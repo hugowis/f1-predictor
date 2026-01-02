@@ -55,7 +55,6 @@ class DataDownloader():
         os.mkdir(laps_foler)
 
         weather_folder = os.path.join(self.weather_dir, str(year), event_name)
-        print(weather_folder)
         os.mkdir(weather_folder)
 
         for s in sessions:

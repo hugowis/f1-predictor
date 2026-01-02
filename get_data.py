@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 SAVE_DIR = "./data"
 fastf1.set_log_level('ERROR')
+fastf1.Cache.enable_cache("./cache")
 
 
 class DataDownloader():

@@ -1,3 +1,7 @@
-* add weather data
-* pos data (distance to driver ahead)
+
+
+
+Croisement des données
+* ajout données météo
+* calcul et ajout des delta time
 * ajout du nom du grand prix

@@ -70,6 +70,7 @@ Predict the **next lap times** for a given driver.
 - Drop laps with missing or invalid lap times
 - Remove red-flag laps
 - Handle deleted / inaccurate laps using FastF1 flags
+- Handle missing track length
 
 #### 1.2 Lap Type Handling
 
@@ -210,6 +211,12 @@ This prevents information leakage across laps of the same race.
 ---
 
 ## 4. Additional Experiments
+
+### Value qualification and testing data
+- Add a session type tag
+- To train the embeddings and freeze them
+- To learn tire degradation curves (on FP long stints)
+- Define a pretaining task
 
 ### Circuit Representation
 

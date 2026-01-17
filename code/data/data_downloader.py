@@ -18,6 +18,8 @@ import argparse
 
 SAVE_DIR = Path("./data")
 CACHE_DIR = Path(".cache")
+CACHE_DIR.mkdir(exist_ok=True, parents=True)
+
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"
 
 MAX_RETRIES = 3

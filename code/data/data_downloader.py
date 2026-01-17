@@ -157,7 +157,7 @@ class DataDownloader:
                 session.load(
                     laps=True,
                     weather=True,
-                    telemetry=False,
+                    telemetry=True,
                     messages=False,
                 )
                 session.laps  # force evaluation
@@ -231,7 +231,25 @@ class DataDownloader:
                     year, event_name, session_name
                 )
 
-                session.laps.to_csv(
+                laps = session.laps
+                # Add track length
+                try:
+                    fastest_lap = session.laps.pick_fastest()
+                    tel = fastest_lap.get_telemetry()
+                    track_length = tel['Distance'].max()
+                    laps['TrackLength'] = track_length / 1000
+                except:
+                    self.logger.warning(
+                        "Unknown track length for session: %d | %s | %s",
+                        year,
+                        event_name,
+                        session_name,
+                    )
+                    laps['TrackLength'] = None
+                # Add number of race laps
+                laps['RaceLaps'] = session.total_laps
+
+                laps.to_csv(
                     laps_folder / f"{session_name}.csv", index=False
                 )
                 session.weather_data.to_csv(

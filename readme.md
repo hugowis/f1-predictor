@@ -171,12 +171,32 @@ Used as the first deep learning baseline.
 - GRU
 - LSTM
 
+In 3 phases:
+- Phase 1
+
+  - Pure teacher forcing
+  - Stint-based sequences
+  - seq2seq  (1-5 laps)
+
+- Phase 2
+
+  - Full-race sequences
+  - Teacher forcing
+  - Auxiliary pit head and compound head
+  - Autoregressive
+
+- Phase 3
+
+  - Partial free-running
+  - Scheduled sampling
+
+
 ---
 
 #### Transformer Models
 
-- Decoder-only architecture
-- Encoder–decoder (optional)
+- Decoder-only architecture (autoregressive)
+- For phase 2 & 3
 
 Notes:
 - Causal masking (no future access)
@@ -213,7 +233,8 @@ This prevents information leakage across laps of the same race.
 ## 4. Additional Experiments
 
 ### Value qualification and testing data
-- Add a session type tag
+- Add a session type tag 
+- some features are not comparable accros sessions: fuel, trafick, ...
 - To train the embeddings and freeze them
 - To learn tire degradation curves (on FP long stints)
 - Define a pretaining task
@@ -237,13 +258,10 @@ This prevents information leakage across laps of the same race.
 ### Extensions (Future Work)
 
 - Uncertainty estimation (predict mean + variance)
-- Multi-task learning:
-  - Lap time
-  - Pit stop probability
-  - Tyre degradation slope
 - Counterfactual simulation:
   - "What if the driver stayed out one more lap?"
 
+- A GUI?
 ---
 
 

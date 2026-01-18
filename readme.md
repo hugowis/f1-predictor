@@ -64,15 +64,15 @@ Predict the **next lap times** for a given driver.
 
 ### 1. Data Preparation
 
-#### 1.1 Data Cleaning
+#### 1.1 Data Cleaning 
 
-- Convert all time-related columns to milliseconds
-- Handle missing track length
-- Join weather data
-- Join track/schedule
-- Verify missing laptime (maybie due to race interuption)
-- drop uselless features
-
+- Convert all time-related columns to milliseconds ✓
+- Handle missing track length ✓
+- Join track/schedule ✓
+- Join weather data ✓
+- Correct missing laptimes (laps with a stop have no laptimes) ✓
+- Drop uselless features ✓
+- Correct missing compound and stint for first race lap 
 
 #### 1.2 Lap Type Handling
 
@@ -82,17 +82,18 @@ Create explicit lap-type flags:
 - `is_inlap`
 - `is_pit_lap`
 
+Create flags for the track status
+- `yellow_flag`
+- `Safty_car`
+- `VSC`
+- ...
+
 ---
 
 ### 1.3 Feature Engineering
 
 #### Temporal & Performance Features
 
-- Previous lap times (t-1, t-2, ..., t-N)
-- Lap time deltas:
-  - `LapTime(t) - LapTime(t-1)`
-- Rolling statistics:
-  - Rolling mean / std over last 3–5 laps
 - Gap to car ahead
 - Gap to race leader 
 
@@ -102,7 +103,6 @@ Create explicit lap-type flags:
 - Tyre life
 - Fresh tyre flag
 - Stint length so far
-- Normalized tyre age
 
 #### Fuel Load Proxy
 
@@ -116,13 +116,16 @@ Fuel load is not available and must be approximated:
 
 - Circuit name (categorical / embedding)
 - Track length
-- Track type (low / medium / high downforce – optional)
 
 #### Driver & Car Features
 
 - Driver ID (categorical / embedding)
 - Team ID (categorical / embedding)
-- Season / car year
+- Season 
+
+#### Weather
+
+- Rainfall to binary value
 
 ---
 
@@ -238,6 +241,11 @@ This prevents information leakage across laps of the same race.
 ---
 
 ## 4. Additional Experiments
+
+## Expériment with dropped features
+- Sectors time
+- Speeds
+- Position
 
 ### Value qualification and testing data
 - Add a session type tag 

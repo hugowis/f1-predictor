@@ -67,10 +67,12 @@ Predict the **next lap times** for a given driver.
 #### 1.1 Data Cleaning
 
 - Convert all time-related columns to milliseconds
-- Drop laps with missing or invalid lap times
-- Remove red-flag laps
-- Handle deleted / inaccurate laps using FastF1 flags
 - Handle missing track length
+- Join weather data
+- Join track/schedule
+- Verify missing laptime (maybie due to race interuption)
+- drop uselless features
+
 
 #### 1.2 Lap Type Handling
 
@@ -79,10 +81,6 @@ Create explicit lap-type flags:
 - `is_outlap`
 - `is_inlap`
 - `is_pit_lap`
-
-For initial experiments:
-- Drop in-laps and out-laps
-- Ignore laps under Safety Car / VSC
 
 ---
 
@@ -118,7 +116,6 @@ Fuel load is not available and must be approximated:
 
 - Circuit name (categorical / embedding)
 - Track length
-- Average lap speed
 - Track type (low / medium / high downforce – optional)
 
 #### Driver & Car Features
@@ -140,6 +137,16 @@ Fuel load is not available and must be approximated:
     - Circuit
 
 ---
+
+### 1.5 Dataloaders
+- Naive data loader for naive baselines cf 2.1
+
+- Stint dataloader
+  - split races in stints
+  - split with safety car, VSC, yellow flag, red flag, ...
+  - remove pit entry/exit laps
+
+- Race data loader
 
 ## 2. Modeling
 

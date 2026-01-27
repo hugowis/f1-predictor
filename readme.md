@@ -64,7 +64,7 @@ Predict the **next lap times** for a given driver.
 
 ### 1. Data Preparation
 
-#### 1.1 Data Cleaning 
+#### 1.1 Data Cleaning ✓
 
 - Convert all time-related columns to milliseconds ✓
 - Handle missing track length ✓
@@ -72,11 +72,10 @@ Predict the **next lap times** for a given driver.
 - Join weather data ✓
 - Correct missing laptimes (laps with a stop have no laptimes) ✓
 - Drop uselless features ✓
-- Correct missing compound and stint for first race lap 
 
 #### 1.2 Lap Type Handling
 
-Create explicit lap-type flags:
+Create explicit lap-type flags: ✓
 - `is_normal_lap`
 - `is_outlap`
 - `is_inlap`
@@ -241,6 +240,11 @@ This prevents information leakage across laps of the same race.
 ---
 
 ## 4. Additional Experiments
+
+### Add 2018 season
+- Different tyre compounds
+- Missing compound, tyre age and stint for first race lap 
+
 
 ## Expériment with dropped features
 - Sectors time

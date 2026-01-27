@@ -96,9 +96,11 @@ class DataPreparation():
         return df
 
 
-    def prepare(self):
+    def prepare(self, skip_2018=True):
 
         for year in self.years:
+            if year == 2018 and skip_2018:
+                continue
             self.logger.info(f"Preparing data for year: {year}")
             for i, raw in tqdm(self.schedules[year].iterrows(), total=self.schedules[year].shape[0]):
                 event_path = self.raw_data_path / "laps" / str(year) / raw['EventName']
@@ -141,7 +143,7 @@ class DataPreparation():
         session["TrackLength"] = session["TrackLength"].round(2)
         return session
 
-    def join_weather_data(self, session, weather ):
+    def join_weather_data(self, session: pd.DataFrame , weather: pd.DataFrame) -> pd.DataFrame:
         
         session = session.sort_values("Time")
         weather = weather.sort_values("Time")
@@ -158,6 +160,19 @@ class DataPreparation():
             ascending=[True, True]
         )
         return session 
+
+    def add_lap_type_flags(self, session: pd.DataFrame) -> pd.DataFrame:
+        session["is_outlap"] = ~session['PitOutTime'].isna()
+        session["is_inlap"] = ~session['PitInTime'].isna()
+        session["is_pitlap"] = session["is_outlap"] | session["is_inlap"] 
+        session["is_normal_lap"] = ~ session["is_pitlap"]
+
+        session["is_outlap"] = session["is_outlap"].astype(int)
+        session["is_inlap"] = session["is_inlap"].astype(int)
+        session["is_pitlap"] = session["is_pitlap"].astype(int)
+        session["is_normal_lap"] = session["is_normal_lap"].astype(int)
+        return session
+
 
     def preparation_pipeline(self, session: pd.DataFrame, year: int, circuit: str, weather: pd.DataFrame) -> None:
         
@@ -177,11 +192,15 @@ class DataPreparation():
         # Calculate missing Laptimes
         self.logger.debug("Calculating missing Laptimes")
         session["LapTime"] = session["LapTime"].fillna(session["Time"] - session["LapStartTime"])
+        # Add lap type flags
+        session = self.add_lap_type_flags(session)
+
+
         # Drop useless columns
-        to_drop = ["Time", "DriverNumber", "Sector1SessionTime", "Sector2SessionTime", "Sector3SessionTime", "SpeedI1", "SpeedI2", "SpeedFL", "SpeedST", "IsPersonalBest", "LapStartTime", "LapStartDate", "FastF1Generated", "IsAccurate", "Sector1Time", "Sector2Time", "Sector3Time", "Position", "Deleted", "DeletedReason"]
+        self.logger.debug("Dropping useless columns")
+        to_drop = ["Time", "DriverNumber", "Sector1SessionTime", "Sector2SessionTime", "Sector3SessionTime", "SpeedI1", "SpeedI2", "SpeedFL", "SpeedST", "IsPersonalBest", "LapStartTime", "LapStartDate", "FastF1Generated", "IsAccurate", "Sector1Time", "Sector2Time", "Sector3Time", "Position", "Deleted", "DeletedReason", "PitOutTime", "PitInTime"]
         session = session.drop(columns=to_drop)
 
-        session.to_csv("tmp.csv", sep=",", index=False)
 
 
         # TODO save df

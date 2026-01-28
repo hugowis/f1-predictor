@@ -81,7 +81,7 @@ Create explicit lap-type flags: ✓
 - `is_inlap`
 - `is_pit_lap`
 
-Create flags for the track status
+Create flags for the track status ✓
 - `yellow_flag`
 - `Safty_car`
 - `VSC`
@@ -93,14 +93,13 @@ Create flags for the track status
 
 #### Temporal & Performance Features
 
-- Gap to car ahead
-- Gap to race leader 
+- Gap to car ahead ✓
 
 #### Tyre Features
 
 - Tyre compound (one-hot encoded)
-- Tyre life
-- Fresh tyre flag
+- Tyre life ✓
+- Fresh tyre flag (to binary)
 - Stint length so far
 
 #### Fuel Load Proxy
@@ -114,7 +113,7 @@ Fuel load is not available and must be approximated:
 #### Track & Circuit Features
 
 - Circuit name (categorical / embedding)
-- Track length
+- Track length ✓
 
 #### Driver & Car Features
 
@@ -137,6 +136,7 @@ Fuel load is not available and must be approximated:
     - Driver
     - Team
     - Circuit
+    - Year
 
 ---
 

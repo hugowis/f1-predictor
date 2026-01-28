@@ -15,9 +15,6 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 class DataPreparation:
     """
     Raw -> Cleaned dataset preparation.
-    Covers README sections:
-      - 1.1 Data Cleaning
-      - 1.2 Lap Type Handling
     """
 
     TIME_COLS = [
@@ -34,8 +31,9 @@ class DataPreparation:
         "IsPersonalBest", "LapStartTime", "LapStartDate",
         "FastF1Generated", "IsAccurate",
         "Sector1Time", "Sector2Time", "Sector3Time",
-        "Position", "Deleted", "DeletedReason",
+        "Deleted", "DeletedReason",
         "PitOutTime", "PitInTime",
+        "TrackStatus"
     ]
 
     TRACK_LENGTH_REF = {
@@ -62,6 +60,8 @@ class DataPreparation:
             self._correct_track_length,
             self._compute_missing_laptimes,
             self._add_lap_type_flags,
+            self._add_trackstatus_flag,
+            self._compute_delta_to_car_ahead,
             self._drop_useless_columns,
         ]
 
@@ -143,6 +143,30 @@ class DataPreparation:
         df["is_normal_lap"] = (~df["is_pitlap"].astype(bool)).astype(int)
 
         return df
+
+    def _add_trackstatus_flag(self, df, **_):
+        status = df["TrackStatus"].fillna(0).astype(int)
+
+        df["track_clear"] = (status == 1).astype(int)
+        df["yellow_flag"] = (status == 2).astype(int)
+        df["safety_car"] = (status == 4).astype(int)
+        df["red_flag"] = (status == 5).astype(int)
+        df["vsc"] = (status == 6).astype(int)
+        df["vsc_ending"] = (status == 7).astype(int)
+
+        return df
+    
+
+    def _compute_delta_to_car_ahead(self, df, **_) -> pd.DataFrame:
+
+        df = df.sort_values(["LapStartTime"])
+
+        df["delta_to_car_ahead"] = df["LapStartTime"] - df["LapStartTime"].shift(1)
+
+        df.loc[df["Position"] == 1, "delta_to_car_ahead"] = 0.0
+        df["delta_to_car_ahead"] = df["delta_to_car_ahead"].fillna(0.0)
+        return df
+    
 
     def _drop_useless_columns(self, df, **_):
         return df.drop(columns=[c for c in self.DROP_COLS if c in df.columns])

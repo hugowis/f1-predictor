@@ -33,7 +33,7 @@ class DataPreparation:
         "Sector1Time", "Sector2Time", "Sector3Time",
         "Deleted", "DeletedReason",
         "PitOutTime", "PitInTime",
-        "TrackStatus"
+        "TrackStatus", "Compound"
     ]
 
     TRACK_LENGTH_REF = {
@@ -47,11 +47,21 @@ class DataPreparation:
         "Spielberg": 4.29,
     }
 
+    BOOL_COLUMNS = [
+        "FreshTyre",
+        "Rainfall"
+    ]
+
     def __init__(self, raw_data_path: Path, save_dir: Path):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.raw_data_path = raw_data_path
         self.save_dir = save_dir
         self.schedules, self.years = self._load_schedules()
+
+        self.drivers = dict()
+        self.teams = dict()
+        self.seasons = dict()
+        self.circuits = dict()
 
         self.pipeline = [
             self._add_metadata,
@@ -62,6 +72,9 @@ class DataPreparation:
             self._add_lap_type_flags,
             self._add_trackstatus_flag,
             self._compute_delta_to_car_ahead,
+            self._convert_bool,
+            self._encode_compoud,
+            self._add_fuel_proxy,
             self._drop_useless_columns,
         ]
 
@@ -107,7 +120,14 @@ class DataPreparation:
     def _join_weather(self, df, *, weather, **_):
         df = df.sort_values("Time")
         weather = weather.sort_values("Time")
-        df = pd.merge_asof(df, weather, on="Time", direction="backward")
+
+        df = pd.merge_asof(
+            df,
+            weather,
+            on="Time",
+            direction="nearest",
+        )
+
         return df.sort_values(["Driver", "LapNumber"])
 
     def _convert_times_to_ms(self, df, **_):
@@ -157,7 +177,7 @@ class DataPreparation:
         return df
     
 
-    def _compute_delta_to_car_ahead(self, df, **_) -> pd.DataFrame:
+    def _compute_delta_to_car_ahead(self, df, **_):
 
         df = df.sort_values(["LapStartTime"])
 
@@ -168,9 +188,36 @@ class DataPreparation:
         return df
     
 
+    def _convert_bool(self, df, **_):
+
+        for col in self.BOOL_COLUMNS:
+            df[col] =  df[col].astype(int)
+
+        return df
+    
+    def _encode_compoud(self, df, **_):
+        df["Compound"] = df["Compound"].fillna("UNKNOWN")
+
+        df["Compound"] = df["Compound"].str.upper()
+        for c in ["SOFT", "MEDIUM", "HARD", "UNKNOWN"]:
+            df[f"compound_{c.lower()}"] = (df["Compound"] == c).astype("Int64")
+        return df
+
+
+    def _add_fuel_proxy(self, df, **_):
+        df["fuel_proxy"] = 1 - (df["LapNumber"] / df["RaceLaps"])
+        return df
+    
     def _drop_useless_columns(self, df, **_):
         return df.drop(columns=[c for c in self.DROP_COLS if c in df.columns])
 
+    def _to_categorical(self, df, **_):
+        # TODO
+        return df
+    
+    def _add_stint_length(self, df, **_):
+        # TODO
+        return df
     # ---------------------------------------------------------------------
     # Orchestration
     # ---------------------------------------------------------------------
@@ -186,7 +233,7 @@ class DataPreparation:
                                  total=len(self.schedules[year])):
 
                 event = race["EventName"]
-                circuit = race["Location"]
+                circuit = race["Location"] 
 
                 laps_dir = self.raw_data_path / "laps" / str(year) / event
                 weather_dir = self.raw_data_path / "weather" / str(year) / event
@@ -196,7 +243,7 @@ class DataPreparation:
                     weather["Time"] = pd.to_timedelta(weather["Time"])
 
                     df = self._load_laps(lap_file)
-
+                    df = df.dropna(subset=["LapTime", "Driver", "LapNumber"])
                     for step in self.pipeline:
                         df = step(
                             df,

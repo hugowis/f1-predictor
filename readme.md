@@ -97,14 +97,14 @@ Create flags for the track status ✓
 
 #### Tyre Features
 
-- Tyre compound (one-hot encoded)
+- Tyre compound (one-hot encoded) ✓
 - Tyre life ✓
-- Fresh tyre flag (to binary)
+- Fresh tyre flag (to binary)  ✓
 - Stint length so far
 
-#### Fuel Load Proxy
+#### Fuel Load Proxy ✓
 
-Fuel load is not available and must be approximated:
+Fuel load is not available and must be approximated: ✓
 
 - Fuel proxy:
 ```fuel_proxy = 1 - (LapNumber / TotalRaceLaps)```
@@ -119,26 +119,19 @@ Fuel load is not available and must be approximated:
 
 - Driver ID (categorical / embedding)
 - Team ID (categorical / embedding)
-- Season 
+- Season (categorical / embedding)
 
 #### Weather
 
-- Rainfall to binary value
+- Rainfall to binary value  ✓
+- Missing weather info  ✓
 
 ---
 
-### 1.4 Categorical Encoding
-
-- One-hot encoding for:
-    - Tyre compound
-    - Track status (green / yellow / SC)
-- Embeddings for:
-    - Driver
-    - Team
-    - Circuit
-    - Year
-
----
+#### Doc
+- add a md file to explain data download
+- add a md file to explain data preparation
+- remove data from todolist
 
 ### 1.5 Dataloaders
 - Naive data loader for naive baselines cf 2.1

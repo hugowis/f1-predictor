@@ -64,77 +64,9 @@ Predict the **next lap times** for a given driver.
 
 ### 1. Data Preparation
 
-#### 1.1 Data Cleaning ✓
 
-- Convert all time-related columns to milliseconds ✓
-- Handle missing track length ✓
-- Join track/schedule ✓
-- Join weather data ✓
-- Correct missing laptimes (laps with a stop have no laptimes) ✓
-- Drop uselless features ✓
-
-#### 1.2 Lap Type Handling
-
-Create explicit lap-type flags: ✓
-- `is_normal_lap`
-- `is_outlap`
-- `is_inlap`
-- `is_pit_lap`
-
-Create flags for the track status ✓
-- `yellow_flag`
-- `Safty_car`
-- `VSC`
-- ...
-
----
-
-### 1.3 Feature Engineering
-
-#### Temporal & Performance Features
-
-- Gap to car ahead ✓
-
-#### Tyre Features
-
-- Tyre compound (one-hot encoded) ✓
-- Tyre life ✓
-- Fresh tyre flag (to binary)  ✓
-- Stint length so far
-
-#### Fuel Load Proxy ✓
-
-Fuel load is not available and must be approximated: ✓
-
-- Fuel proxy:
-```fuel_proxy = 1 - (LapNumber / TotalRaceLaps)```
-
-
-#### Track & Circuit Features
-
-- Circuit name (categorical / embedding)
-- Track length ✓
-
-#### Driver & Car Features
-
-- Driver ID (categorical / embedding)
-- Team ID (categorical / embedding)
-- Season (categorical / embedding)
-
-#### Weather
-
-- Rainfall to binary value  ✓
-- Missing weather info  ✓
-
----
-
-#### Doc
-- add a md file to explain data download
-- add a md file to explain data preparation
-- remove data from todolist
-
-### 1.5 Dataloaders
-- Naive data loader for naive baselines cf 2.1
+### 1.1 Dataloaders
+- Naive data loaders for naive baselines cf 2.1
 
 - Stint dataloader
   - split races in stints

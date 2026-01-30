@@ -4,9 +4,9 @@ from typing import Dict, List
 
 import pandas as pd
 from tqdm import tqdm
+import json
 
-RAW_DATA_PATH = Path("data/raw_data")
-CLEANED_DATA_PATH = Path("data/clean_data")
+DATA_PATH = Path("./data")
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -52,16 +52,25 @@ class DataPreparation:
         "Rainfall"
     ]
 
-    def __init__(self, raw_data_path: Path, save_dir: Path):
+    CATEGORICAL_COLUMNS = [
+        "Driver",
+        "Team",
+        "Year",
+        "Circuit"
+
+    ]
+
+    def __init__(self, data_path: Path):
+
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.raw_data_path = raw_data_path
-        self.save_dir = save_dir
+        self.vocabs_path = data_path / "vocabs"
+        self.raw_data_path = data_path / "raw_data"
+        self.save_dir = data_path / "clean_data"
         self.schedules, self.years = self._load_schedules()
 
-        self.drivers = dict()
-        self.teams = dict()
-        self.seasons = dict()
-        self.circuits = dict()
+        self.categories = {
+            col: {"<UNK>": 0} for col in self.CATEGORICAL_COLUMNS
+        }
 
         self.pipeline = [
             self._add_metadata,
@@ -75,6 +84,8 @@ class DataPreparation:
             self._convert_bool,
             self._encode_compoud,
             self._add_fuel_proxy,
+            self._to_categorical,
+            self._add_stint_length,
             self._drop_useless_columns,
         ]
 
@@ -113,8 +124,8 @@ class DataPreparation:
     # ---------------------------------------------------------------------
 
     def _add_metadata(self, df, *, year, circuit, **_):
-        df["year"] = year
-        df["circuit"] = circuit
+        df["Year"] = year
+        df["Circuit"] = circuit
         return df
 
     def _join_weather(self, df, *, weather, **_):
@@ -138,7 +149,7 @@ class DataPreparation:
 
     def _correct_track_length(self, df, **_):
         if df["TrackLength"].isna().any():
-            circuit = df["circuit"].iloc[0]
+            circuit = df["Circuit"].iloc[0]
             ref = self.TRACK_LENGTH_REF.get(circuit)
             if ref is None:
                 self.logger.warning(f"No reference track length for {circuit}")
@@ -211,12 +222,47 @@ class DataPreparation:
     def _drop_useless_columns(self, df, **_):
         return df.drop(columns=[c for c in self.DROP_COLS if c in df.columns])
 
+
     def _to_categorical(self, df, **_):
-        # TODO
+        for col in self.CATEGORICAL_COLUMNS:
+            vocab = self.categories[col]
+
+            values = (
+                df[col]
+                .astype("string")
+                .fillna("<UNK>")
+            )
+
+            encoded = []
+
+            for v in values:
+                if v not in vocab:
+                    vocab[v] = len(vocab)
+                encoded.append(vocab[v])
+
+            df[col] = pd.Series(encoded, index=df.index).astype("Int64")
+
         return df
     
     def _add_stint_length(self, df, **_):
-        # TODO
+        df = df.sort_values(["Driver", "LapNumber"])
+
+        is_new_stint = (
+            (df["PitOutTime"].notna()) |
+            (df["LapNumber"] == 1)
+        )
+
+        df["stint_id"] = is_new_stint.groupby(df["Driver"]).cumsum()
+
+        mask = df["is_normal_lap"] == 1
+
+        df.loc[mask, "stint_lap"] = (
+            df[mask]
+            .groupby(["Driver", "Stint"])
+            .cumcount()
+            + 1
+        )
+        df["stint_lap"] = df["stint_lap"].fillna(-1)
         return df
     # ---------------------------------------------------------------------
     # Orchestration
@@ -254,12 +300,21 @@ class DataPreparation:
 
                     self._save(df, year, event, lap_file.stem)
 
+        self._save_vocab()
+
     def _save(self, df, year, event, session):
         out_dir = self.save_dir / f"{year}" / f"{event}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         df.to_csv(out_dir / f"{session}.csv", index=False)
 
+    def _save_vocab(self):
+        
+        self.vocabs_path.mkdir(parents=True, exist_ok=True)
+        for k in self.categories.keys():
+            path = self.vocabs_path / k
+            with open(f"{path}.json", "w") as f:
+                json.dump(self.categories[k], f, indent=2, sort_keys=True)
 
 if __name__ == "__main__":
-    DataPreparation(RAW_DATA_PATH, CLEANED_DATA_PATH).prepare()
+    DataPreparation(DATA_PATH).prepare()

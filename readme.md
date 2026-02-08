@@ -1,11 +1,106 @@
 # F1 Lap Time Predictor
 
-The goal of this project is to build a deep learning–based solution to **predict the next lap times of an F1 driver**, given the information available from **previous laps only**.
+A deep learning solution to predict **next lap times in Formula 1 racing** using historical lap data and race telemetry.
 
-This is formulated as a **next-step time series prediction problem**:
-> Given laps 1..t for a driver in a race, predict lap time at t+1, t+2, ...
+## Overview
 
-The project focuses on race laps only (not qualifying).
+This project builds a **sequence-to-sequence (seq2seq) model** to solve the lap time prediction problem:
+
+> **Given**: Lap times and telemetry data from laps 1 to t  
+> **Predict**: Lap times for lap t+1, t+2, ... within a stint  
+
+**Key constraints:**
+- Only information available *up to lap t* can be used (no data leakage)
+- Focus on race laps (not qualifying sessions)
+- Must handle varying stint lengths, pit stops, and track conditions
+- Real-world applicability to race strategy and driver performance analysis
+
+---
+
+## Current Solution: Phase 1 (✅ Complete)
+
+### Architecture
+- **Model**: Seq2Seq with GRU encoder-decoder
+- **Parameters**: 363,921 trainable parameters
+- **Hidden size**: 128 units, 2 stacked layers, 0.2 dropout
+- **Teacher forcing**: 100% during training (Phase 1 approach)
+- **Sequence length**: 20 laps max per stint
+
+### Training Details
+- **Data**: 5,311 stints (2019-2023 seasons)
+  - Train: 2019-2023 (5,311 sequences)
+  - Validation: 2024 (1,235 sequences)
+  - Test: 2025 (1,225 sequences)
+- **Hardware**: NVIDIA RTX 5080 (13.0 CUDA)
+- **Optimizer**: SGD with learning rate 1e-3, cosine scheduler (5 warm-up epochs)
+- **Loss**: MSE with gradient clipping (1.0)
+- **Early stopping**: Patience=15 epochs → stopped at epoch 60
+
+ - **Batch size**: 32 (this evaluation run)
+ - **Early stopping**: Patience=15 epochs → stopped at epoch 57
+
+### Performance Results
+| Metric | Value |
+|--------|-------|
+| **MAE** | 51.10 ms |
+| **RMSE** | 92.38 ms |
+| **Median AE** | 31.92 ms |
+| **MAPE** | 4.22 % |
+
+### Error Distribution
+- **0-10 ms** (Very Accurate): 16.74%
+- **10-50 ms** (Accurate): 52.17% ⭐ *Most common*
+- **50-100 ms** (Good): 20.18%
+- **100-200 ms** (Fair): 7.38%
+- **200+ ms** (Poor): 3.53%
+
+**Key insight**: 68.91% of predictions have <50ms error (16.74% + 52.17%), demonstrating improved accuracy for the bs32 training run.
+
+---
+
+## Quick Start - Training Pipeline
+
+All training and evaluation scripts are located in the `code/` folder for better organization.
+
+### Training a Model
+
+```bash
+# Train Phase 1 model (default config)
+python code/train.py --phase 1 --device cuda
+
+# Train with custom batch size and epochs
+python code/train.py --phase 1 --batch-size 16 --epochs 100 --device cuda
+
+# Train with custom config file
+python code/train.py --config path/to/config.json --device cuda
+```
+
+### Evaluating a Model
+
+```bash
+# Evaluate checkpoint on 2025 test data
+python code/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --device cuda
+
+# Evaluate on specific years
+python code/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --test-years 2022 2023 2024
+```
+
+### Visualizing Results
+
+```bash
+# Generate loss curves and error distribution plots
+python code/visualize_results.py
+
+# Generate error analysis report
+python code/analyze_results.py
+```
+
+All results are saved to `results/phase1/` including:
+- `loss_curves.png` - Training/validation loss progression
+- `error_breakdown.png` - Error distribution visualization
+- `test_metrics_summary.png` - Test performance metrics
+- `analysis_report.txt` - Comprehensive analysis report
+- `evaluation_results.json` - Detailed evaluation metrics
 
 ---
 
@@ -60,153 +155,126 @@ Predict the **next lap times** for a given driver.
 
 ---
 
-## TODOLIST
+## Project Status & Roadmap
 
-### 1. Data Preparation
+### ✅ Phase 1: Complete
 
+**Completed tasks:**
+- ✅ Data loading and preprocessing (stint-based sequences)
+- ✅ Seq2Seq GRU model architecture
+- ✅ Training infrastructure (trainer, scheduler, early stopping)
+- ✅ Evaluation metrics (MAE, RMSE, MAPE, quantiles)
+- ✅ GPU support (CUDA 13.0, automatic device detection)
+- ✅ Masking for missing/non-finite data
+- ✅ Full training pipeline (100 epochs, converged at epoch 60)
+- ✅ Model checkpointing and restoration
+- ✅ Visualization suite (loss curves, error breakdown, metrics plots)
+- ✅ Comprehensive evaluation reports
 
-### 1.1 Dataloaders
-- Naive data loaders for naive baselines cf 2.1
-
-- Stint dataloader
-  - split races in stints
-  - split with safety car, VSC, yellow flag, red flag, ...
-  - remove pit entry/exit laps
-
-- Race data loader
-
-## 2. Modeling
-
-### 2.1 Baselines
-
-- Naive baseline:
-    - `LapTime(t+1) = LapTime(t)`
-    - Rolling mean baseline
-    - ARIMA-style models (per driver, per race)
-
----
-
-### 2.2 Machine Learning Models
-
-#### Feedforward Neural Network (MLP)
-
-- Input:
-- Flattened previous N laps
-- Static context features
-- Output:
-- Next lap time
-
-Used as the first deep learning baseline.
+**Deliverables:**
+- Trained model checkpoint: `results/phase1/checkpoints/best_model.pt`
+- Training history: `results/phase1/history.json`
+- Test metrics: `results/phase1/evaluation/evaluation_results.json`
+- Visualizations: `.png` files in `results/phase1/`
+- Configuration: `results/phase1/config.json`
 
 ---
 
-#### Recurrent Models
+### 🚀 Phase 2: In Planning
 
-- GRU
-- LSTM
+**Objectives:**
+- [ ] Extend sequence length to full races
+- [ ] Implement autoregressive predictions (free-running mode)
+- [ ] Auxiliary pit head and compound head
+- [ ] Scheduled sampling (gradual removal of teacher forcing)
+- [ ] Error analysis by driver and circuit
 
-In 3 phases:
-- Phase 1
+**Expected improvements:**
+- Predictions across full race (not just stints)
+- Handling of strategy changes and pit stops
+- Driver-specific lap time signatures
 
-  - Pure teacher forcing
-  - Stint-based sequences
-  - seq2seq  (1-5 laps)
+---
 
-- Phase 2
+### 🔮 Phase 3: Future Enhancements
 
-  - Full-race sequences
-  - Teacher forcing
-  - Auxiliary pit head and compound head
-  - Autoregressive
-
-- Phase 3
-
-  - Partial free-running
-  - Scheduled sampling
+**Long-term items:**
+- [ ] Transformer-based architecture
+- [ ] Uncertainty estimation (mean + variance predictions)
+- [ ] Web dashboard
+- [ ] Real-time prediction pipeline for races
+- [ ] Pretraining on FP/qualifying data for better generalization
+- [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
 
 
 ---
 
-#### Transformer Models
+## Detailed TODO List
 
-- Decoder-only architecture (autoregressive)
-- For phase 2 & 3
+### Data Pipeline
+- ✅ Lap data loading (FastF1 framework)
+- ✅ Weather data integration
+- ✅ Track metadata joining
+- ✅ Stint-based sequence creation
+- ✅ Data normalization (per-year StandardScaler)
+- ✅ Masking for non-finite values
+- [ ] Add 2018 season (different compounds and missing data)
+- [ ] Advanced augmentation techniques
+- [ ] Feature engineering (momentum, trend indicators)
 
-Notes:
-- Causal masking (no future access)
-- Requires careful regularization to avoid overfitting
-- Used only once dataset size is sufficient
+### Modeling - Phase 1
+- ✅ GRU encoder-decoder architecture
+- ✅ Teacher forcing (full schedule)
+- ✅ Stint-based sequences (1-20 laps)
+- ✅ Multi-layer RNN (2 layers)
+- ✅ Dropout and gradient clipping
+- [ ] LSTM variant comparison
 
+### Modeling - Phase 2
+- [ ] Full-race sequences
+- [ ] Autoregressive generation
+- [ ] Pit stop modeling
+- [ ] Driver embeddings
+- [ ] Team/car embeddings
+- [ ] Transformer decoder
+- [ ] Attention mechanisms
+
+### Training & Optimization
+- ✅ PyTorch training loop
+- ✅ GPU acceleration
+- ✅ Learning rate scheduling (cosine annealing)
+- ✅ Early stopping with patience
+- ✅ Gradient accumulation support
+- ✅ Checkpointing and restoration
+
+### Evaluation & Analysis
+- ✅ Test set evaluation
+- ✅ Denormalization of predictions
+- ✅ MAE/RMSE/MAPE/Quantiles computation
+- ✅ Error breakdown by ranges
+- ✅ Loss curve visualization
+- ✅ Error distribution plots
+- [ ] Driver-level error analysis
+- [ ] Circuit-level error analysis
+- [ ] Stint-phase analysis (early/mid/late)
+- [ ] Compound-specific analysis
+- [ ] Statistical significance testing
+
+### Infrastructure & Deployment
+- ✅ Modular code structure
+- ✅ Configuration system (dataclasses)
+- ✅ Training script with CLI
+- ✅ Evaluation script with checkpointing
+- ✅ Visualization suite
+- ✅ Git ignore for generated files
+- [ ] Prediction dashboard
 ---
 
-## 3. Evaluation Protocol
-
-### Data Splitting
-
-- Split **by race**, not by lap
-- Recommended:
-  - Train: older seasons
-  - Validation: middle season(s)
-  - Test: most recent season
-
-This prevents information leakage across laps of the same race.
-
----
-
-### Metrics
-
-- Mean Absolute Error (MAE) in milliseconds
-- MAE normalized by track average lap time
-- Error analysis by:
-  - Stint phase (early / mid / late)
-  - Tyre compound
-  - Track
-
----
-
-## 4. Additional Experiments
-
-### Add 2018 season
-- Different tyre compounds
-- Missing compound, tyre age and stint for first race lap 
-
-
-## Expériment with dropped features
-- Sectors time
-- Speeds
-- Position
-
-### Value qualification and testing data
-- Add a session type tag 
-- some features are not comparable accros sessions: fuel, trafick, ...
-- To train the embeddings and freeze them
-- To learn tire degradation curves (on FP long stints)
-- Define a pretaining task
-
-### Circuit Representation
-
-- Mean lap time / speed per circuit
-- Learned circuit embeddings
-- Circuit clustering
-
----
-
-### Driver & Car Representation
-
-- Driver embeddings
-- Team / car-year embeddings
-- Driver-specific output heads 
-
----
-
-### Extensions (Future Work)
-
-- Uncertainty estimation (predict mean + variance)
-- Counterfactual simulation:
-  - "What if the driver stayed out one more lap?"
-
-- A GUI?
----
+## Experiments
+- [ ] Add 2018 season data
+- [ ] Test with dropped features (sectors, speeds, position)
+- [ ] Qualify test data (session type tags)
+- [ ] Pretraining on FP sessions, qualifycation data, sprin, etc.
 
 
 

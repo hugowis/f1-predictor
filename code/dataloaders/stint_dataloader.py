@@ -109,6 +109,8 @@ class StintDataloader(Dataset):
         window_size: int = 20,
         augment_prob: float = 0.0,
         normalize: bool = True,
+        scaler_type: str = "standard",
+        normalizer: Optional[LapTimeNormalizer] = None,
         data_path: Path = None,
         device: str = 'cpu',
         seed: int = None,
@@ -136,15 +138,19 @@ class StintDataloader(Dataset):
         # Setup normalization
         self.normalizer = None
         if normalize:
-            self.normalizer = LapTimeNormalizer(scaler_type="standard")
-            # Try to load fitted scaler, if not available fit on data
-            try:
-                self.normalizer.load(self.years)
-                logger.info(f"Loaded pre-fitted scaler for years {self.years}")
-            except FileNotFoundError:
-                logger.info(f"Fitting scaler on data from years {self.years}...")
-                numeric_data = self.data[self.numeric_columns].copy()
-                self.normalizer.fit(numeric_data, years=self.years)
+            if normalizer is not None:
+                self.normalizer = normalizer
+                logger.info("Using provided normalizer")
+            else:
+                self.normalizer = LapTimeNormalizer(scaler_type=scaler_type)
+                # Try to load fitted scaler, if not available fit on data
+                try:
+                    self.normalizer.load(self.years)
+                    logger.info(f"Loaded pre-fitted scaler for years {self.years}")
+                except FileNotFoundError:
+                    logger.info(f"Fitting scaler on data from years {self.years}...")
+                    numeric_data = self.data[self.numeric_columns].copy()
+                    self.normalizer.fit(numeric_data, years=self.years)
         
         # Generate stint sequences
         logger.info("Generating stint sequences...")
@@ -255,25 +261,16 @@ class StintDataloader(Dataset):
         np.ndarray
             Feature vector [numeric_features + categorical_features + boolean_features + compound_features]
         """
-        features = []
-        
         # Numeric features (will be normalized)
         numeric_feat = lap[self.numeric_columns].values.astype(np.float32)
-        features.append(numeric_feat)
-        
-        # Categorical features (already encoded as int in data)
-        cat_feat = lap[self.categorical_columns].values.astype(np.int32)
-        features.append(cat_feat)
-        
         # Boolean features
         bool_feat = lap[self.boolean_columns].values.astype(np.float32)
-        features.append(bool_feat)
-        
         # Compound one-hot features
         compound_feat = lap[self.compound_columns].values.astype(np.float32)
-        features.append(compound_feat)
-        
-        return np.concatenate(features)
+
+        # Concatenate numeric, categorical, boolean and compound into single vector
+        cat_feat = lap[self.categorical_columns].values.astype(np.int32)
+        return np.concatenate([numeric_feat, cat_feat, bool_feat, compound_feat])
     
     def _apply_augmentation(self, laps: pd.DataFrame) -> pd.DataFrame:
         """
@@ -366,7 +363,7 @@ class StintDataloader(Dataset):
         for _, lap in input_laps.iterrows():
             feat = self._get_lap_features(lap)
             features_list.append(feat)
-        
+
         # Convert to tensor
         if features_list:
             features = np.array(features_list, dtype=np.float32)
@@ -374,19 +371,19 @@ class StintDataloader(Dataset):
             # Padding case: empty input sequence
             num_features = len(self._get_lap_features(input_laps.iloc[0])) if len(input_laps) > 0 else 100
             features = np.zeros((0, num_features), dtype=np.float32)
-        
+
         # Pad sequence to window size
         if len(features) < self.window_size:
             padding = np.zeros((self.window_size - len(features), features.shape[1]), dtype=np.float32)
             features = np.vstack([padding, features])
-        
+
         # Get target lap time
         target_laptime = float(target_lap['LapTime'])
-        
+
         # Convert to tensors
         features_tensor = torch.from_numpy(features).to(self.device)
         target_tensor = torch.tensor(target_laptime, dtype=torch.float32, device=self.device)
-        
+
         metadata = {
             'driver': stint['driver'],
             'year': stint['year'],
@@ -394,5 +391,5 @@ class StintDataloader(Dataset):
             'stint_id': stint['stint_id'],
             'length': stint['length'],
         }
-        
+
         return features_tensor, target_tensor, metadata

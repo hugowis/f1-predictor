@@ -1,0 +1,20 @@
+"""
+Models package for F1 lap time prediction.
+"""
+
+from .base import BaseModel
+from .seq2seq import Seq2SeqGRU
+from .trainer import Trainer, create_scheduler
+from .evaluator import Evaluator, denormalize_predictions, report_evaluation
+
+__all__ = [
+    'BaseModel',
+    'Seq2SeqGRU',
+    'Trainer',
+    'Evaluator',
+    'create_scheduler',
+    'denormalize_predictions',
+    'report_evaluation',
+]
+
+__version__ = '1.0.0'

@@ -1,0 +1,279 @@
+"""
+Configuration system for F1 lap time prediction models.
+
+Provides default configs for different model architectures and training setups.
+"""
+
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional
+import json
+from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelConfig:
+    """Model architecture configuration."""
+    name: str = "seq2seq_gru"
+    input_size: int = 33  # From dataloaders
+    output_size: int = 1  # Predict single lap time
+    hidden_size: int = 128
+    num_layers: int = 2
+    dropout: float = 0.2
+    embedding_dims: Optional[Dict[str, int]] = None
+    vocab_sizes: Optional[Dict[str, int]] = None
+    
+    def __post_init__(self):
+        if self.embedding_dims is None:
+            self.embedding_dims = {
+                'Driver': 32,
+                'Team': 16,
+                'Circuit': 16,
+                'Year': 8,
+            }
+        if self.vocab_sizes is None:
+            self.vocab_sizes = {
+                'Driver': 76,
+                'Team': 18,
+                'Circuit': 35,
+                'Year': 8,
+            }
+
+
+@dataclass
+class TrainingConfig:
+    """Training hyperparameters."""
+    batch_size: int = 32
+    learning_rate: float = 1e-3
+    num_epochs: int = 100
+    weight_decay: float = 1e-5
+    gradient_clip: Optional[float] = 1.0
+    accumulation_steps: int = 1
+    
+    # Learning rate scheduling
+    scheduler_type: str = "cosine"  # "cosine", "linear", "lambda"
+    warm_up_epochs: int = 5
+    
+    # Teacher forcing schedule
+    teacher_forcing_start: float = 1.0  # Start with full teacher forcing
+    teacher_forcing_end: float = 0.5    # End with 50%
+    teacher_forcing_decay: str = "linear"  # "linear", "exponential"
+    
+    # Early stopping
+    early_stopping_patience: int = 15
+    validation_freq: int = 1  # Validate every N epochs
+    
+    # Data
+    train_years: list = None
+    val_years: list = None
+    test_years: list = None
+    
+    def __post_init__(self):
+        if self.train_years is None:
+            self.train_years = [2019, 2020, 2021, 2022, 2023]
+        if self.val_years is None:
+            self.val_years = [2024]
+        if self.test_years is None:
+            self.test_years = [2025]
+
+
+@dataclass
+class DataConfig:
+    """Data loading configuration."""
+    window_size: int = 10  # For stint dataloader
+    context_window: int = 5  # For autoregressive dataloader
+    augment_prob: float = 0.3
+    normalize: bool = True
+    scaler_type: str = "standard"
+    num_workers: int = 0
+    shuffle_train: bool = True
+    shuffle_val: bool = False
+    shuffle_test: bool = False
+
+
+@dataclass
+class Config:
+    """Master configuration combining all components."""
+    model: ModelConfig = None
+    training: TrainingConfig = None
+    data: DataConfig = None
+    device: str = "cuda"
+    seed: int = 42
+    output_dir: str = "./results"
+    
+    def __post_init__(self):
+        if self.model is None:
+            self.model = ModelConfig()
+        if self.training is None:
+            self.training = TrainingConfig()
+        if self.data is None:
+            self.data = DataConfig()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary."""
+        return {
+            'model': asdict(self.model),
+            'training': asdict(self.training),
+            'data': asdict(self.data),
+            'device': self.device,
+            'seed': self.seed,
+            'output_dir': self.output_dir,
+        }
+    
+    def save(self, path: Path):
+        """Save config to JSON file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+        
+        logger.info(f"Config saved to {path}")
+    
+    @classmethod
+    def load(cls, path: Path) -> 'Config':
+        """Load config from JSON file."""
+        path = Path(path)
+        
+        with open(path, 'r') as f:
+            data = json.load(f)
+        
+        config = cls(
+            model=ModelConfig(**data.get('model', {})),
+            training=TrainingConfig(**data.get('training', {})),
+            data=DataConfig(**data.get('data', {})),
+            device=data.get('device', 'cuda'),
+            seed=data.get('seed', 42),
+            output_dir=data.get('output_dir', './results'),
+        )
+        
+        logger.info(f"Config loaded from {path}")
+        return config
+    
+    def __str__(self) -> str:
+        """String representation."""
+        lines = ["Configuration:"]
+        
+        lines.append("\nModel:")
+        for key, val in asdict(self.model).items():
+            lines.append(f"  {key}: {val}")
+        
+        lines.append("\nTraining:")
+        for key, val in asdict(self.training).items():
+            if key not in ['train_years', 'val_years', 'test_years']:
+                lines.append(f"  {key}: {val}")
+            else:
+                lines.append(f"  {key}: {val}")
+        
+        lines.append("\nData:")
+        for key, val in asdict(self.data).items():
+            lines.append(f"  {key}: {val}")
+        
+        lines.append(f"\nDevice: {self.device}")
+        lines.append(f"Seed: {self.seed}")
+        lines.append(f"Output: {self.output_dir}")
+        
+        return "\n".join(lines)
+
+
+# Preset configurations
+def get_phase1_config() -> Config:
+    """
+    Phase 1: Pure teacher forcing, stint-based sequences.
+    
+    Returns
+    -------
+    Config
+        Configuration for Phase 1 training
+    """
+    model_config = ModelConfig(
+        name="seq2seq_gru",
+        hidden_size=128,
+        num_layers=2,
+        dropout=0.2,
+    )
+    
+    training_config = TrainingConfig(
+        batch_size=32,
+        learning_rate=1e-3,
+        num_epochs=100,
+        teacher_forcing_start=1.0,
+        teacher_forcing_end=1.0,  # Keep at 100% since it's pure teacher forcing
+        train_years=[2019, 2020, 2021, 2022, 2023],
+        val_years=[2024],
+        test_years=[2025],
+    )
+    
+    data_config = DataConfig(
+        window_size=20,
+        augment_prob=0.3,
+    )
+    
+    return Config(
+        model=model_config,
+        training=training_config,
+        data=data_config,
+        device="cuda",
+        output_dir="./results/phase1",
+    )
+
+
+def get_phase2_config() -> Config:
+    """
+    Phase 2: Full-race sequences with auxiliary heads.
+    
+    Returns
+    -------
+    Config
+        Configuration for Phase 2 training
+    """
+    model_config = ModelConfig(
+        name="seq2seq_gru",
+        hidden_size=256,
+        num_layers=3,
+        dropout=0.3,
+    )
+    
+    training_config = TrainingConfig(
+        batch_size=32,
+        learning_rate=5e-4,
+        num_epochs=150,
+        teacher_forcing_start=1.0,
+        teacher_forcing_end=0.5,
+        teacher_forcing_decay="exponential",
+        train_years=[2019, 2020, 2021],
+        val_years=[2022],
+        test_years=[2023],
+    )
+    
+    data_config = DataConfig(
+        window_size=50,
+        context_window=10,
+        augment_prob=0.5,
+    )
+    
+    return Config(
+        model=model_config,
+        training=training_config,
+        data=data_config,
+        device="cuda",
+        output_dir="./results/phase2",
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    # Example usage
+    config = get_phase1_config()
+    print(config)
+    
+    # Save config
+    config.save(Path("./config_phase1.json"))
+    
+    # Load config
+    loaded_config = Config.load(Path("./config_phase1.json"))
+    print("\nLoaded config:")
+    print(loaded_config)

@@ -113,6 +113,8 @@ class AutoregressiveLapDataloader(Dataset):
         context_window: int = 5,
         augment_prob: float = 0.0,
         normalize: bool = True,
+        scaler_type: str = "standard",
+        normalizer: Optional[LapTimeNormalizer] = None,
         data_path: Path = None,
         device: str = 'cpu',
         seed: int = None,
@@ -146,15 +148,19 @@ class AutoregressiveLapDataloader(Dataset):
         # Setup normalization
         self.normalizer = None
         if normalize:
-            self.normalizer = LapTimeNormalizer(scaler_type="standard")
-            # Try to load fitted scaler, if not available fit on data
-            try:
-                self.normalizer.load(self.years)
-                logger.info(f"Loaded pre-fitted scaler for years {self.years}")
-            except FileNotFoundError:
-                logger.info(f"Fitting scaler on data from years {self.years}...")
-                numeric_data = self.data[self.numeric_columns].copy()
-                self.normalizer.fit(numeric_data, years=self.years)
+            if normalizer is not None:
+                self.normalizer = normalizer
+                logger.info("Using provided normalizer")
+            else:
+                self.normalizer = LapTimeNormalizer(scaler_type=scaler_type)
+                # Try to load fitted scaler, if not available fit on data
+                try:
+                    self.normalizer.load(self.years)
+                    logger.info(f"Loaded pre-fitted scaler for years {self.years}")
+                except FileNotFoundError:
+                    logger.info(f"Fitting scaler on data from years {self.years}...")
+                    numeric_data = self.data[self.numeric_columns].copy()
+                    self.normalizer.fit(numeric_data, years=self.years)
         
         # Generate lap pairs
         logger.info("Generating (context_lap, next_lap) pairs...")

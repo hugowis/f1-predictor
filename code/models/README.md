@@ -67,7 +67,7 @@ python evaluate.py --checkpoint best_model.pt --config results/phase1/config.jso
 from pathlib import Path
 import torch
 from code.config import get_phase1_config
-from code.models import Seq2SeqGRU, Trainer
+from code.models import Seq2Seq, Trainer
 from code.dataloaders import StintDataloader
 from torch.optim import Adam
 from torch.utils.data import DataLoader
@@ -85,7 +85,7 @@ train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=32)
 
 # Create model
-model = Seq2SeqGRU(
+model = Seq2Seq(
     input_size=33,
     hidden_size=128,
     num_layers=2,
@@ -265,7 +265,7 @@ def _compute_all_metrics(self, predictions, targets):
 - Provides common interface and utility methods
 
 ### `code/models/seq2seq.py`
-- `Seq2SeqGRU`: Main model implementation
+- `Seq2Seq`: Main model implementation
 - Encoder-decoder with teacher forcing support
 
 ### `code/models/trainer.py`

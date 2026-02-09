@@ -16,12 +16,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     """Model architecture configuration."""
-    name: str = "seq2seq_gru"
+    name: str = "seq2seq"
     input_size: int = 33  # From dataloaders
     output_size: int = 1  # Predict single lap time
     hidden_size: int = 128
     num_layers: int = 2
     dropout: float = 0.2
+    encoder: str = 'gru'
     embedding_dims: Optional[Dict[str, int]] = None
     vocab_sizes: Optional[Dict[str, int]] = None
     
@@ -189,7 +190,7 @@ def get_phase1_config() -> Config:
         Configuration for Phase 1 training
     """
     model_config = ModelConfig(
-        name="seq2seq_gru",
+        name="seq2seq",
         hidden_size=128,
         num_layers=2,
         dropout=0.2,
@@ -230,7 +231,7 @@ def get_phase2_config() -> Config:
         Configuration for Phase 2 training
     """
     model_config = ModelConfig(
-        name="seq2seq_gru",
+        name="seq2seq",
         hidden_size=256,
         num_layers=3,
         dropout=0.3,

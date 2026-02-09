@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dataloaders import StintDataloader, LapTimeNormalizer
 from dataloaders.utils import load_all_races
-from models import Seq2SeqGRU, Evaluator, report_evaluation
+from models import Seq2Seq, Evaluator, report_evaluation
 from config.base import Config
 
 # Setup logging
@@ -64,12 +64,14 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
         raise ValueError("No model config found in checkpoint. Use --config flag or retrain.")
     
     # Create model with saved config
-    model = Seq2SeqGRU(
+    model = Seq2Seq(
         input_size=model_config.get('input_size', 33),
         output_size=model_config.get('output_size', 1),
         hidden_size=model_config.get('hidden_size', 128),
         num_layers=model_config.get('num_layers', 2),
         dropout=model_config.get('dropout', 0.2),
+        decoder_type=model_config.get('decoder_type', 'gru'),
+        encoder_type=model_config.get('encoder', model_config.get('encoder_type', 'gru')),
         embedding_dims=model_config.get('embedding_dims', {}),
         vocab_sizes=model_config.get('vocab_sizes', {}),
         device=device,

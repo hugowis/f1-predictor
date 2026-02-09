@@ -16,13 +16,15 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader, random_split
+from analyze_results import analyze_results as run_analysis
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataloaders import StintDataloader, LapTimeNormalizer
-from models import Seq2SeqGRU, Trainer, create_scheduler
+from models import Seq2Seq, Trainer, create_scheduler
 from config.base import Config, get_phase1_config, get_phase2_config
+from evaluate import evaluate as run_evaluation
 
 # Setup logging
 logging.basicConfig(
@@ -134,11 +136,13 @@ def create_model(config: Config, device: str = 'cpu'):
         'dropout': config.model.dropout,
         'embedding_dims': config.model.embedding_dims,
         'vocab_sizes': config.model.vocab_sizes,
+        'decoder_type': getattr(config.model, 'decoder_type', 'gru'),
+        'encoder_type': getattr(config.model, 'encoder', 'gru'),
         'device': device,
     }
     
-    if config.model.name == "seq2seq_gru":
-        model = Seq2SeqGRU(**model_config)
+    if config.model.name in ("seq2seq", "seq2seq_gru"):
+        model = Seq2Seq(**model_config)
     else:
         raise ValueError(f"Unknown model: {config.model.name}")
     
@@ -280,8 +284,8 @@ def main():
     parser.add_argument('--phase', type=int, choices=[1, 2], help='Use preset Phase N config')
     parser.add_argument('--config', type=Path, help='Path to config JSON file')
     parser.add_argument('--device', default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--postprocess', action='store_true', help='Run evaluation and analysis after training')
     parser.add_argument('--output', type=Path, help='Output directory for results')
+    parser.add_argument('--decoder-type', choices=['gru', 'lstm'], help='Decoder type to use (overrides config)')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning-rate', type=float, help='Learning rate')
@@ -305,15 +309,13 @@ def main():
     # Override config with command line arguments
     if args.device:
         config.device = args.device
-    # Postprocessing flag: if provided, request evaluation+analysis after training
-    if getattr(args, 'postprocess', False):
+    if getattr(args, 'decoder_type', None):
+        # Attach decoder_type to model config dynamically
         try:
-            config.training.run_postprocessing = True
+            config.model.decoder_type = args.decoder_type
         except Exception:
-            # Ensure training namespace exists
-            if not hasattr(config, 'training'):
-                config.training = type('T', (), {})()
-            config.training.run_postprocessing = True
+            setattr(config.model, 'decoder_type', args.decoder_type)
+
     if args.batch_size:
         config.training.batch_size = args.batch_size
     if args.epochs:
@@ -333,33 +335,33 @@ def main():
     logger.info(f"Final train loss: {history['train_loss'][-1]:.6f}")
     logger.info(f"Total epochs trained: {len(history['train_loss'])}")
 
+    # Post-training: run evaluation using the best checkpoint then analysis
+    try:
+        checkpoint_path = (output_dir / "checkpoints" / "best_model.pt")
+        if checkpoint_path.exists():
+            logger.info(f"Running evaluation on checkpoint: {checkpoint_path}")
+            run_evaluation(
+                checkpoint_path=checkpoint_path,
+                test_years=config.training.test_years,
+                config_path=output_dir / "config.json",
+                device=config.device,
+                output_dir=output_dir / "evaluation",
+            )
+        else:
+            logger.warning(f"Checkpoint not found: {checkpoint_path}. Skipping evaluation.")
+    except Exception as e:
+        logger.exception(f"Evaluation failed: {e}")
+
+    # Run post-training analysis (call function directly)
+    try:
+        logger.info("Running post-training analysis...")
+        # call with explicit results_dir to avoid relying on run name
+        run_analysis(run=output_dir.name, results_dir=output_dir)
+    except Exception as e:
+        logger.exception(f"Post-training analysis failed: {e}")
+
 
 if __name__ == "__main__":
-    # Optionally run postprocessing (evaluation + analysis) if requested
-    args = None
-    try:
-        # Reparse to check for postprocess flag
-        import sys as _sys
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument('--postprocess', action='store_true')
-        args, _ = parser.parse_known_args(_sys.argv[1:])
-    except Exception:
-        args = None
 
     main()
 
-    # If postprocess requested, call the wrapper in code/postprocess.py
-    try:
-        if args and getattr(args, 'postprocess', False):
-            from postprocess import run_postprocessing
-            from pathlib import Path as _Path
-            # Best checkpoint location
-            cp = _Path(config.output_dir) / 'checkpoints' / 'best_model.pt'
-            # If main didn't expose `config`, try loading saved config
-            try:
-                run_postprocessing(cp, config_path=_Path(config.output_dir) / 'config.json', device=config.device, output_dir=_Path(config.output_dir))
-            except Exception:
-                # Fallback: use output_dir and device derived from arguments
-                run_postprocessing(cp, config_path=_Path(config.output_dir) / 'config.json', device=config.device, output_dir=_Path(config.output_dir))
-    except Exception:
-        pass

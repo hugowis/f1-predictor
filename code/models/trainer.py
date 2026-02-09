@@ -48,7 +48,7 @@ class Trainer:
     
     Examples
     --------
-    >>> model = Seq2SeqGRU(...)
+    >>> model = Seq2Seq(...)
     >>> optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     >>> criterion = nn.MSELoss()
     >>> 

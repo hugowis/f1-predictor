@@ -58,6 +58,10 @@ This project builds a **sequence-to-sequence (seq2seq) model** to solve the lap 
 
 ---
 
+
+**LSTM vs GRU Comparison (concise)**: The LSTM Phase 1 run achieves similar MAE to the GRU run but shows notably lower RMSE and MAPE, while the median absolute error is slightly higher — see the GRU summary above and the LSTM metrics here for direct comparison.
+
+
 ## Quick Start - Training Pipeline
 
 All training and evaluation scripts are located in the `code/` folder for better organization.
@@ -88,10 +92,8 @@ python code/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --
 ### Visualizing Results
 
 ```bash
-# Generate loss curves and error distribution plots
-python code/visualize_results.py
 
-# Generate error analysis report
+# Generate error analysis report, loss curves and error distribution plots
 python code/analyze_results.py
 ```
 
@@ -183,7 +185,7 @@ Predict the **next lap times** for a given driver.
 ### 🚀 Phase 2: In Planning
 
 **Objectives:**
-- [ ] Extend sequence length to full races
+- [ ] Extend sequence length to full races, masking for not normal laps
 - [ ] Implement autoregressive predictions (free-running mode)
 - [ ] Auxiliary pit head and compound head
 - [ ] Scheduled sampling (gradual removal of teacher forcing)
@@ -228,7 +230,7 @@ Predict the **next lap times** for a given driver.
 - ✅ Stint-based sequences (1-20 laps)
 - ✅ Multi-layer RNN (2 layers)
 - ✅ Dropout and gradient clipping
-- [ ] LSTM variant comparison
+- ✅ LSTM variant comparison
 
 ### Modeling - Phase 2
 - [ ] Full-race sequences
@@ -258,7 +260,6 @@ Predict the **next lap times** for a given driver.
 - [ ] Circuit-level error analysis
 - [ ] Stint-phase analysis (early/mid/late)
 - [ ] Compound-specific analysis
-- [ ] Statistical significance testing
 
 ### Infrastructure & Deployment
 - ✅ Modular code structure
@@ -273,7 +274,6 @@ Predict the **next lap times** for a given driver.
 ## Experiments
 - [ ] Add 2018 season data
 - [ ] Test with dropped features (sectors, speeds, position)
-- [ ] Qualify test data (session type tags)
 - [ ] Pretraining on FP sessions, qualifycation data, sprin, etc.
 
 

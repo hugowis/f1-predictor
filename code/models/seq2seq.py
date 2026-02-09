@@ -24,7 +24,7 @@ from dataloaders.utils import get_numeric_columns, get_categorical_columns, get_
 logger = logging.getLogger(__name__)
 
 
-class Seq2SeqGRU(BaseModel):
+class Seq2Seq(BaseModel):
     """
     Sequence-to-sequence model with GRU encoder-decoder architecture.
     
@@ -79,7 +79,7 @@ class Seq2SeqGRU(BaseModel):
     ...     'embedding_dims': {'Driver': 32, 'Team': 16},
     ...     'vocab_sizes': {'Driver': 76, 'Team': 18},
     ... }
-    >>> model = Seq2SeqGRU(**config)
+    >>> model = Seq2Seq(**config)
     >>> 
     >>> # Encoder input: (batch, seq_len, input_size)
     >>> encoder_input = torch.randn(32, 5, config['input_size'])
@@ -99,6 +99,8 @@ class Seq2SeqGRU(BaseModel):
         hidden_size: int = 128,
         num_layers: int = 2,
         dropout: float = 0.2,
+        decoder_type: str = 'gru',
+        rnn_type: str = None,
         encoder_input_size: Optional[int] = None,
         decoder_output_size: Optional[int] = None,
         embedding_dims: Optional[Dict[str, int]] = None,
@@ -112,6 +114,7 @@ class Seq2SeqGRU(BaseModel):
             'hidden_size': hidden_size,
             'num_layers': num_layers,
             'dropout': dropout,
+            'decoder_type': decoder_type,
             'encoder_input_size': encoder_input_size or input_size,
             'decoder_output_size': decoder_output_size or output_size,
             'embedding_dims': embedding_dims or {},
@@ -125,6 +128,15 @@ class Seq2SeqGRU(BaseModel):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = dropout
+        # Determine unified RNN type (GRU or LSTM).
+        # Priority: explicit rnn_type param > decoder_type param > kwargs encoder/decoder > default 'gru'
+        chosen = (rnn_type or decoder_type or kwargs.get('encoder_type') or kwargs.get('decoder_type') or 'gru')
+        self.rnn_type = chosen.lower()
+        if self.rnn_type not in ('gru', 'lstm'):
+            raise ValueError("rnn_type must be either 'gru' or 'lstm'")
+        # Keep legacy attributes for compatibility
+        self.decoder_type = self.rnn_type
+        self.encoder_type = self.rnn_type
         
         # Embeddings for categorical features
         self.embeddings = nn.ModuleDict()
@@ -147,15 +159,25 @@ class Seq2SeqGRU(BaseModel):
             base_numeric = max(0, input_size - num_categorical)
             self.encoder_input_size = base_numeric + self.total_embedding_size
         
-        # ENCODER: GRU that processes past laps
-        self.encoder = nn.GRU(
-            input_size=self.encoder_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-            bidirectional=False,
-        )
+        # ENCODER: GRU or LSTM that processes past laps
+        if self.rnn_type == 'gru':
+            self.encoder = nn.GRU(
+                input_size=self.encoder_input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
+                bidirectional=False,
+            )
+        else:
+            self.encoder = nn.LSTM(
+                input_size=self.encoder_input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
+                bidirectional=False,
+            )
         
         # Encoder output projection (optional, for decoder initialization)
         self.fc_encoder_to_hidden = nn.Linear(hidden_size, hidden_size)
@@ -165,15 +187,26 @@ class Seq2SeqGRU(BaseModel):
         # If you later want to include embeddings or extra context per step,
         # adjust `decoder_input_size` and ensure `current_input` includes them.
         decoder_input_size = output_size
-        
-        self.decoder = nn.GRU(
-            input_size=decoder_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-            bidirectional=False,
-        )
+        # Decoder can be GRU or LSTM based on `decoder_type`.
+        if self.rnn_type == 'gru':
+            self.decoder = nn.GRU(
+                input_size=decoder_input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
+                bidirectional=False,
+            )
+        else:
+            # LSTM decoder
+            self.decoder = nn.LSTM(
+                input_size=decoder_input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
+                bidirectional=False,
+            )
         
         # Decoder output projection to lap time prediction
         self.fc_decoder_output = nn.Linear(hidden_size, output_size)
@@ -310,14 +343,25 @@ class Seq2SeqGRU(BaseModel):
         decoder_seq_len = decoder_input.size(1)
         
         # ENCODER: process input sequence
-        encoder_output, encoder_hidden = self.encoder(encoder_input)
+        enc_result = self.encoder(encoder_input)
+        if self.encoder_type == 'lstm':
+            encoder_output, (enc_h, enc_c) = enc_result
+            encoder_hidden = enc_h
+        else:
+            encoder_output, encoder_hidden = enc_result
         # encoder_output: (batch, encoder_seq_len, hidden_size)
         # encoder_hidden: (num_layers, batch, hidden_size)
         
         # Use last encoder hidden state to initialize decoder
-        decoder_hidden = self.fc_encoder_to_hidden(encoder_output[:, -1, :]).unsqueeze(0)
-        # decoder_hidden: (1, batch, hidden_size) -> expand to (num_layers, batch, hidden_size)
-        decoder_hidden = decoder_hidden.expand(self.num_layers, batch_size, self.hidden_size).contiguous()
+        base_hidden = self.fc_encoder_to_hidden(encoder_output[:, -1, :]).unsqueeze(0)
+        # expand to (num_layers, batch, hidden_size)
+        expanded = base_hidden.expand(self.num_layers, batch_size, self.hidden_size).contiguous()
+        if self.decoder_type == 'gru':
+            decoder_hidden = expanded
+        else:
+            # LSTM: initialize (h0, c0). Use zeros for cell state.
+            c0 = torch.zeros_like(expanded)
+            decoder_hidden = (expanded, c0)
         
         # DECODER: generate output sequence
         outputs = []
@@ -327,7 +371,11 @@ class Seq2SeqGRU(BaseModel):
             # Decoder step: single time step
             decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
             # Ensure decoder_hidden is contiguous for next iteration (GPU requirement)
-            decoder_hidden = decoder_hidden.contiguous()
+            if isinstance(decoder_hidden, tuple):
+                h, c = decoder_hidden
+                decoder_hidden = (h.contiguous(), c.contiguous())
+            else:
+                decoder_hidden = decoder_hidden.contiguous()
             # decoder_output: (batch, 1, hidden_size)
             
             # Project hidden state to output
@@ -399,6 +447,12 @@ class Seq2SeqGRU(BaseModel):
         
         for _ in range(max_length):
             decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
+            # Normalize hidden tensors if LSTM tuple
+            if isinstance(decoder_hidden, tuple):
+                h, c = decoder_hidden
+                decoder_hidden = (h.contiguous(), c.contiguous())
+            else:
+                decoder_hidden = decoder_hidden.contiguous()
             step_output = self.fc_decoder_output(decoder_output)
             outputs.append(step_output)
             current_input = step_output

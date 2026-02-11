@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -131,6 +132,7 @@ def create_test_dataloader(
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
+        collate_fn=lambda batch: default_collate([b for b in batch if b is not None])
     )
     
     return test_loader
@@ -282,12 +284,25 @@ def evaluate(
         logger.info(f"  {category}: {percentage:.2f}%")
     
     # Save evaluation results
+    # Save per-sample predictions and metadata (for downstream analysis)
+    preds_file = output_dir / 'predictions.npz'
+    meta_file = output_dir / 'predictions_metadata.json'
+    try:
+        np.savez_compressed(preds_file, predictions=pred_denorm, targets=target_denorm)
+        with open(meta_file, 'w', encoding='utf-8') as mf:
+            json.dump(predictions.get('metadata', []), mf, default=str, indent=2)
+        logger.info(f"Saved per-sample predictions to {preds_file} and metadata to {meta_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save predictions/metadata: {e}")
+
     results = {
         'checkpoint': str(checkpoint_path),
         'test_years': test_years,
         'metrics': metrics,
         'metrics_denormalized_ms': metrics_denorm,
         'error_breakdown': error_breakdown,
+        'predictions_file': str(preds_file),
+        'predictions_metadata_file': str(meta_file),
     }
     
     results_path = output_dir / "evaluation_results.json"

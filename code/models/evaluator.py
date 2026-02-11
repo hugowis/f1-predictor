@@ -68,7 +68,7 @@ class Evaluator:
         self.model.eval()
         all_predictions = []
         all_targets = []
-        all_metadata = []
+        all_metadata = []  # will store per-sample metadata dicts
         sum_se = 0.0
         total_count = 0
         
@@ -164,7 +164,64 @@ class Evaluator:
                 # Store valid predictions/targets for metrics
                 all_predictions.append(preds_np[valid_mask])
                 all_targets.append(targs_np[valid_mask])
-                all_metadata.append(metadata)
+
+                # Align metadata to valid entries and store per-sample
+                meta_list = []
+
+                # Robustly handle collated metadata which may be:
+                # - a dict of arrays/tensors (default_collate behavior)
+                # - a list of per-sample dicts
+                # - a single dict
+                if isinstance(metadata, dict):
+                    # Try to build list of per-sample dicts from dict of batched values
+                    # Determine batch length from first value
+                    try:
+                        first_val = next(iter(metadata.values()))
+                        batch_len = len(first_val)
+                    except Exception:
+                        batch_len = None
+
+                    if batch_len is None:
+                        meta_list = [metadata]
+                    else:
+                        for i in range(batch_len):
+                            item = {}
+                            for k, v in metadata.items():
+                                try:
+                                    if isinstance(v, torch.Tensor):
+                                        elem = v[i]
+                                        if elem.numel() == 1:
+                                            val = elem.item()
+                                        else:
+                                            val = elem.cpu().numpy().tolist()
+                                    elif isinstance(v, np.ndarray):
+                                        elem = v[i]
+                                        try:
+                                            val = elem.item()
+                                        except Exception:
+                                            val = elem.tolist()
+                                    else:
+                                        # list or scalar
+                                        val = v[i]
+                                except Exception:
+                                    val = None
+                                item[k] = val
+                            meta_list.append(item)
+
+                elif isinstance(metadata, (list, tuple)):
+                    meta_list = list(metadata)
+                else:
+                    meta_list = [metadata]
+
+                # If metadata length matches preds length, select by valid_mask
+                if len(meta_list) == len(valid_mask):
+                    for i, ok in enumerate(valid_mask):
+                        if ok:
+                            all_metadata.append(meta_list[i])
+                else:
+                    # Fallback: append a placeholder for each valid prediction
+                    for _ in range(int(valid_mask.sum())):
+                        all_metadata.append({'note': 'missing_metadata'})
         
         # Aggregate results
         if len(all_predictions) > 0:

@@ -8,6 +8,7 @@ writes human-readable reports and figures into `results/phase1/`.
 import argparse
 import json
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
@@ -118,6 +119,174 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
             print(f"✓ Saved test_metrics_summary.png")
     else:
         print("No evaluation error breakdown found — skipping error plots.")
+
+    # 2.3 Group-level analyses (driver, circuit, stint phase, compound) if per-sample predictions exist
+    preds_path = eval_dir / 'predictions.npz'
+    meta_path = eval_dir / 'predictions_metadata.json'
+    if preds_path.exists():
+        try:
+            data = np.load(preds_path, allow_pickle=True)
+            pred_arr = data['predictions']
+            targ_arr = data['targets']
+
+            if meta_path.exists():
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta_list = json.load(f)
+            else:
+                meta_list = []
+
+            # Ensure alignment
+            L = min(len(pred_arr), len(targ_arr), len(meta_list)) if len(meta_list) > 0 else min(len(pred_arr), len(targ_arr))
+            pred_arr = np.asarray(pred_arr).reshape(-1)[:L]
+            targ_arr = np.asarray(targ_arr).reshape(-1)[:L]
+            if len(meta_list) > 0:
+                meta_list = meta_list[:L]
+            else:
+                # build minimal metadata if none present
+                meta_list = [{'idx': int(i)} for i in range(L)]
+
+            df = pd.DataFrame(meta_list)
+
+            # Map driver/circuit integer IDs back to short codes using vocabs if available
+            try:
+                vocabs_dir = Path(__file__).parent.parent / 'data' / 'vocabs'
+                driver_map = {}
+                circuit_map = {}
+                driver_vocab_path = vocabs_dir / 'Driver.json'
+                circuit_vocab_path = vocabs_dir / 'Circuit.json'
+
+                if driver_vocab_path.exists():
+                    with open(driver_vocab_path, 'r', encoding='utf-8') as f:
+                        dv = json.load(f)
+                    # inverse mapping: int -> code
+                    driver_map = {int(v): k for k, v in dv.items()}
+
+                if circuit_vocab_path.exists():
+                    with open(circuit_vocab_path, 'r', encoding='utf-8') as f:
+                        cv = json.load(f)
+                    circuit_map = {int(v): k for k, v in cv.items()}
+                # optional team vocab
+                team_vocab_path = vocabs_dir / 'Team.json'
+                team_map = {}
+                if team_vocab_path.exists():
+                    with open(team_vocab_path, 'r', encoding='utf-8') as f:
+                        tv = json.load(f)
+                    team_map = {int(v): k for k, v in tv.items()}
+
+                if 'driver' in df.columns and driver_map:
+                    df['driver_code'] = df['driver'].apply(lambda x: driver_map.get(int(x), str(x)))
+                else:
+                    df['driver_code'] = df['driver'].astype(str)
+
+                if 'circuit' in df.columns and circuit_map:
+                    df['circuit_code'] = df['circuit'].apply(lambda x: circuit_map.get(int(x), str(x)))
+                else:
+                    df['circuit_code'] = df['circuit'].astype(str)
+                if 'team' in df.columns and team_map:
+                    df['team_code'] = df['team'].apply(lambda x: team_map.get(int(x), str(x)) if pd.notna(x) else 'unknown')
+                elif 'team' in df.columns:
+                    df['team_code'] = df['team'].astype(str)
+            except Exception:
+                df['driver_code'] = df['driver'].astype(str) if 'driver' in df.columns else ''
+                df['circuit_code'] = df['circuit'].astype(str) if 'circuit' in df.columns else ''
+            df['prediction'] = pred_arr
+            df['target'] = targ_arr
+            df['error_abs'] = np.abs(df['prediction'] - df['target'])
+            df['error_signed'] = df['prediction'] - df['target']
+
+            # Driver-level
+            try:
+                driver_stats = df.groupby('driver_code').apply(lambda g: pd.Series({
+                    'mae': float(g['error_abs'].mean()),
+                    'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
+                    'median_ae': float(g['error_abs'].median()),
+                    'count': int(len(g))
+                }))
+                driver_stats.to_csv(results_dir / 'driver_level.csv')
+
+                top = driver_stats.sort_values('count', ascending=False).head(20)
+                fig, ax = plt.subplots(figsize=(10, 5))
+                ax.bar(top.index.astype(str), top['mae'])
+                ax.set_title('Driver MAE (top 20 by samples)')
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(results_dir / 'driver_level_mae.png', dpi=300, bbox_inches='tight')
+                plt.close()
+            except Exception:
+                print('Driver-level analysis skipped (missing driver metadata)')
+
+            # Circuit-level
+            try:
+                circuit_stats = df.groupby('circuit_code').apply(lambda g: pd.Series({
+                    'mae': float(g['error_abs'].mean()),
+                    'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
+                    'median_ae': float(g['error_abs'].median()),
+                    'count': int(len(g))
+                }))
+                circuit_stats.to_csv(results_dir / 'circuit_level.csv')
+
+                topc = circuit_stats.sort_values('count', ascending=False).head(20)
+                fig, ax = plt.subplots(figsize=(10, 5))
+                ax.bar(topc.index.astype(str), topc['mae'])
+                ax.set_title('Circuit MAE (top 20 by samples)')
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(results_dir / 'circuit_level_mae.png', dpi=300, bbox_inches='tight')
+                plt.close()
+            except Exception:
+                print('Circuit-level analysis skipped (missing circuit metadata)')
+
+            # Stint-phase analysis removed by request
+
+            # Team-level analysis
+            try:
+                if 'team_code' in df.columns:
+                    team_stats = df.groupby('team_code').apply(lambda g: pd.Series({
+                        'mae': float(g['error_abs'].mean()),
+                        'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
+                        'median_ae': float(g['error_abs'].median()),
+                        'count': int(len(g))
+                    }))
+                    team_stats.to_csv(results_dir / 'team_level.csv')
+
+                    topt = team_stats.sort_values('count', ascending=False).head(20)
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    ax.bar(topt.index.astype(str), topt['mae'])
+                    ax.set_title('Team MAE (top 20 by samples)')
+                    plt.xticks(rotation=45, ha='right')
+                    plt.tight_layout()
+                    plt.savefig(results_dir / 'team_level_mae.png', dpi=300, bbox_inches='tight')
+                    plt.close()
+                else:
+                    print('Skipping team-level analysis (missing team metadata)')
+            except Exception:
+                print('Team-level analysis failed')
+
+            # Compound-specific analysis
+            if 'compound' in df.columns:
+                try:
+                    comp_stats = df.groupby('compound').apply(lambda g: pd.Series({
+                        'mae': float(g['error_abs'].mean()),
+                        'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
+                        'median_ae': float(g['error_abs'].median()),
+                        'count': int(len(g))
+                    })).sort_values('count', ascending=False)
+                    comp_stats.to_csv(results_dir / 'compound_level.csv')
+
+                    topcomp = comp_stats.head(20)
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    ax.bar(topcomp.index.astype(str), topcomp['mae'])
+                    ax.set_title('Compound MAE (top 20)')
+                    plt.xticks(rotation=45, ha='right')
+                    plt.tight_layout()
+                    plt.savefig(results_dir / 'compound_level_mae.png', dpi=300, bbox_inches='tight')
+                    plt.close()
+                except Exception:
+                    print('Compound analysis failed')
+
+            print(f"✓ Saved driver/circuit/phase/compound analyses (CSV + plots) to {results_dir}")
+        except Exception as e:
+            print(f"Failed to run group analyses: {e}")
 
     print("\n[3/3] Writing analysis report...")
 

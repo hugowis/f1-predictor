@@ -191,11 +191,19 @@ class StintDataloader(Dataset):
             
             for seq in stint_sequences:
                 if len(seq) >= 2:  # Need at least input + target
+                    # extract team from the sequence (constant within group)
+                    try:
+                        team_val = seq['Team'].iloc[0]
+                        team_val = int(team_val)
+                    except Exception:
+                        team_val = seq['Team'].iloc[0] if 'Team' in seq.columns else None
+
                     stints.append({
                         'laps': seq,
                         'driver': int(driver),
                         'year': int(year),
                         'circuit': int(circuit),
+                        'team': team_val,
                         'stint_id': int(stint_id),
                         'length': len(seq),
                     })
@@ -338,26 +346,55 @@ class StintDataloader(Dataset):
             Metadata: {'driver', 'year', 'circuit', 'stint_id', 'length'}
         """
         stint = self.stints[idx]
-        laps = stint['laps'].copy()
-        
+
+        # Original unmodified laps (used to capture compound and positions)
+        laps_orig = stint['laps'].copy()
+
+        # Capture compound and target position BEFORE normalization/augmentation
+        try:
+            # Some cleaned datasets provide one-hot compound columns instead of a 'Compound' label
+            row = laps_orig.iloc[-1]
+            orig_comp = None
+            # Check for explicit 'Compound' column first
+            if 'Compound' in row.index:
+                orig_comp = row.get('Compound', None)
+            else:
+                # Try one-hot columns
+                for col in self.compound_columns:
+                    if col in row.index and int(row[col]) == 1:
+                        # map 'compound_soft' -> 'soft'
+                        orig_comp = col.replace('compound_', '')
+                        break
+
+            if orig_comp is None or (isinstance(orig_comp, float) and np.isnan(orig_comp)):
+                orig_comp = 'unknown'
+            else:
+                orig_comp = str(orig_comp)
+        except Exception:
+            orig_comp = 'unknown'
+
+        target_pos = len(laps_orig) - 1
+        stint_len = len(laps_orig)
+
+        # Work on a copy for augmentation/normalization
+        laps = laps_orig.copy()
+
         # Apply augmentation if enabled
         if np.random.random() < self.augment_prob:
             laps = self._apply_augmentation(laps)
-        
+
         # Normalize numeric features
         if self.normalizer is not None:
             laps = self.normalizer.transform(laps)
-        
-        # Extract features and target
-        # Input: all laps except last
-        # Target: last lap's time
+
+        # Extract features and target (last lap is the target)
         input_laps = laps.iloc[:-1]
         target_lap = laps.iloc[-1]
-        
+
         # Pad or truncate to window size
         if len(input_laps) > self.window_size:
             input_laps = input_laps.iloc[-self.window_size:]
-        
+
         # Build feature matrix
         features_list = []
         for _, lap in input_laps.iterrows():
@@ -368,7 +405,6 @@ class StintDataloader(Dataset):
         if features_list:
             features = np.array(features_list, dtype=np.float32)
         else:
-            # Padding case: empty input sequence
             num_features = len(self._get_lap_features(input_laps.iloc[0])) if len(input_laps) > 0 else 100
             features = np.zeros((0, num_features), dtype=np.float32)
 
@@ -388,8 +424,10 @@ class StintDataloader(Dataset):
             'driver': stint['driver'],
             'year': stint['year'],
             'circuit': stint['circuit'],
+            'team': stint.get('team', None),
             'stint_id': stint['stint_id'],
             'length': stint['length'],
+            'compound': orig_comp,
         }
 
         return features_tensor, target_tensor, metadata

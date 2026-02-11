@@ -231,13 +231,14 @@ Predict the **next lap times** for a given driver.
 - ✅ Multi-layer RNN (2 layers)
 - ✅ Dropout and gradient clipping
 - ✅ LSTM variant comparison
+- ✅ Driver embeddings
+- ✅ Team/car embeddings
 
 ### Modeling - Phase 2
 - [ ] Full-race sequences
 - [ ] Autoregressive generation
-- [ ] Pit stop modeling
-- [ ] Driver embeddings
-- [ ] Team/car embeddings
+- [ ] Pit stop modeling (head for pit lap prediction)
+- [ ] Compound modeling (head for tire compound prediction)
 - [ ] Transformer decoder
 - [ ] Attention mechanisms
 
@@ -256,10 +257,10 @@ Predict the **next lap times** for a given driver.
 - ✅ Error breakdown by ranges
 - ✅ Loss curve visualization
 - ✅ Error distribution plots
-- [ ] Driver-level error analysis
-- [ ] Circuit-level error analysis
-- [ ] Stint-phase analysis (early/mid/late)
-- [ ] Compound-specific analysis
+- ✅ Driver-level error analysis
+- ✅ Circuit-level error analysis
+- ✅ Team-level error analysis
+- ✅ Compound-specific analysis
 
 ### Infrastructure & Deployment
 - ✅ Modular code structure

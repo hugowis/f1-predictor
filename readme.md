@@ -220,7 +220,7 @@ Predict the **next lap times** for a given driver.
 - ✅ Stint-based sequence creation
 - ✅ Data normalization (per-year StandardScaler)
 - ✅ Masking for non-finite values
-- [ ] Add 2018 season (different compounds and missing data)
+- ✅ Add 2018 season (different compounds and missing data)
 - [ ] Advanced augmentation techniques
 - [ ] Feature engineering (momentum, trend indicators)
 

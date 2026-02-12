@@ -34,13 +34,39 @@ class ModelConfig:
                 'Circuit': 16,
                 'Year': 8,
             }
+
+        # Attempt to infer vocab sizes from cleaned data vocabs (data/vocabs/*.json).
+        # This prevents embedding index out-of-bounds when new categories (e.g. 2018) are added.
         if self.vocab_sizes is None:
-            self.vocab_sizes = {
-                'Driver': 76,
-                'Team': 18,
-                'Circuit': 35,
-                'Year': 8,
-            }
+            try:
+                vocabs_dir = Path("data") / "vocabs"
+                inferred = {}
+                for key in ['Driver', 'Team', 'Circuit', 'Year']:
+                    fp = vocabs_dir / f"{key}.json"
+                    if fp.exists():
+                        with open(fp, 'r', encoding='utf-8') as f:
+                            mapping = json.load(f)
+                        # mapping values are indices; vocab_size = max_index + 1
+                        max_index = max(mapping.values()) if mapping else 0
+                        inferred[key] = int(max_index) + 1
+
+                # Fallback to sensible defaults for any missing entries
+                defaults = {
+                    'Driver': 76,
+                    'Team': 18,
+                    'Circuit': 35,
+                    'Year': 8,
+                }
+                # Merge inferred with defaults
+                self.vocab_sizes = {k: inferred.get(k, defaults[k]) for k in defaults}
+            except Exception:
+                # If anything fails, use hard-coded defaults
+                self.vocab_sizes = {
+                    'Driver': 76,
+                    'Team': 18,
+                    'Circuit': 35,
+                    'Year': 8,
+                }
 
 
 @dataclass
@@ -73,7 +99,7 @@ class TrainingConfig:
     
     def __post_init__(self):
         if self.train_years is None:
-            self.train_years = [2019, 2020, 2021, 2022, 2023]
+            self.train_years = [2018, 2019, 2020, 2021, 2022, 2023]
         if self.val_years is None:
             self.val_years = [2024]
         if self.test_years is None:

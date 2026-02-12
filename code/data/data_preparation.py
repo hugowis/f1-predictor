@@ -82,7 +82,7 @@ class DataPreparation:
             self._add_trackstatus_flag,
             self._compute_delta_to_car_ahead,
             self._convert_bool,
-            self._encode_compoud,
+            self._encode_compound,
             self._add_fuel_proxy,
             self._to_categorical,
             self._add_stint_length,
@@ -206,11 +206,11 @@ class DataPreparation:
 
         return df
     
-    def _encode_compoud(self, df, **_):
+    def _encode_compound(self, df, **_):
         df["Compound"] = df["Compound"].fillna("UNKNOWN")
 
         df["Compound"] = df["Compound"].str.upper()
-        for c in ["SOFT", "MEDIUM", "HARD", "UNKNOWN"]:
+        for c in ["ULTRASOFT", "SUPERSOFT", "HYPERSOFT", "SOFT", "MEDIUM", "HARD", "UNKNOWN"]:
             df[f"compound_{c.lower()}"] = (df["Compound"] == c).astype("Int64")
         return df
 
@@ -317,4 +317,4 @@ class DataPreparation:
                 json.dump(self.categories[k], f, indent=2, sort_keys=True)
 
 if __name__ == "__main__":
-    DataPreparation(DATA_PATH).prepare()
+    DataPreparation(DATA_PATH).prepare(skip_2018=False)

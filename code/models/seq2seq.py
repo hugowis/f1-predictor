@@ -125,6 +125,12 @@ class Seq2Seq(BaseModel):
         
         self.input_size = input_size
         self.output_size = output_size
+        # Number of compound classes (one-hot compound columns)
+        # Default to number of compound columns from dataloader utils
+        try:
+            self.compound_classes = kwargs.get('compound_classes', len(get_compound_columns()))
+        except Exception:
+            self.compound_classes = kwargs.get('compound_classes', 4)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = dropout
@@ -210,9 +216,10 @@ class Seq2Seq(BaseModel):
         
         # Decoder output projection to lap time prediction
         self.fc_decoder_output = nn.Linear(hidden_size, output_size)
-        
-        # Optional: additional layer for better expressiveness
-        self.fc_hidden = nn.Linear(hidden_size * 2, hidden_size)  # Concatenates encoder+decoder
+        # Pit stop head (binary logit)
+        self.fc_pit = nn.Linear(hidden_size, 1)
+        # Compound prediction head (logits over compound classes)
+        self.fc_compound = nn.Linear(hidden_size, self.compound_classes)
         
         self.to(device)
     
@@ -364,9 +371,29 @@ class Seq2Seq(BaseModel):
             decoder_hidden = (expanded, c0)
         
         # DECODER: generate output sequence
-        outputs = []
-        current_input = decoder_input[:, 0:1, :]  # Start with first ground truth
-        
+        # Fast path: when using full teacher forcing (deterministic), run the
+        # decoder in a single vectorized call to avoid Python-level timestep
+        # loop and many small kernel launches which drastically reduce GPU
+        # utilization.
+        if teacher_forcing and teacher_forcing_ratio >= 0.999:
+            # decoder_input shape: (batch, seq_len, output_size)
+            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+            # decoder_output: (batch, seq_len, hidden_size)
+            lap_out = self.fc_decoder_output(decoder_output)  # (batch, seq_len, output_size)
+            pit_out = self.fc_pit(decoder_output).squeeze(-1)  # (batch, seq_len)
+            comp_out = self.fc_compound(decoder_output)  # (batch, seq_len, C)
+
+            return {
+                'lap': lap_out,
+                'pit_logits': pit_out,
+                'compound_logits': comp_out,
+            }
+
+        outputs_lap = []
+        outputs_pit = []
+        outputs_compound = []
+        current_input = decoder_input[:, 0:1, :]  # Start with first ground truth (lap time)
+
         for t in range(decoder_seq_len):
             # Decoder step: single time step
             decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
@@ -377,24 +404,36 @@ class Seq2Seq(BaseModel):
             else:
                 decoder_hidden = decoder_hidden.contiguous()
             # decoder_output: (batch, 1, hidden_size)
-            
+
             # Project hidden state to output
             step_output = self.fc_decoder_output(decoder_output)  # (batch, 1, output_size)
-            outputs.append(step_output)
-            
+            step_pit_logit = self.fc_pit(decoder_output)  # (batch, 1, 1)
+            step_comp_logits = self.fc_compound(decoder_output)  # (batch, 1, C)
+
+            outputs_lap.append(step_output)
+            outputs_pit.append(step_pit_logit.squeeze(-1))
+            outputs_compound.append(step_comp_logits)
+
             # Decide whether to use teacher forcing or own prediction
             use_teacher = teacher_forcing and (torch.rand(1).item() < teacher_forcing_ratio)
-            
+
             if use_teacher and t < decoder_seq_len - 1:
-                # Use ground truth from decoder_input
+                # Use ground truth from decoder_input (lap time only)
                 current_input = decoder_input[:, t+1:t+2, :]
             else:
                 # Use model's prediction (autoregressive)
                 current_input = step_output
         
         # Concatenate all outputs
-        outputs = torch.cat(outputs, dim=1)  # (batch, decoder_seq_len, output_size)
-        return outputs
+        lap_out = torch.cat(outputs_lap, dim=1)  # (batch, decoder_seq_len, output_size)
+        pit_out = torch.cat(outputs_pit, dim=1)  # (batch, decoder_seq_len)
+        comp_out = torch.cat(outputs_compound, dim=1)  # (batch, decoder_seq_len, C)
+
+        return {
+            'lap': lap_out,
+            'pit_logits': pit_out,
+            'compound_logits': comp_out,
+        }
 
     def encode(self, encoder_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -442,9 +481,11 @@ class Seq2Seq(BaseModel):
         batch_size = decoder_input.size(0)
         max_length = max_length or decoder_input.size(1)
         
-        outputs = []
+        outputs_lap = []
+        outputs_pit = []
+        outputs_compound = []
         current_input = decoder_input[:, 0:1, :]
-        
+
         for _ in range(max_length):
             decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
             # Normalize hidden tensors if LSTM tuple
@@ -454,8 +495,20 @@ class Seq2Seq(BaseModel):
             else:
                 decoder_hidden = decoder_hidden.contiguous()
             step_output = self.fc_decoder_output(decoder_output)
-            outputs.append(step_output)
+            step_pit_logit = self.fc_pit(decoder_output)
+            step_comp_logits = self.fc_compound(decoder_output)
+
+            outputs_lap.append(step_output)
+            outputs_pit.append(step_pit_logit.squeeze(-1))
+            outputs_compound.append(step_comp_logits)
             current_input = step_output
-        
-        outputs = torch.cat(outputs, dim=1)
-        return outputs
+
+        lap_out = torch.cat(outputs_lap, dim=1)
+        pit_out = torch.cat(outputs_pit, dim=1)
+        comp_out = torch.cat(outputs_compound, dim=1)
+
+        return {
+            'lap': lap_out,
+            'pit_logits': pit_out,
+            'compound_logits': comp_out,
+        }

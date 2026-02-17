@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Union, List, Tuple, Dict, Optional
 import numpy as np
 import pandas as pd
+import os
 import torch
 from torch.utils.data import Dataset
 
@@ -145,6 +146,16 @@ class AutoregressiveLapDataloader(Dataset):
         logger.info(f"Loading race data for years {self.years}...")
         self.data = load_all_races(self.years, session="Race", data_path=self.data_path)
         
+        # Filter out extreme outliers in lap times
+        # Reasonable F1 lap times are 55s-200s (55K-200K ms)
+        # Anything beyond this is likely red flags, data errors, or safety car crawling
+        original_len = len(self.data)
+        lap_time_max = 200000  # 200 seconds (3 min 20 sec) max reasonable lap
+        self.data = self.data[self.data['LapTime'] <= lap_time_max].reset_index(drop=True)
+        filtered_count = original_len - len(self.data)
+        if filtered_count > 0:
+            logger.info(f"Filtered {filtered_count} laps with LapTime > {lap_time_max/1000:.0f}s ({filtered_count/original_len*100:.2f}%)")
+        
         # Setup normalization
         self.normalizer = None
         if normalize:
@@ -166,6 +177,88 @@ class AutoregressiveLapDataloader(Dataset):
         logger.info("Generating (context_lap, next_lap) pairs...")
         self.lap_pairs = self._generate_lap_pairs()
         logger.info(f"Created {len(self.lap_pairs)} lap pairs")
+
+        # Optionally skip precomputation via environment variable to avoid
+        # long startup on interactive runs. Set `SKIP_PRECOMPUTE=1` to skip.
+        if os.environ.get('SKIP_PRECOMPUTE') == '1':
+            logger.info("SKIP_PRECOMPUTE=1: skipping precompute of feature tensors")
+            self._precomputed_contexts = [None] * len(self.lap_pairs)
+            self._precomputed_targets = [None] * len(self.lap_pairs)
+            self._precomputed_meta = [None] * len(self.lap_pairs)
+        else:
+            # Precompute feature tensors for all lap pairs to avoid heavy
+            # pandas->numpy work inside __getitem__ which blocks the GPU.
+            # This produces slightly higher memory usage but greatly reduces
+            # per-sample CPU overhead during training.
+            logger.info(f"Precomputing feature tensors for all {len(self.lap_pairs)} lap pairs...")
+            self._precomputed_contexts = [None] * len(self.lap_pairs)
+            self._precomputed_targets = [None] * len(self.lap_pairs)
+            self._precomputed_meta = [None] * len(self.lap_pairs)
+
+            for i in range(len(self.lap_pairs)):
+                pair = self.lap_pairs[i]
+                context_indices = pair['context_indices']
+                target_index = pair['target_index']
+
+                context_laps = self.data.loc[context_indices].copy()
+                target_lap = self.data.loc[target_index].copy()
+
+                # NOTE: precompute without augmentation (augmentation per-sample
+                # would re-introduce CPU work). If augment_prob > 0, augmentation
+                # will be skipped for precomputed path to maximize throughput.
+                if self.normalizer is not None:
+                    context_laps = self.normalizer.transform(context_laps)
+                    target_lap_norm = self.normalizer.transform(target_lap.to_frame().T)
+                    target_lap = target_lap_norm.iloc[0]
+
+                # Extract features for context
+                context_features = []
+                for _, lap in context_laps.iterrows():
+                    feat = self._get_lap_features(lap)
+                    context_features.append(feat)
+
+                if context_features:
+                    context_array = np.array(context_features, dtype=np.float32)
+                else:
+                    # Empty context
+                    num_features = len(self._get_lap_features(context_laps.iloc[0])) if len(context_laps) > 0 else 100
+                    context_array = np.zeros((0, num_features), dtype=np.float32)
+
+                # Pad context to window size
+                if len(context_array) < self.context_window:
+                    padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
+                    context_array = np.vstack([padding, context_array])
+
+                # Target values
+                target_laptime = float(target_lap['LapTime'])
+                pit_flag = int(target_lap.get('is_pitlap', 0))
+                comp_vals = target_lap[self.compound_columns].values.astype(np.int32)
+                if comp_vals.sum() == 0:
+                    compound_idx = len(self.compound_columns) - 1
+                else:
+                    compound_idx = int(np.argmax(comp_vals))
+
+                # Convert to tensors and store
+                context_tensor = torch.from_numpy(context_array)
+                target_tensor = {
+                    'lap_time': torch.tensor(target_laptime, dtype=torch.float32),
+                    'is_pitlap': torch.tensor(pit_flag, dtype=torch.long),
+                    'compound': torch.tensor(compound_idx, dtype=torch.long),
+                }
+
+                metadata = {
+                    'driver': pair['driver'],
+                    'year': pair['year'],
+                    'circuit': pair['circuit'],
+                    'race_name': pair['race_name'],
+                    'context_length': len(context_features),
+                }
+
+                self._precomputed_contexts[i] = context_tensor
+                self._precomputed_targets[i] = target_tensor
+                self._precomputed_meta[i] = metadata
+
+            logger.info(f"Precomputed all {len(self.lap_pairs)} context tensors in RAM for maximum training speed")
     
     def _generate_lap_pairs(self) -> List[Dict]:
         """
@@ -194,10 +287,10 @@ class AutoregressiveLapDataloader(Dataset):
             if len(normal_laps) < 2:  # Need at least 1 context + 1 target
                 continue
             
-            # Sort by lap number
-            normal_laps = normal_laps.sort_values('LapNumber').reset_index(drop=True)
+            # Sort by lap number while preserving original global indices
+            normal_laps = normal_laps.sort_values('LapNumber')
             
-            # Get original indices for reference
+            # Keep original global indices for selecting rows from self.data
             original_indices = normal_laps.index.tolist()
             
             # Generate pairs
@@ -324,50 +417,66 @@ class AutoregressiveLapDataloader(Dataset):
         dict
             Metadata: {'driver', 'year', 'circuit', 'race_name', 'context_length'}
         """
+        # Fast path: if this index was precomputed, return cached tensors
+        if idx < len(self._precomputed_contexts) and self._precomputed_contexts[idx] is not None:
+            context_tensor = self._precomputed_contexts[idx].to(self.device)
+            target_tensor = self._precomputed_targets[idx]
+            for k, v in list(target_tensor.items()):
+                if isinstance(v, torch.Tensor):
+                    target_tensor[k] = v.to(self.device)
+            metadata = self._precomputed_meta[idx]
+            return context_tensor, target_tensor, metadata
+
+        # Fallback: compute on the fly for indices not precomputed
         pair = self.lap_pairs[idx]
-        
-        # Get context and target laps
         context_indices = pair['context_indices']
         target_index = pair['target_index']
-        
+
         context_laps = self.data.loc[context_indices].copy()
         target_lap = self.data.loc[target_index].copy()
-        
+
         # Apply augmentation if enabled
         if np.random.random() < self.augment_prob:
             context_laps, target_lap = self._apply_augmentation(context_laps, target_lap)
-        
+
         # Normalize numeric features
         if self.normalizer is not None:
             context_laps = self.normalizer.transform(context_laps)
             target_lap_normalized = self.normalizer.transform(target_lap.to_frame().T)
             target_lap = target_lap_normalized.iloc[0]
-        
+
         # Extract features
         context_features = []
         for _, lap in context_laps.iterrows():
             feat = self._get_lap_features(lap)
             context_features.append(feat)
-        
+
         if context_features:
             context_array = np.array(context_features, dtype=np.float32)
         else:
-            # Empty context (should not happen in normal operation)
             num_features = len(self._get_lap_features(context_laps.iloc[0])) if len(context_laps) > 0 else 100
             context_array = np.zeros((0, num_features), dtype=np.float32)
-        
+
         # Pad context to window size
         if len(context_array) < self.context_window:
             padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
             context_array = np.vstack([padding, context_array])
-        
-        # Get target lap time
+
         target_laptime = float(target_lap['LapTime'])
-        
-        # Convert to tensors
+        pit_flag = int(target_lap.get('is_pitlap', 0))
+        comp_vals = target_lap[self.compound_columns].values.astype(np.int32)
+        if comp_vals.sum() == 0:
+            compound_idx = len(self.compound_columns) - 1
+        else:
+            compound_idx = int(np.argmax(comp_vals))
+
         context_tensor = torch.from_numpy(context_array).to(self.device)
-        target_tensor = torch.tensor(target_laptime, dtype=torch.float32, device=self.device)
-        
+        target_tensor = {
+            'lap_time': torch.tensor(target_laptime, dtype=torch.float32, device=self.device),
+            'is_pitlap': torch.tensor(pit_flag, dtype=torch.long, device=self.device),
+            'compound': torch.tensor(compound_idx, dtype=torch.long, device=self.device),
+        }
+
         metadata = {
             'driver': pair['driver'],
             'year': pair['year'],
@@ -375,5 +484,5 @@ class AutoregressiveLapDataloader(Dataset):
             'race_name': pair['race_name'],
             'context_length': len(context_features),
         }
-        
+
         return context_tensor, target_tensor, metadata

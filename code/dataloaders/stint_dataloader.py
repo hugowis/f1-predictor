@@ -135,6 +135,15 @@ class StintDataloader(Dataset):
         logger.info(f"Loading race data for years {self.years}...")
         self.data = load_all_races(self.years, session="Race", data_path=self.data_path)
         
+        # Filter out extreme outliers in lap times
+        # Reasonable F1 lap times are 55s-200s (55K-200K ms)
+        original_len = len(self.data)
+        lap_time_max = 200000  # 200 seconds max reasonable lap
+        self.data = self.data[self.data['LapTime'] <= lap_time_max].reset_index(drop=True)
+        filtered_count = original_len - len(self.data)
+        if filtered_count > 0:
+            logger.info(f"Filtered {filtered_count} laps with LapTime > {lap_time_max/1000:.0f}s ({filtered_count/original_len*100:.2f}%)")
+        
         # Setup normalization
         self.normalizer = None
         if normalize:

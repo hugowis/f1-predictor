@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 import json
 from datetime import datetime
 
@@ -68,6 +69,11 @@ class Trainer:
         checkpoint_dir: Optional[Path] = None,
         gradient_clip: Optional[float] = 1.0,
         accumulation_steps: int = 1,
+        pit_loss_weight: float = 0.5,
+        compound_loss_weight: float = 0.5,
+        use_mixed_precision: bool = True,
+        early_stopping_use_ema: bool = False,
+        early_stopping_ema_alpha: float = 0.3,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -76,6 +82,15 @@ class Trainer:
         self.scheduler = scheduler
         self.gradient_clip = gradient_clip
         self.accumulation_steps = accumulation_steps
+        self.pit_loss_weight = pit_loss_weight
+        self.compound_loss_weight = compound_loss_weight
+        self.use_mixed_precision = use_mixed_precision and device == 'cuda'
+        self.early_stopping_use_ema = early_stopping_use_ema
+        self.early_stopping_ema_alpha = float(early_stopping_ema_alpha)
+        
+        # Initialize gradient scaler for mixed precision training
+        self.scaler = GradScaler() if self.use_mixed_precision else None
+        
         # Ensure model is on the correct device
         try:
             self.model.to(self.device)
@@ -86,19 +101,29 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         self.best_val_loss = float('inf')
+        self.best_monitored_val = float('inf')
+        self.val_ema = None
         self.epochs_without_improvement = 0
         self.history = {
             'train_loss': [],
+            'train_lap_loss': [],
+            'train_pit_loss': [],
+            'train_compound_loss': [],
             'val_loss': [],
+            'val_loss_ema': [],
+            'val_loss_monitored': [],
             'learning_rate': [],
         }
+        
+        if self.use_mixed_precision:
+            logger.info("Mixed precision training enabled (FP16)")
     
     def train_epoch(
         self,
         train_loader: DataLoader,
         epoch: int = 0,
         teacher_forcing_ratio: float = 1.0,
-    ) -> float:
+    ) -> Dict[str, float]:
         """
         Train for one epoch.
         
@@ -113,91 +138,225 @@ class Trainer:
         
         Returns
         -------
-        float
-            Average loss for the epoch
+        dict
+            Average total and component losses for the epoch
         """
         self.model.train()
         total_loss = 0.0
+        total_lap_loss = 0.0
+        total_pit_loss = 0.0
+        total_comp_loss = 0.0
         num_batches = 0
         
         for batch_idx, batch in enumerate(train_loader):
-            # Extract batch data
-            encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch)
+            # Extract batch data (pass dataset so decoder targets can be normalized/asserted)
+            encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch, dataset=train_loader.dataset)
             # Encoder input may be a dict (structured numeric+categorical); let the
             # model handle device placement and embedding when it's a dict.
             if not isinstance(encoder_input, dict):
                 encoder_input = encoder_input.to(self.device)
             decoder_input = decoder_input.to(self.device)
-            targets = targets.to(self.device)
-            
-            # Forward pass
-            outputs = self.model(
-                encoder_input,
-                decoder_input,
-                teacher_forcing=True,
-                teacher_forcing_ratio=teacher_forcing_ratio,
-            )
-            
-            # Reshape targets to match output shape: (batch,) -> (batch, 1, 1)
-            if targets.dim() == 1:
-                targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1)
+            # Move targets tensors to device if targets is a dict
+            if isinstance(targets, dict):
+                for k, v in list(targets.items()):
+                    if isinstance(v, torch.Tensor):
+                        targets[k] = v.to(self.device)
             else:
-                targets_reshaped = targets
-
-            # Compute masked loss: ignore NaN or non-finite targets
-            with torch.no_grad():
-                mask = torch.isfinite(targets_reshaped)
-            if mask.sum() == 0:
-                # Nothing to learn from this batch
-                continue
-
-            # If model outputs are non-finite, skip this batch to avoid NaNs
-            if not torch.isfinite(outputs).all():
-                # Skip silently to avoid cluttering logs
-                continue
-
-            se = (outputs - targets_reshaped) ** 2
-            masked_se = se * mask.float()
-            denom = mask.float().sum()
-            loss_batch = masked_se.sum() / denom
-
-            # Backward pass with gradient accumulation
-            loss = loss_batch / self.accumulation_steps
-            loss.backward()
+                targets = targets.to(self.device)
             
-            # Before stepping optimizer, check gradients for NaN/Inf
-            skip_step = False
+            # Forward pass with optional mixed precision
+            with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+                outputs = self.model(
+                    encoder_input,
+                    decoder_input,
+                    teacher_forcing=True,
+                    teacher_forcing_ratio=teacher_forcing_ratio,
+                )
+
+            # Determine if targets is a dict (multi-task) or single tensor
+            if isinstance(targets, dict):
+                # Lap time target
+                lap_t = targets['lap_time']
+                if lap_t.dim() == 1:
+                    lap_t_rs = lap_t.unsqueeze(-1).unsqueeze(-1)
+                else:
+                    lap_t_rs = lap_t
+
+                # Pit and compound targets
+                pit_t = targets.get('is_pitlap', None)
+                comp_t = targets.get('compound', None)
+
+                # Compute lap loss (MSE) with masking
+                with torch.no_grad():
+                    mask = torch.isfinite(lap_t_rs)
+                if mask.sum() == 0:
+                    continue
+
+                lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs
+                if not torch.isfinite(lap_pred).all():
+                    continue
+
+                se = (lap_pred - lap_t_rs) ** 2
+                masked_se = se * mask.float()
+                denom = mask.float().sum()
+                lap_loss = masked_se.sum() / denom
+
+                # Pit loss (BCEWithLogits)
+                pit_loss = torch.tensor(0.0, device=self.device)
+                if pit_t is not None and 'pit_logits' in outputs:
+                    pit_pred = outputs['pit_logits']  # (batch, seq_len)
+                    # Align shapes: make pit_t same shape as pit_pred
+                    if pit_t.dim() == 1:
+                        pit_t_rs = pit_t.unsqueeze(-1)
+                    else:
+                        pit_t_rs = pit_t
+                    bce = nn.BCEWithLogitsLoss(reduction='none')
+                    pit_raw_loss = bce(pit_pred, pit_t_rs.float())
+                    pit_loss = pit_raw_loss.mean()
+
+                # Compound loss (CrossEntropy)
+                comp_loss = torch.tensor(0.0, device=self.device)
+                if comp_t is not None and 'compound_logits' in outputs:
+                    comp_pred = outputs['compound_logits']  # (batch, seq_len, C)
+                    # Flatten for cross-entropy: (batch*seq_len, C)
+                    bsz, seq_len, C = comp_pred.shape
+                    comp_pred_flat = comp_pred.reshape(bsz * seq_len, C)
+                    # comp_t may be (batch,) or (batch, seq_len)
+                    if comp_t.dim() == 1:
+                        comp_t_rs = comp_t.unsqueeze(-1).expand(-1, seq_len).reshape(-1)
+                    else:
+                        comp_t_rs = comp_t.reshape(-1)
+                    ce = nn.CrossEntropyLoss(reduction='none')
+                    comp_raw = ce(comp_pred_flat, comp_t_rs)
+                    comp_loss = comp_raw.mean()
+
+                # Combine losses with configurable weighting
+                loss_batch = (
+                    lap_loss +
+                    float(self.pit_loss_weight) * pit_loss +
+                    float(self.compound_loss_weight) * comp_loss
+                )
+
+                lap_loss_value = float(lap_loss.detach().item())
+                pit_loss_value = float(pit_loss.detach().item())
+                comp_loss_value = float(comp_loss.detach().item())
+
+            else:
+                # Old single-target behavior
+                if targets.dim() == 1:
+                    targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1)
+                else:
+                    targets_reshaped = targets
+
+                with torch.no_grad():
+                    mask = torch.isfinite(targets_reshaped)
+                if mask.sum() == 0:
+                    continue
+
+                if isinstance(outputs, dict):
+                    lap_pred = outputs['lap']
+                else:
+                    lap_pred = outputs
+
+                if not torch.isfinite(lap_pred).all():
+                    continue
+
+                se = (lap_pred - targets_reshaped) ** 2
+                masked_se = se * mask.float()
+                denom = mask.float().sum()
+                loss_batch = masked_se.sum() / denom
+                lap_loss_value = float(loss_batch.detach().item())
+                pit_loss_value = 0.0
+                comp_loss_value = 0.0
+
+            # Skip pathological batches that would dominate epoch loss and destabilize training
+            if not torch.isfinite(loss_batch):
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            loss_value = float(loss_batch.detach().item())
+            if loss_value > 1e3:
+                logger.debug(
+                    f"Skipping pathological batch at epoch {epoch}, batch {batch_idx}: "
+                    f"loss={loss_value:.6f}"
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            # Scale loss for gradient accumulation (common to both branches)
+            loss = loss_batch / self.accumulation_steps
+            
+            # Backward pass with gradient accumulation and mixed precision
+            if self.use_mixed_precision:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Optimizer step with gradient accumulation and mixed precision
             if (batch_idx + 1) % self.accumulation_steps == 0:
-                if self.gradient_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.gradient_clip
-                    )
-                for name, p in self.model.named_parameters():
-                    if p.grad is None:
-                        continue
-                    if not torch.isfinite(p.grad).all():
-                        logger.warning(f"Non-finite gradient detected for {name} at batch {batch_idx}, skipping optimizer step and zeroing gradients")
-                        skip_step = True
-                        break
-                if not skip_step:
-                    self.optimizer.step()
-                # Always zero grads to keep state consistent
+                if self.use_mixed_precision:
+                    # Unscale gradients for clipping
+                    if self.gradient_clip is not None:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.gradient_clip
+                        )
+                    
+                    # Step optimizer with scaler
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Standard training without mixed precision
+                    if self.gradient_clip is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.gradient_clip
+                        )
+                    
+                    # Check for non-finite gradients
+                    skip_step = False
+                    for name, p in self.model.named_parameters():
+                        if p.grad is None:
+                            continue
+                        if not torch.isfinite(p.grad).all():
+                            logger.warning(f"Non-finite gradient detected for {name} at batch {batch_idx}, skipping optimizer step")
+                            skip_step = True
+                            break
+                    
+                    if not skip_step:
+                        self.optimizer.step()
+                
+                # Zero gradients
                 self.optimizer.zero_grad()
             
-            total_loss += loss_batch.item()
+            total_loss += loss_value
+            total_lap_loss += lap_loss_value
+            total_pit_loss += pit_loss_value
+            total_comp_loss += comp_loss_value
             num_batches += 1
             
             if (batch_idx + 1) % max(1, len(train_loader) // 5) == 0:
                 logger.info(
                     f"Epoch {epoch} [{batch_idx + 1}/{len(train_loader)}] "
-                    f"Loss: {loss_batch.item():.6f}"
+                    f"Loss: {loss_value:.6f}"
                 )
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        logger.info(f"Epoch {epoch} - Train Loss: {avg_loss:.6f}")
-        
-        return avg_loss
+        avg_lap_loss = total_lap_loss / num_batches if num_batches > 0 else 0.0
+        avg_pit_loss = total_pit_loss / num_batches if num_batches > 0 else 0.0
+        avg_comp_loss = total_comp_loss / num_batches if num_batches > 0 else 0.0
+        logger.info(
+            f"Epoch {epoch} - Train Loss: {avg_loss:.6f} "
+            f"(lap={avg_lap_loss:.6f}, pit={avg_pit_loss:.6f}, compound={avg_comp_loss:.6f})"
+        )
+
+        return {
+            'loss': avg_loss,
+            'lap_loss': avg_lap_loss,
+            'pit_loss': avg_pit_loss,
+            'compound_loss': avg_comp_loss,
+        }
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
         """
@@ -221,57 +380,87 @@ class Trainer:
         
         with torch.no_grad():
             for batch in val_loader:
-                encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch)
+                encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch, dataset=val_loader.dataset)
                 # Encoder input may be structured dict; don't call .to on dicts
                 if not isinstance(encoder_input, dict):
                     encoder_input = encoder_input.to(self.device)
                 decoder_input = decoder_input.to(self.device)
-                targets = targets.to(self.device)
-                
-                # Forward pass (no teacher forcing for validation)
-                outputs = self.model(
-                    encoder_input,
-                    decoder_input,
-                    teacher_forcing=False,
-                )
-                
-                # Reshape targets to match output shape: (batch,) -> (batch, 1, 1)
-                if targets.dim() == 1:
-                    targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1)
+                # Move targets tensors to device if targets is a dict
+                if isinstance(targets, dict):
+                    for k, v in list(targets.items()):
+                        if isinstance(v, torch.Tensor):
+                            targets[k] = v.to(self.device)
                 else:
-                    targets_reshaped = targets
+                    targets = targets.to(self.device)
 
-                # Mask invalid targets (NaN / inf)
-                mask = np.isfinite(targets.cpu().numpy())
-                # If no valid targets in this batch, skip
-                if mask.sum() == 0:
+                # Forward pass with optional mixed precision (no teacher forcing for validation)
+                with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+                    outputs = self.model(
+                        encoder_input,
+                        decoder_input,
+                        teacher_forcing=False,
+                    )
+
+                # If targets is dict (multi-task), focus validation on lap_time
+                if isinstance(targets, dict):
+                    lap_t = targets['lap_time']
+                    if lap_t.dim() == 1:
+                        targets_reshaped = lap_t.unsqueeze(-1).unsqueeze(-1)
+                    else:
+                        targets_reshaped = lap_t
+                else:
+                    # Reshape targets to match output shape: (batch,) -> (batch, 1, 1)
+                    if targets.dim() == 1:
+                        targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1)
+                    else:
+                        targets_reshaped = targets
+
+                # Compute finite mask on the same tensor shape used in loss
+                mask_t = torch.isfinite(targets_reshaped)
+                if mask_t.sum() == 0:
                     continue
 
-                # Compute masked loss using torch (ensure types on device)
-                mask_t = torch.from_numpy(mask).to(self.device)
-                se = (outputs - targets_reshaped) ** 2
+                # Use lap predictions if multi-head
+                if isinstance(outputs, dict):
+                    lap_pred = outputs['lap']
+                else:
+                    lap_pred = outputs
+
+                if not torch.isfinite(lap_pred).all():
+                    continue
+
+                se = (lap_pred - targets_reshaped) ** 2
                 masked_se = se * mask_t.float()
                 loss_val = masked_se.sum().item() / float(mask_t.sum().item())
                 total_loss += loss_val
                 num_batches += 1
 
                 # Store predictions and valid targets for metrics
-                preds_np = outputs.cpu().numpy().reshape(-1)
-                targs_np = targets.cpu().numpy().reshape(-1)
-                valid_idx = np.isfinite(targs_np)
+                # Use lap predictions and targets_reshaped for metrics
+                if isinstance(outputs, dict):
+                    lap_pred = outputs['lap']
+                else:
+                    lap_pred = outputs
+
+                preds_np = lap_pred.cpu().numpy().reshape(-1)
+                targs_np = targets_reshaped.cpu().numpy().reshape(-1)
+                valid_idx = np.isfinite(targs_np) & np.isfinite(preds_np)
                 all_predictions.append(preds_np[valid_idx])
                 all_targets.append(targs_np[valid_idx])
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         
         # Compute additional metrics
-        predictions = np.concatenate(all_predictions, axis=0)
-        targets_arr = np.concatenate(all_targets, axis=0)
-        metrics = self._compute_metrics(predictions, targets_arr)
+        if all_predictions and all_targets:
+            predictions = np.concatenate(all_predictions, axis=0)
+            targets_arr = np.concatenate(all_targets, axis=0)
+            metrics = self._compute_metrics(predictions, targets_arr)
+        else:
+            metrics = {'mae': float('nan'), 'rmse': float('nan'), 'mape': float('nan')}
         metrics['loss'] = avg_loss
         
         logger.info(f"Validation Loss: {avg_loss:.6f}")
-        logger.info(f"Validation MAE: {metrics.get('mae', 0):.2f} ms")
+        logger.info(f"Validation MAE (normalized): {metrics.get('mae', 0):.4f}")
         
         return avg_loss, metrics
     
@@ -311,6 +500,10 @@ class Trainer:
         logger.info(f"Starting training for {num_epochs} epochs")
         logger.info(f"Model: {self.model.model_info()}")
         logger.info(f"Device: {self.device}")
+        if self.early_stopping_use_ema:
+            logger.info(f"Early stopping monitor: EMA(val_loss), alpha={self.early_stopping_ema_alpha:.2f}")
+        else:
+            logger.info("Early stopping monitor: val_loss")
         
         for epoch in range(num_epochs):
             # Update learning rate
@@ -321,17 +514,36 @@ class Trainer:
             tf_ratio = teacher_forcing_schedule(epoch)
             
             # Train
-            train_loss = self.train_epoch(train_loader, epoch, tf_ratio)
-            self.history['train_loss'].append(train_loss)
+            train_stats = self.train_epoch(train_loader, epoch, tf_ratio)
+            self.history['train_loss'].append(float(train_stats.get('loss', 0.0)))
+            self.history['train_lap_loss'].append(float(train_stats.get('lap_loss', train_stats.get('loss', 0.0))))
+            self.history['train_pit_loss'].append(float(train_stats.get('pit_loss', 0.0)))
+            self.history['train_compound_loss'].append(float(train_stats.get('compound_loss', 0.0)))
             
             # Validate
             if val_loader is not None:
                 val_loss, val_metrics = self.validate(val_loader)
                 self.history['val_loss'].append(val_loss)
+
+                # Monitor either raw val loss or EMA-smoothed val loss
+                if self.early_stopping_use_ema:
+                    if self.val_ema is None:
+                        self.val_ema = float(val_loss)
+                    else:
+                        alpha = self.early_stopping_ema_alpha
+                        self.val_ema = alpha * float(val_loss) + (1.0 - alpha) * self.val_ema
+                    monitored_val = self.val_ema
+                else:
+                    monitored_val = float(val_loss)
+
+                self.history['val_loss_ema'].append(float(self.val_ema) if self.val_ema is not None else float(val_loss))
+                self.history['val_loss_monitored'].append(float(monitored_val))
+                logger.info(f"Monitored Validation Loss: {monitored_val:.6f}")
                 
                 # Check for improvement
-                if val_loss < self.best_val_loss:
+                if monitored_val < self.best_monitored_val:
                     self.best_val_loss = val_loss
+                    self.best_monitored_val = monitored_val
                     self.epochs_without_improvement = 0
                     self._save_checkpoint(epoch, val_loss, val_metrics)
                 else:
@@ -352,7 +564,7 @@ class Trainer:
         logger.info("Training completed")
         return self.history
     
-    def _unpack_batch(self, batch: Tuple) -> Tuple:
+    def _unpack_batch(self, batch: Tuple, dataset: Optional[Any] = None) -> Tuple:
         """
         Unpack batch data from dataloader.
         
@@ -374,14 +586,27 @@ class Trainer:
             else:
                 encoder_final = encoder_input
 
-            # Create decoder input from targets
-            # Expand 1D targets (batch,) to (batch, 1, 1) for seq2seq
-            if targets.dim() == 1:
-                decoder_input = targets.unsqueeze(-1).unsqueeze(-1)
-            elif targets.dim() == 2:
-                decoder_input = targets.unsqueeze(-1)
+            # Extract lap_time from targets dict (standardized format)
+            # Targets must be a dict with 'lap_time' key for multi-task consistency
+            if not isinstance(targets, dict):
+                # Convert tensor targets to dict format for consistency
+                targets = {'lap_time': targets}
+            
+            lap_t = targets.get('lap_time')
+            if lap_t is None:
+                raise ValueError("targets dict must contain 'lap_time' key")
+            
+            # Data is already normalized by the dataloader - no runtime normalization
+            # This prevents data leakage from applying transforms at training time
+            lap_tensor_norm = lap_t.clone().type(torch.float32)
+
+            # Build decoder_input shape consistent with previous behavior
+            if lap_tensor_norm.dim() == 1:
+                decoder_input = lap_tensor_norm.unsqueeze(-1).unsqueeze(-1)
+            elif lap_tensor_norm.dim() == 2:
+                decoder_input = lap_tensor_norm.unsqueeze(-1)
             else:
-                decoder_input = targets.clone()
+                decoder_input = lap_tensor_norm.clone()
 
             return encoder_final, decoder_input, targets, metadata
         else:

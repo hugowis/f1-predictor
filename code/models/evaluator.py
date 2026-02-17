@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.amp import autocast
 import logging
 
 logger = logging.getLogger(__name__)
@@ -134,19 +135,45 @@ class Evaluator:
 
                 encoder_input = encoder_input.to(self.device)
                 decoder_input = decoder_input.to(self.device)
-                targets = targets.to(self.device)
-                
-                # Forward pass
-                outputs = self.model(encoder_input, decoder_input, teacher_forcing=False)
-
-                # Ensure targets shape matches outputs
-                if targets.dim() == 1:
-                    targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1)
+                # Move targets tensors to device if targets is a dict
+                if isinstance(targets, dict):
+                    for k, v in list(targets.items()):
+                        if isinstance(v, torch.Tensor):
+                            targets[k] = v.to(self.device)
                 else:
-                    targets_reshaped = targets
+                    targets = targets.to(self.device)
+                
+                # Forward pass with autocast for faster inference
+                with autocast(device_type='cuda', enabled=self.device == 'cuda'):
+                    outputs = self.model(encoder_input, decoder_input, teacher_forcing=False)
 
-                # Convert to numpy and flatten per-sample for masking
-                preds_np = outputs.cpu().numpy().reshape(-1)
+                # Handle multi-head outputs (dict) or single tensor
+                if isinstance(outputs, dict):
+                    lap_pred = outputs.get('lap')
+                    pit_logits = outputs.get('pit_logits', None)
+                    comp_logits = outputs.get('compound_logits', None)
+                else:
+                    lap_pred = outputs
+                    pit_logits = None
+                    comp_logits = None
+
+                # Prepare target lap times
+                if isinstance(targets, dict):
+                    lap_t = targets['lap_time']
+                    pit_t = targets.get('is_pitlap', None)
+                    comp_t = targets.get('compound', None)
+                else:
+                    lap_t = targets
+                    pit_t = None
+                    comp_t = None
+
+                if lap_t.dim() == 1:
+                    targets_reshaped = lap_t.unsqueeze(-1).unsqueeze(-1)
+                else:
+                    targets_reshaped = lap_t
+
+                # Convert lap predictions/targets to numpy and flatten per-sample for masking
+                preds_np = lap_pred.cpu().numpy().reshape(-1)
                 targs_np = targets_reshaped.cpu().numpy().reshape(-1)
 
                 # Mask invalid values
@@ -164,6 +191,36 @@ class Evaluator:
                 # Store valid predictions/targets for metrics
                 all_predictions.append(preds_np[valid_mask])
                 all_targets.append(targs_np[valid_mask])
+
+                # If pit predictions exist, store them and targets
+                if pit_logits is not None and pit_t is not None:
+                    pit_probs = torch.sigmoid(pit_logits).cpu().numpy().reshape(-1)
+                    pit_targets = pit_t.cpu().numpy().reshape(-1)
+                    # Apply same valid_mask (based on lap targets) to align samples
+                    pit_valid = np.isfinite(pit_targets) & np.isfinite(pit_probs)
+                    # store under metadata keys for downstream aggregation
+                    # Attach to all_metadata entries in same order
+                    # We append aggregated arrays at the end of metadata list for simplicity
+                    # Collect pit per-batch
+                    try:
+                        existing = batch_pit_preds
+                    except NameError:
+                        batch_pit_preds = []
+                        batch_pit_targs = []
+                    batch_pit_preds.append(pit_probs[pit_valid])
+                    batch_pit_targs.append(pit_targets[pit_valid])
+
+                if comp_logits is not None and comp_t is not None:
+                    comp_preds = np.argmax(comp_logits.cpu().numpy(), axis=-1).reshape(-1)
+                    comp_targets = comp_t.cpu().numpy().reshape(-1)
+                    comp_valid = np.isfinite(comp_targets) & np.isfinite(comp_preds)
+                    try:
+                        existing = batch_comp_preds
+                    except NameError:
+                        batch_comp_preds = []
+                        batch_comp_targs = []
+                    batch_comp_preds.append(comp_preds[comp_valid])
+                    batch_comp_targs.append(comp_targets[comp_valid])
 
                 # Align metadata to valid entries and store per-sample
                 meta_list = []
@@ -231,6 +288,30 @@ class Evaluator:
             predictions = np.array([])
             targets = np.array([])
 
+        # Aggregate pit/compound if collected
+        pit_pred_arr = None
+        pit_targ_arr = None
+        comp_pred_arr = None
+        comp_targ_arr = None
+        try:
+            if 'batch_pit_preds' in locals():
+                pit_pred_arr = np.concatenate(batch_pit_preds, axis=0)
+                pit_targ_arr = np.concatenate(batch_pit_targs, axis=0)
+        except Exception:
+            pit_pred_arr = None
+            pit_targ_arr = None
+
+        try:
+            if 'batch_comp_preds' in locals():
+                comp_pred_arr = np.concatenate(batch_comp_preds, axis=0)
+                comp_targ_arr = np.concatenate(batch_comp_targs, axis=0)
+        except Exception:
+            comp_pred_arr = None
+            comp_targ_arr = None
+
+        # Attach to predictions for external evaluation convenience
+        # (keeps backward compatibility if keys absent)
+
         # Compute metrics
         metrics = self._compute_all_metrics(predictions, targets) if total_count > 0 else {
             'mae': float('nan'), 'rmse': float('nan'), 'median_ae': float('nan'), 'mape': float('nan')
@@ -238,8 +319,8 @@ class Evaluator:
         metrics['loss'] = float(sum_se / total_count) if total_count > 0 else float('nan')
         
         logger.info(f"Test Loss: {metrics['loss']:.6f}")
-        logger.info(f"Test MAE: {metrics['mae']:.2f} ms")
-        logger.info(f"Test RMSE: {metrics['rmse']:.2f} ms")
+        logger.info(f"Test MAE (normalized): {metrics['mae']:.4f}")
+        logger.info(f"Test RMSE (normalized): {metrics['rmse']:.4f}")
         logger.info(f"Test MAPE: {metrics['mape']:.2f}%")
         
         if return_predictions:
@@ -247,6 +328,10 @@ class Evaluator:
                 'predictions': predictions,
                 'targets': targets,
                 'metadata': all_metadata,
+                'pit_predictions': pit_pred_arr,
+                'pit_targets': pit_targ_arr,
+                'compound_predictions': comp_pred_arr,
+                'compound_targets': comp_targ_arr,
             }
             return metrics, pred_dict
         else:
@@ -407,6 +492,7 @@ def denormalize_predictions(
 def report_evaluation(
     metrics: Dict[str, float],
     save_path: Optional[str] = None,
+    unit_label: str = "normalized",
 ) -> str:
     """
     Generate a human-readable evaluation report.
@@ -429,20 +515,20 @@ def report_evaluation(
     report.append("=" * 60)
     
     report.append("\nCore Metrics:")
-    report.append(f"  MAE:          {metrics.get('mae', 0):.2f} ms")
-    report.append(f"  RMSE:         {metrics.get('rmse', 0):.2f} ms")
-    report.append(f"  Median AE:    {metrics.get('median_ae', 0):.2f} ms")
+    report.append(f"  MAE:          {metrics.get('mae', 0):.2f} {unit_label}")
+    report.append(f"  RMSE:         {metrics.get('rmse', 0):.2f} {unit_label}")
+    report.append(f"  Median AE:    {metrics.get('median_ae', 0):.2f} {unit_label}")
     report.append(f"  MAPE:         {metrics.get('mape', 0):.2f}%")
     report.append(f"  Loss:         {metrics.get('loss', 0):.6f}")
     
     report.append("\nQuantile Absolute Error:")
     for q in [25, 50, 75, 95, 99]:
         key = f'q{q}_ae'
-        report.append(f"  {q}th percentile: {metrics.get(key, 0):.2f} ms")
+        report.append(f"  {q}th percentile: {metrics.get(key, 0):.2f} {unit_label}")
     
     report.append("\nBias:")
-    report.append(f"  Mean bias:    {metrics.get('mean_bias', 0):.2f} ms")
-    report.append(f"  Median bias:  {metrics.get('median_bias', 0):.2f} ms")
+    report.append(f"  Mean bias:    {metrics.get('mean_bias', 0):.2f} {unit_label}")
+    report.append(f"  Median bias:  {metrics.get('median_bias', 0):.2f} {unit_label}")
     
     report_str = "\n".join(report)
     

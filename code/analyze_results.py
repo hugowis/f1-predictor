@@ -49,6 +49,8 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
     print("\n[2/3] Creating visualizations...")
 
+    diagnostics = {}
+
     # 2.1 Loss curves (if history exists)
     history_path = results_dir / "history.json"
     if history_path.exists():
@@ -57,11 +59,17 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
         epochs = range(1, len(history.get('train_loss', [])) + 1)
         train_losses = history.get('train_loss', [])
+        train_lap_losses = history.get('train_lap_loss', [])
+        train_pit_losses = history.get('train_pit_loss', [])
+        train_compound_losses = history.get('train_compound_loss', [])
         val_losses = history.get('val_loss', [])
+        val_loss_ema = history.get('val_loss_ema', [])
 
         fig, axes = plt.subplots(1, 2, figsize=(15, 5))
         axes[0].plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2.5)
         axes[0].plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2.5)
+        if val_loss_ema and len(val_loss_ema) == len(val_losses):
+            axes[0].plot(epochs, val_loss_ema, 'm--', label='Validation Loss EMA', linewidth=1.8)
         axes[0].set_xlabel('Epoch')
         axes[0].set_ylabel('Loss')
         axes[0].set_title('Training & Validation Loss')
@@ -70,6 +78,8 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
         axes[1].semilogy(epochs, train_losses, 'b-', label='Train Loss', linewidth=2.5)
         axes[1].semilogy(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2.5)
+        if val_loss_ema and len(val_loss_ema) == len(val_losses):
+            axes[1].semilogy(epochs, val_loss_ema, 'm--', label='Validation Loss EMA', linewidth=1.8)
         axes[1].set_xlabel('Epoch')
         axes[1].set_ylabel('Loss (log)')
         axes[1].set_title('Training & Validation Loss (Log Scale)')
@@ -80,6 +90,49 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
         plt.savefig(results_dir / 'loss_curves.png', dpi=300, bbox_inches='tight')
         plt.close()
         print(f"✓ Saved loss_curves.png")
+
+        # Optional training loss components for multi-task runs
+        if train_lap_losses and (train_pit_losses or train_compound_losses):
+            fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+            axes[0].plot(epochs, train_lap_losses, label='Train Lap Loss', linewidth=2.2)
+            if train_pit_losses:
+                axes[0].plot(epochs, train_pit_losses, label='Train Pit Loss', linewidth=1.8)
+            if train_compound_losses:
+                axes[0].plot(epochs, train_compound_losses, label='Train Compound Loss', linewidth=1.8)
+            axes[0].set_xlabel('Epoch')
+            axes[0].set_ylabel('Loss')
+            axes[0].set_title('Training Loss Components')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            axes[1].plot(epochs, train_lap_losses, label='Train Lap Loss', linewidth=2.2)
+            axes[1].plot(epochs, val_losses, label='Validation Lap Loss', linewidth=2.2)
+            axes[1].set_xlabel('Epoch')
+            axes[1].set_ylabel('Loss')
+            axes[1].set_title('Like-for-like Lap Train vs Val')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(results_dir / 'loss_components.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"✓ Saved loss_components.png")
+
+        if train_losses and val_losses:
+            best_idx = int(np.argmin(val_losses))
+            diagnostics['training_dynamics'] = {
+                'epochs_trained': int(len(val_losses)),
+                'best_epoch': int(best_idx + 1),
+                'best_val_loss': float(val_losses[best_idx]),
+                'last_val_loss': float(val_losses[-1]),
+                'last_train_loss': float(train_losses[-1]),
+                'overfit_ratio_last_to_best_val': float(val_losses[-1] / val_losses[best_idx]) if val_losses[best_idx] != 0 else float('nan'),
+                'gap_last_train_minus_val': float(train_losses[-1] - val_losses[-1]),
+            }
+            if train_lap_losses and len(train_lap_losses) == len(val_losses):
+                diagnostics['training_dynamics']['last_train_lap_loss'] = float(train_lap_losses[-1])
+                diagnostics['training_dynamics']['gap_last_train_lap_minus_val'] = float(train_lap_losses[-1] - val_losses[-1])
+                diagnostics['training_dynamics']['gap_best_train_lap_minus_val'] = float(train_lap_losses[best_idx] - val_losses[best_idx])
     else:
         print("No history.json found — skipping loss curves.")
 
@@ -196,12 +249,12 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
             # Driver-level
             try:
-                driver_stats = df.groupby('driver_code').apply(lambda g: pd.Series({
-                    'mae': float(g['error_abs'].mean()),
-                    'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
-                    'median_ae': float(g['error_abs'].median()),
-                    'count': int(len(g))
-                }))
+                driver_stats = df.groupby('driver_code').agg(
+                    mae=('error_abs', 'mean'),
+                    rmse=('error_signed', lambda x: float(np.sqrt(np.mean(np.square(x))))),
+                    median_ae=('error_abs', 'median'),
+                    count=('error_abs', 'size'),
+                )
                 driver_stats.to_csv(results_dir / 'driver_level.csv')
 
                 top = driver_stats.sort_values('count', ascending=False).head(20)
@@ -217,12 +270,12 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
             # Circuit-level
             try:
-                circuit_stats = df.groupby('circuit_code').apply(lambda g: pd.Series({
-                    'mae': float(g['error_abs'].mean()),
-                    'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
-                    'median_ae': float(g['error_abs'].median()),
-                    'count': int(len(g))
-                }))
+                circuit_stats = df.groupby('circuit_code').agg(
+                    mae=('error_abs', 'mean'),
+                    rmse=('error_signed', lambda x: float(np.sqrt(np.mean(np.square(x))))),
+                    median_ae=('error_abs', 'median'),
+                    count=('error_abs', 'size'),
+                )
                 circuit_stats.to_csv(results_dir / 'circuit_level.csv')
 
                 topc = circuit_stats.sort_values('count', ascending=False).head(20)
@@ -241,12 +294,12 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
             # Team-level analysis
             try:
                 if 'team_code' in df.columns:
-                    team_stats = df.groupby('team_code').apply(lambda g: pd.Series({
-                        'mae': float(g['error_abs'].mean()),
-                        'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
-                        'median_ae': float(g['error_abs'].median()),
-                        'count': int(len(g))
-                    }))
+                    team_stats = df.groupby('team_code').agg(
+                        mae=('error_abs', 'mean'),
+                        rmse=('error_signed', lambda x: float(np.sqrt(np.mean(np.square(x))))),
+                        median_ae=('error_abs', 'median'),
+                        count=('error_abs', 'size'),
+                    )
                     team_stats.to_csv(results_dir / 'team_level.csv')
 
                     topt = team_stats.sort_values('count', ascending=False).head(20)
@@ -265,12 +318,12 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
             # Compound-specific analysis
             if 'compound' in df.columns:
                 try:
-                    comp_stats = df.groupby('compound').apply(lambda g: pd.Series({
-                        'mae': float(g['error_abs'].mean()),
-                        'rmse': float(np.sqrt(np.mean((g['prediction'] - g['target'])**2))),
-                        'median_ae': float(g['error_abs'].median()),
-                        'count': int(len(g))
-                    })).sort_values('count', ascending=False)
+                    comp_stats = df.groupby('compound').agg(
+                        mae=('error_abs', 'mean'),
+                        rmse=('error_signed', lambda x: float(np.sqrt(np.mean(np.square(x))))),
+                        median_ae=('error_abs', 'median'),
+                        count=('error_abs', 'size'),
+                    ).sort_values('count', ascending=False)
                     comp_stats.to_csv(results_dir / 'compound_level.csv')
 
                     topcomp = comp_stats.head(20)
@@ -290,6 +343,36 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
     print("\n[3/3] Writing analysis report...")
 
+    # Optional comparison with strong baseline if available
+    baseline_eval_path = Path(__file__).parent.parent / 'results' / 'experiment_100epochs_gru_run1' / 'evaluation' / 'evaluation_results.json'
+    baseline_comparison = {}
+    if baseline_eval_path.exists() and metrics_denorm:
+        try:
+            with open(baseline_eval_path, 'r', encoding='utf-8') as f:
+                baseline_eval = json.load(f)
+            baseline_denorm = baseline_eval.get('metrics_denormalized_ms', {})
+            if baseline_denorm:
+                baseline_comparison = {
+                    'mae_ms_phase2': float(metrics_denorm.get('mae_ms', float('nan'))),
+                    'mae_ms_baseline': float(baseline_denorm.get('mae_ms', float('nan'))),
+                    'mae_delta_ms': float(metrics_denorm.get('mae_ms', float('nan')) - baseline_denorm.get('mae_ms', float('nan'))),
+                    'rmse_ms_phase2': float(metrics_denorm.get('rmse_ms', float('nan'))),
+                    'rmse_ms_baseline': float(baseline_denorm.get('rmse_ms', float('nan'))),
+                    'rmse_delta_ms': float(metrics_denorm.get('rmse_ms', float('nan')) - baseline_denorm.get('rmse_ms', float('nan'))),
+                    'median_ae_ms_phase2': float(metrics_denorm.get('median_ae_ms', float('nan'))),
+                    'median_ae_ms_baseline': float(baseline_denorm.get('median_ae_ms', float('nan'))),
+                    'median_ae_delta_ms': float(metrics_denorm.get('median_ae_ms', float('nan')) - baseline_denorm.get('median_ae_ms', float('nan'))),
+                }
+        except Exception:
+            baseline_comparison = {}
+
+    if diagnostics:
+        diagnostics['baseline_comparison'] = baseline_comparison
+        diagnostics_path = results_dir / 'phase_diagnostics.json'
+        with open(diagnostics_path, 'w', encoding='utf-8') as f:
+            json.dump(diagnostics, f, indent=2)
+        print(f"✓ Saved phase_diagnostics.json")
+
     mae = metrics_denorm.get('mae_ms', float('nan'))
     rmse = metrics_denorm.get('rmse_ms', float('nan'))
     median = metrics_denorm.get('median_ae_ms', float('nan'))
@@ -308,6 +391,31 @@ Median Absolute Error:         {median:.2f} ms
 ERROR DISTRIBUTION BY RANGE
 {'-'*80}
 {''.join([f"{k}: {v:.2f}%\n" for k, v in error_breakdown.items()])}
+
+TRAINING DYNAMICS
+{'-'*80}
+epochs_trained: {diagnostics.get('training_dynamics', {}).get('epochs_trained', 'n/a')}
+best_epoch: {diagnostics.get('training_dynamics', {}).get('best_epoch', 'n/a')}
+best_val_loss: {diagnostics.get('training_dynamics', {}).get('best_val_loss', float('nan')):.6f}
+last_val_loss: {diagnostics.get('training_dynamics', {}).get('last_val_loss', float('nan')):.6f}
+overfit_ratio_last_to_best_val: {diagnostics.get('training_dynamics', {}).get('overfit_ratio_last_to_best_val', float('nan')):.3f}
+last_train_total_loss: {diagnostics.get('training_dynamics', {}).get('last_train_loss', float('nan')):.6f}
+last_train_lap_loss: {diagnostics.get('training_dynamics', {}).get('last_train_lap_loss', float('nan')):.6f}
+gap_last_train_total_minus_val: {diagnostics.get('training_dynamics', {}).get('gap_last_train_minus_val', float('nan')):.6f}
+gap_last_train_lap_minus_val: {diagnostics.get('training_dynamics', {}).get('gap_last_train_lap_minus_val', float('nan')):.6f}
+
+BASELINE COMPARISON (vs experiment_100epochs_gru_run1)
+{'-'*80}
+MAE delta: {baseline_comparison.get('mae_delta_ms', float('nan')):.2f} ms
+RMSE delta: {baseline_comparison.get('rmse_delta_ms', float('nan')):.2f} ms
+Median AE delta: {baseline_comparison.get('median_ae_delta_ms', float('nan')):.2f} ms
+
+RECOMMENDED NEXT TRAINING RUN
+{'-'*80}
+- Lower auxiliary-task weighting (pit/compound) to prioritize lap-time objective
+- Reduce augmentation intensity for stability on 2025 distribution
+- Keep early stopping tighter and use best checkpoint epoch
+- Compare tuned run against baseline with denormalized MAE/RMSE first
 
 {'='*80}
 """

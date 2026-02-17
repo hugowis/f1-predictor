@@ -189,7 +189,7 @@ Predict the **next lap times** for a given driver.
 - [ ] Implement autoregressive predictions (free-running mode)
 - [ ] Auxiliary pit head and compound head
 - [ ] Scheduled sampling (gradual removal of teacher forcing)
-- [ ] Error analysis by driver and circuit
+- ✅ Error analysis by driver and circuit
 
 **Expected improvements:**
 - Predictions across full race (not just stints)
@@ -221,8 +221,6 @@ Predict the **next lap times** for a given driver.
 - ✅ Data normalization (per-year StandardScaler)
 - ✅ Masking for non-finite values
 - ✅ Add 2018 season (different compounds and missing data)
-- [ ] Advanced augmentation techniques
-- [ ] Feature engineering (momentum, trend indicators)
 
 ### Modeling - Phase 1
 - ✅ GRU encoder-decoder architecture
@@ -240,7 +238,6 @@ Predict the **next lap times** for a given driver.
 - [ ] Pit stop modeling (head for pit lap prediction)
 - [ ] Compound modeling (head for tire compound prediction)
 - [ ] Transformer decoder
-- [ ] Attention mechanisms
 
 ### Training & Optimization
 - ✅ PyTorch training loop
@@ -273,7 +270,7 @@ Predict the **next lap times** for a given driver.
 ---
 
 ## Experiments
-- [ ] Add 2018 season data
+- ✅ Add 2018 season data
 - [ ] Test with dropped features (sectors, speeds, position)
 - [ ] Pretraining on FP sessions, qualifycation data, sprin, etc.
 

@@ -78,6 +78,7 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     gradient_clip: Optional[float] = 1.0
     accumulation_steps: int = 1
+    use_mixed_precision: bool = True  # Enable FP16 training on CUDA
     
     # Learning rate scheduling
     scheduler_type: str = "cosine"  # "cosine", "linear", "lambda"
@@ -89,8 +90,14 @@ class TrainingConfig:
     teacher_forcing_decay: str = "linear"  # "linear", "exponential"
     
     # Early stopping
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 50
     validation_freq: int = 1  # Validate every N epochs
+    early_stopping_use_ema: bool = False
+    early_stopping_ema_alpha: float = 0.3
+
+    # Multi-task loss weights
+    pit_loss_weight: float = 0.5
+    compound_loss_weight: float = 0.5
     
     # Data
     train_years: list = None
@@ -104,6 +111,8 @@ class TrainingConfig:
             self.val_years = [2024]
         if self.test_years is None:
             self.test_years = [2025]
+
+        # Multi-task loss weights are explicit dataclass fields
 
 
 @dataclass
@@ -228,7 +237,7 @@ def get_phase1_config() -> Config:
         num_epochs=100,
         teacher_forcing_start=1.0,
         teacher_forcing_end=1.0,  # Keep at 100% since it's pure teacher forcing
-        train_years=[2019, 2020, 2021, 2022, 2023],
+        train_years=[2018, 2019, 2020, 2021, 2022, 2023],
         val_years=[2024],
         test_years=[2025],
     )
@@ -266,19 +275,25 @@ def get_phase2_config() -> Config:
     training_config = TrainingConfig(
         batch_size=32,
         learning_rate=5e-4,
-        num_epochs=150,
+        num_epochs=100,
+        weight_decay=5e-5,
         teacher_forcing_start=1.0,
-        teacher_forcing_end=0.5,
+        teacher_forcing_end=0.3,
         teacher_forcing_decay="exponential",
-        train_years=[2019, 2020, 2021],
-        val_years=[2022],
-        test_years=[2023],
+        early_stopping_patience=20,
+        early_stopping_use_ema=True,
+        early_stopping_ema_alpha=0.25,
+        pit_loss_weight=0.15,
+        compound_loss_weight=0.1,
+        train_years=[2018, 2019, 2020, 2021, 2022, 2023],
+        val_years=[2024],
+        test_years=[2025],
     )
     
     data_config = DataConfig(
         window_size=50,
         context_window=10,
-        augment_prob=0.5,
+        augment_prob=0.2,
     )
     
     return Config(

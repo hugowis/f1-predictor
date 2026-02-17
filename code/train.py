@@ -22,6 +22,8 @@ from analyze_results import analyze_results as run_analysis
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataloaders import StintDataloader, LapTimeNormalizer
+from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
+from dataloaders.utils import get_compound_columns
 from models import Seq2Seq, Trainer, create_scheduler
 from config.base import Config, get_phase1_config, get_phase2_config
 from evaluate import evaluate as run_evaluation
@@ -52,7 +54,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
     """
     logger.info("Creating dataloaders...")
     
-    # Create datasets for each split
+    # Create datasets for each split (stint-based)
     train_ds = StintDataloader(
         year=config.training.train_years,
         window_size=config.data.window_size,
@@ -60,7 +62,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
     )
-    
+
     shared_normalizer = train_ds.normalizer if config.data.normalize else None
 
     val_ds = StintDataloader(
@@ -71,7 +73,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         scaler_type=config.data.scaler_type,
         normalizer=shared_normalizer,
     )
-    
+
     test_ds = StintDataloader(
         year=config.training.test_years,
         window_size=config.data.window_size,
@@ -91,6 +93,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         batch_size=batch_size,
         shuffle=config.data.shuffle_train,
         num_workers=config.data.num_workers,
+        pin_memory=True,
     )
     
     val_loader = DataLoader(
@@ -98,6 +101,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         batch_size=batch_size,
         shuffle=config.data.shuffle_val,
         num_workers=config.data.num_workers,
+        pin_memory=True,
     )
     
     test_loader = DataLoader(
@@ -105,8 +109,69 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         batch_size=batch_size,
         shuffle=config.data.shuffle_test,
         num_workers=config.data.num_workers,
+        pin_memory=True,
     )
     
+    return train_loader, val_loader, test_loader
+
+
+def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
+    """
+    Create dataloaders for autoregressive lap-by-lap training.
+    """
+    logger.info("Creating autoregressive dataloaders...")
+
+    train_ds = AutoregressiveLapDataloader(
+        year=config.training.train_years,
+        context_window=config.data.context_window,
+        augment_prob=config.data.augment_prob,
+        normalize=config.data.normalize,
+        scaler_type=config.data.scaler_type,
+    )
+
+    shared_normalizer = train_ds.normalizer if config.data.normalize else None
+    
+    # DEBUG: Log normalizer statistics
+    if shared_normalizer is not None:
+        stats = shared_normalizer.get_statistics()
+        lap_idx = stats['columns'].index('LapTime')
+        logger.info(f"Train normalizer stats: mean={stats['mean'][lap_idx]:.2f}, std={stats['std'][lap_idx]:.2f}")
+
+    val_ds = AutoregressiveLapDataloader(
+        year=config.training.val_years,
+        context_window=config.data.context_window,
+        augment_prob=0.0,
+        normalize=config.data.normalize,
+        scaler_type=config.data.scaler_type,
+        normalizer=shared_normalizer,
+    )
+    
+    # DEBUG: Verify val dataset is using shared normalizer
+    if val_ds.normalizer is not None:
+        val_stats = val_ds.normalizer.get_statistics()
+        val_lap_idx = val_stats['columns'].index('LapTime')
+        logger.info(f"Val normalizer stats: mean={val_stats['mean'][val_lap_idx]:.2f}, std={val_stats['std'][val_lap_idx]:.2f}")
+        if shared_normalizer is not None:
+            is_same = (val_ds.normalizer is shared_normalizer)
+            logger.info(f"Val normalizer is same object as train normalizer: {is_same}")
+
+    test_ds = AutoregressiveLapDataloader(
+        year=config.training.test_years,
+        context_window=config.data.context_window,
+        augment_prob=0.0,
+        normalize=config.data.normalize,
+        scaler_type=config.data.scaler_type,
+        normalizer=shared_normalizer,
+    )
+
+    logger.info(f"Train set: {len(train_ds)} lap pairs")
+    logger.info(f"Val set: {len(val_ds)} lap pairs")
+    logger.info(f"Test set: {len(test_ds)} lap pairs")
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=config.data.shuffle_train, num_workers=config.data.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=config.data.shuffle_val, num_workers=config.data.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=config.data.shuffle_test, num_workers=config.data.num_workers, pin_memory=True)
+
     return train_loader, val_loader, test_loader
 
 
@@ -141,6 +206,13 @@ def create_model(config: Config, device: str = 'cpu'):
         'device': device,
     }
     
+    # If autoregressive dataloader is used, pass compound_classes to model
+    try:
+        compound_classes = len(get_compound_columns())
+    except Exception:
+        compound_classes = getattr(config.model, 'compound_classes', 4)
+    model_config['compound_classes'] = compound_classes
+
     if config.model.name in ("seq2seq", "seq2seq_gru"):
         model = Seq2Seq(**model_config)
     else:
@@ -215,10 +287,70 @@ def train(config: Config, output_dir: Path = None):
     logger.info(config)
     
     # Create dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(
-        config,
-        batch_size=config.training.batch_size
-    )
+    if getattr(config, 'use_autoregressive', False):
+        train_loader, val_loader, test_loader = create_autoregressive_dataloaders(
+            config,
+            batch_size=config.training.batch_size
+        )
+    else:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            config,
+            batch_size=config.training.batch_size
+        )
+
+    # Sanity-check that dataset.normalizer.transform applied to raw rows matches
+    # the normalized lap_time returned by the dataset's __getitem__ implementation.
+    try:
+        dataset = train_loader.dataset
+        if hasattr(dataset, 'normalizer') and dataset.normalizer is not None:
+            import numpy as _np
+            import pandas as _pd
+
+            numeric_cols = getattr(dataset, 'numeric_columns', ['LapTime'])
+            max_checks = min(50, len(getattr(dataset, 'lap_pairs', [])))
+            mismatches = []
+
+            # Temporarily disable augmentation to get deterministic __getitem__ behavior
+            orig_aug = getattr(dataset, 'augment_prob', 0.0)
+            try:
+                dataset.augment_prob = 0.0
+                for i in range(max_checks):
+                    pair = dataset.lap_pairs[i]
+                    tidx = pair['target_index']
+                    raw_row = dataset.data.loc[[tidx]]
+                    # Ensure numeric columns exist in raw_row
+                    raw_numeric = raw_row[numeric_cols]
+                    try:
+                        transformed = dataset.normalizer.transform(raw_numeric)
+                        transformed_val = float(transformed['LapTime'].iloc[0])
+                    except Exception:
+                        transformed_val = float('nan')
+
+                    try:
+                        _, tgt, _ = dataset.__getitem__(i)
+                        returned = float(tgt['lap_time'].cpu().numpy()) if hasattr(tgt['lap_time'], 'cpu') else float(tgt['lap_time'])
+                    except Exception:
+                        returned = float('nan')
+
+                    if not (_np.isfinite(transformed_val) and _np.isfinite(returned) and abs(transformed_val - returned) < 1e-3):
+                        mismatches.append((tidx, float(raw_row['LapTime'].iloc[0]), transformed_val, returned))
+
+            finally:
+                # Restore augmentation probability
+                dataset.augment_prob = orig_aug
+
+            if mismatches:
+                logger.error(f"Normalizer consistency check failed: {len(mismatches)} mismatches (showing up to 20)")
+                for row in mismatches[:20]:
+                    logger.error(f"{row[0]}: raw={row[1]} -> transformed={row[2]} -> returned={row[3]}")
+                raise RuntimeError("Dataset normalizer.transform does not match dataset.__getitem__ returned lap_time values. See logs for samples.")
+            else:
+                logger.info("Normalizer consistency check passed: transformed values match dataset returns on sample rows")
+    except StopIteration:
+        logger.warning("Could not sample a batch from train_loader for normalizer check")
+    except Exception:
+        logger.exception("Normalizer sanity check failed during consistency verification")
+        raise
     
     # Create model
     model = create_model(config, device=config.device)
@@ -250,6 +382,11 @@ def train(config: Config, output_dir: Path = None):
         checkpoint_dir=output_dir / "checkpoints",
         gradient_clip=config.training.gradient_clip,
         accumulation_steps=config.training.accumulation_steps,
+        pit_loss_weight=getattr(config.training, 'pit_loss_weight', 0.5),
+        compound_loss_weight=getattr(config.training, 'compound_loss_weight', 0.5),
+        use_mixed_precision=getattr(config.training, 'use_mixed_precision', True),
+        early_stopping_use_ema=getattr(config.training, 'early_stopping_use_ema', False),
+        early_stopping_ema_alpha=getattr(config.training, 'early_stopping_ema_alpha', 0.3),
     )
     
     # Training loop
@@ -285,10 +422,12 @@ def main():
     parser.add_argument('--config', type=Path, help='Path to config JSON file')
     parser.add_argument('--device', default='cuda', help='Device to use (cuda or cpu)')
     parser.add_argument('--output', type=Path, help='Output directory for results')
+    parser.add_argument('--autoregressive', action='store_true', help='Use autoregressive lap-by-lap dataloader')
     parser.add_argument('--decoder-type', choices=['gru', 'lstm'], help='Decoder type to use (overrides config)')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning-rate', type=float, help='Learning rate')
+    parser.add_argument('--no-mixed-precision', action='store_true', help='Disable mixed precision training (FP16)')
     
     args = parser.parse_args()
     
@@ -302,6 +441,9 @@ def main():
     elif args.phase == 2:
         config = get_phase2_config()
         logger.info("Using Phase 2 preset config")
+    elif args.autoregressive:
+        config = get_phase2_config()
+        logger.info("Using default Phase 2 config for autoregressive training")
     else:
         config = get_phase1_config()
         logger.info("Using default Phase 1 config")
@@ -322,10 +464,16 @@ def main():
         config.training.num_epochs = args.epochs
     if args.learning_rate:
         config.training.learning_rate = args.learning_rate
+    if args.no_mixed_precision:
+        config.training.use_mixed_precision = False
     
     output_dir = args.output or Path(config.output_dir)
     
     # Run training
+    # Choose dataloader mode (stint vs autoregressive) inside `train()` by flag
+    if args.autoregressive:
+        # attach a marker to config so train() can choose
+        setattr(config, 'use_autoregressive', True)
     history = train(config, output_dir)
     
     logger.info("\n" + "=" * 60)

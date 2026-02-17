@@ -33,6 +33,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def compute_regression_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict:
+    """
+    Compute regression metrics from flat prediction/target arrays.
+
+    Parameters
+    ----------
+    predictions : np.ndarray
+        Predicted values
+    targets : np.ndarray
+        Ground truth values
+
+    Returns
+    -------
+    dict
+        Metrics dictionary with MAE/RMSE/MAPE/quantiles/bias/loss
+    """
+    pred_flat = np.asarray(predictions).reshape(-1)
+    target_flat = np.asarray(targets).reshape(-1)
+
+    metrics = {
+        'mae': float(np.mean(np.abs(pred_flat - target_flat))),
+        'rmse': float(np.sqrt(np.mean((pred_flat - target_flat) ** 2))),
+        'median_ae': float(np.median(np.abs(pred_flat - target_flat))),
+    }
+
+    mape_mask = target_flat != 0
+    if mape_mask.any():
+        metrics['mape'] = float(np.mean(np.abs((pred_flat[mape_mask] - target_flat[mape_mask]) / target_flat[mape_mask])) * 100)
+    else:
+        metrics['mape'] = 0.0
+
+    errors = np.abs(pred_flat - target_flat)
+    metrics['q25_ae'] = float(np.percentile(errors, 25))
+    metrics['q50_ae'] = float(np.percentile(errors, 50))
+    metrics['q75_ae'] = float(np.percentile(errors, 75))
+    metrics['q95_ae'] = float(np.percentile(errors, 95))
+    metrics['q99_ae'] = float(np.percentile(errors, 99))
+
+    bias = pred_flat - target_flat
+    metrics['mean_bias'] = float(np.mean(bias))
+    metrics['median_bias'] = float(np.median(bias))
+    metrics['loss'] = float(np.mean((pred_flat - target_flat) ** 2))
+
+    return metrics
+
+
 def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
     """
     Load model from checkpoint.
@@ -225,6 +271,61 @@ def evaluate(
             logger.info(f"  {key.upper()}: {value:.2f}%")
         else:
             logger.info(f"  {key.upper()}: {value:.2f}")
+
+    # Additional multi-task metrics (pit, compound) if available in predictions
+    pit_preds = predictions.get('pit_predictions')
+    pit_targs = predictions.get('pit_targets')
+    # Try to compute AUROC + accuracy for pit predictions using sklearn if available
+    if pit_preds is not None and pit_targs is not None:
+        try:
+            from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
+            pit_probs = pit_preds.reshape(-1)
+            pit_labels = pit_targs.reshape(-1)
+            # Ensure binary labels 0/1
+            pit_labels = pit_labels.astype(int)
+            # AUROC (requires both classes present)
+            try:
+                pit_auroc = float(roc_auc_score(pit_labels, pit_probs))
+            except Exception:
+                pit_auroc = float('nan')
+            pit_pred_binary = (pit_probs >= 0.5).astype(int)
+            pit_acc = float(accuracy_score(pit_labels, pit_pred_binary))
+            pit_cm = confusion_matrix(pit_labels, pit_pred_binary).tolist()
+            logger.info(f"  PIT_AUROC: {pit_auroc:.3f}")
+            logger.info(f"  PIT_ACC: {pit_acc:.3f}")
+            logger.info(f"  PIT_CONFUSION: {pit_cm}")
+            metrics['pit_auroc'] = pit_auroc
+            metrics['pit_accuracy'] = pit_acc
+            metrics['pit_confusion'] = pit_cm
+        except Exception:
+            # Fallback to simple accuracy only
+            try:
+                pit_acc = float(((pit_preds >= 0.5).astype(int).reshape(-1) == pit_targs.reshape(-1)).mean())
+            except Exception:
+                pit_acc = float('nan')
+            logger.info(f"  PIT_ACC: {pit_acc:.3f}")
+            metrics['pit_accuracy'] = pit_acc
+
+    comp_preds = predictions.get('compound_predictions')
+    comp_targs = predictions.get('compound_targets')
+    if comp_preds is not None and comp_targs is not None:
+        try:
+            from sklearn.metrics import confusion_matrix, accuracy_score
+            comp_pred_flat = comp_preds.reshape(-1)
+            comp_targ_flat = comp_targs.reshape(-1)
+            comp_acc = float(accuracy_score(comp_targ_flat, comp_pred_flat))
+            comp_cm = confusion_matrix(comp_targ_flat, comp_pred_flat).tolist()
+            logger.info(f"  COMPOUND_ACC: {comp_acc:.3f}")
+            logger.info(f"  COMPOUND_CONFUSION: {comp_cm}")
+            metrics['compound_accuracy'] = comp_acc
+            metrics['compound_confusion'] = comp_cm
+        except Exception:
+            try:
+                comp_acc = float((comp_preds.reshape(-1) == comp_targs.reshape(-1)).mean())
+            except Exception:
+                comp_acc = float('nan')
+            logger.info(f"  COMPOUND_ACC: {comp_acc:.3f}")
+            metrics['compound_accuracy'] = comp_acc
     
     # Denormalize predictions for interpretability
     logger.info("\nDenormalizing predictions...")
@@ -258,11 +359,21 @@ def evaluate(
             pred_denorm = predictions['predictions']
             target_denorm = predictions['targets']
     
-    # Compute denormalized metrics
+    # Compute denormalized metrics (milliseconds)
+    metrics_denorm_full = compute_regression_metrics(pred_denorm, target_denorm)
     metrics_denorm = {
-        'mae_ms': float(np.mean(np.abs(pred_denorm - target_denorm))),
-        'rmse_ms': float(np.sqrt(np.mean((pred_denorm - target_denorm) ** 2))),
-        'median_ae_ms': float(np.median(np.abs(pred_denorm - target_denorm))),
+        'mae_ms': metrics_denorm_full['mae'],
+        'rmse_ms': metrics_denorm_full['rmse'],
+        'median_ae_ms': metrics_denorm_full['median_ae'],
+        'mape_percent': metrics_denorm_full['mape'],
+        'q25_ae_ms': metrics_denorm_full['q25_ae'],
+        'q50_ae_ms': metrics_denorm_full['q50_ae'],
+        'q75_ae_ms': metrics_denorm_full['q75_ae'],
+        'q95_ae_ms': metrics_denorm_full['q95_ae'],
+        'q99_ae_ms': metrics_denorm_full['q99_ae'],
+        'mean_bias_ms': metrics_denorm_full['mean_bias'],
+        'median_bias_ms': metrics_denorm_full['median_bias'],
+        'mse_ms2': metrics_denorm_full['loss'],
     }
     
     logger.info("\nDenormalized Metrics (ms):")
@@ -298,12 +409,15 @@ def evaluate(
     results = {
         'checkpoint': str(checkpoint_path),
         'test_years': test_years,
-        'metrics': metrics,
+        'metrics_normalized': metrics,
         'metrics_denormalized_ms': metrics_denorm,
         'error_breakdown': error_breakdown,
         'predictions_file': str(preds_file),
         'predictions_metadata_file': str(meta_file),
     }
+
+    # Backward compatibility with older consumers expecting key name `metrics`
+    results['metrics'] = metrics
     
     results_path = output_dir / "evaluation_results.json"
     with open(results_path, 'w') as f:
@@ -311,9 +425,9 @@ def evaluate(
     
     logger.info(f"\nEvaluation results saved to {results_path}")
     
-    # Generate report
+    # Generate report on denormalized metrics for interpretability
     report_path = output_dir / "evaluation_report.txt"
-    report = report_evaluation(metrics, save_path=report_path)
+    report = report_evaluation(metrics_denorm_full, save_path=report_path, unit_label="ms")
     print("\n" + report)
     
     return metrics

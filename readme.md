@@ -66,6 +66,74 @@ This project builds a **sequence-to-sequence (seq2seq) model** to solve the lap 
 
 All training and evaluation scripts are located in the `code/` folder for better organization.
 
+### Prepare the data
+
+```bash
+# Download data
+python code/data/data_downloader.py 
+# Prepare it
+python code/data/data_preparation.py
+```
+
+### Precomputed / Cached Dataloader (new)
+
+To speed up development and testing you can persist the autoregressive dataloader's
+precomputed context tensors to disk so subsequent runs load instantly.
+
+- Default behavior: the `AutoregressiveLapDataloader` will attempt to load a cache
+  file under `data/precomputed/` named like `ar_cache_<years>_cw<context>_<scaler>.pt`.
+- You can override or explicitly set the cache file with the `cache_path` parameter.
+- The dataloader validates cache compatibility (years, `context_window`, `scaler_type`, numeric columns).
+- To skip precomputation entirely (interactive debugging), set the environment variable `SKIP_PRECOMPUTE=1`.
+
+Examples
+
+Python API (use explicit cache path):
+
+```python
+from pathlib import Path
+from code.dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
+
+ds = AutoregressiveLapDataloader(
+    year=[2019, 2020],
+    context_window=5,
+    cache_path=Path('data/precomputed/my_ar_cache.pt'),
+    scaler_type='standard',
+    device='cpu'
+)
+# On first instantiation this will precompute tensors and save the cache.
+# On subsequent runs it will load the cache (if compatible) which is much faster.
+```
+
+Quick precompute from Python (bulk):
+
+```python
+from pathlib import Path
+from code.dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
+
+def build_cache(years, cw):
+    p = Path(f'data/precomputed/ar_cache_{"_".join(map(str, years))}_cw{cw}_standard.pt')
+    ds = AutoregressiveLapDataloader(year=years, context_window=cw, cache_path=p)
+
+# Example: precompute caches for 2018-2020 with cw=5
+build_cache([2018,2019,2020], 5)
+```
+
+Clearing cache
+
+```bash
+rm -f data/precomputed/ar_cache_*
+```
+
+Notes
+
+- The cache stores context arrays (numpy), target primitives and metadata. If you change
+  the dataloader feature set (numeric columns) or scaler type, the cache will be ignored
+  and recomputed.
+- Keep an eye on disk usage for very large year ranges; caches can become large when
+  precomputing many races.
+
+
 ### Training a Model
 
 ```bash
@@ -182,19 +250,34 @@ Predict the **next lap times** for a given driver.
 
 ---
 
-### 🚀 Phase 2: In Planning
+### 🚀 Phase 2: Autoregressive (Trained)
+
+**Status:** ✅ Trained and evaluated (autoregressive / free-running mode)
+
+**Denormalized test metrics (Phase 2):**
+- **MAE:** 39.08 ms
+- **RMSE:** 63.84 ms
+- **Median AE:** 24.89 ms
+
+**Error distribution:**
+- 0-10 ms: 23.05%
+- 10-50 ms: 55.29%
+- 50-100 ms: 13.95%
+- 100-200 ms: 5.17%
+- 200+ ms: 2.54%
+
+
 
 **Objectives:**
-- [ ] Extend sequence length to full races, masking for not normal laps
-- [ ] Implement autoregressive predictions (free-running mode)
-- [ ] Auxiliary pit head and compound head
-- [ ] Scheduled sampling (gradual removal of teacher forcing)
+- ✅ Extend sequence length to full races, masking for not normal laps
+- ✅ Implement autoregressive predictions (free-running mode)
+- ✅ Auxiliary pit head and compound head
+- ✅ Scheduled sampling (gradual removal of teacher forcing)
 - ✅ Error analysis by driver and circuit
 
 **Expected improvements:**
 - Predictions across full race (not just stints)
 - Handling of strategy changes and pit stops
-- Driver-specific lap time signatures
 
 ---
 
@@ -233,11 +316,14 @@ Predict the **next lap times** for a given driver.
 - ✅ Team/car embeddings
 
 ### Modeling - Phase 2
-- [ ] Full-race sequences
-- [ ] Autoregressive generation
-- [ ] Pit stop modeling (head for pit lap prediction)
-- [ ] Compound modeling (head for tire compound prediction)
-- [ ] Transformer decoder
+- [✅] Full-race sequences
+- [✅] Autoregressive
+- [✅] Pit stop modeling (head for pit lap prediction)
+- [✅] Compound modeling (head for tire compound prediction)
+
+### Modeling - Phase 3
+- [ ] Transformer-based architecture
+- [ ] Uncertainty estimation (mean + variance predictions)
 
 ### Training & Optimization
 - ✅ PyTorch training loop
@@ -266,13 +352,13 @@ Predict the **next lap times** for a given driver.
 - ✅ Evaluation script with checkpointing
 - ✅ Visualization suite
 - ✅ Git ignore for generated files
-- [ ] Prediction dashboard
+- [ ] Web dashboard
 ---
 
 ## Experiments
 - ✅ Add 2018 season data
 - [ ] Test with dropped features (sectors, speeds, position)
 - [ ] Pretraining on FP sessions, qualifycation data, sprin, etc.
-
+- [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
 
 

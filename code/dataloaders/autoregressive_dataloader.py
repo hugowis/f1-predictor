@@ -117,6 +117,7 @@ class AutoregressiveLapDataloader(Dataset):
         scaler_type: str = "standard",
         normalizer: Optional[LapTimeNormalizer] = None,
         data_path: Path = None,
+        cache_path: Optional[Path] = None,
         device: str = 'cpu',
         seed: int = None,
     ):
@@ -125,6 +126,8 @@ class AutoregressiveLapDataloader(Dataset):
         self.augment_prob = augment_prob
         self.device = device
         self.data_path = data_path or Path("./data")
+        # Cache file for precomputed contexts/targets
+        self.cache_path = Path(cache_path) if cache_path is not None else None
         
         if seed is not None:
             np.random.seed(seed)
@@ -186,14 +189,68 @@ class AutoregressiveLapDataloader(Dataset):
             self._precomputed_targets = [None] * len(self.lap_pairs)
             self._precomputed_meta = [None] * len(self.lap_pairs)
         else:
-            # Precompute feature tensors for all lap pairs to avoid heavy
-            # pandas->numpy work inside __getitem__ which blocks the GPU.
-            # This produces slightly higher memory usage but greatly reduces
-            # per-sample CPU overhead during training.
-            logger.info(f"Precomputing feature tensors for all {len(self.lap_pairs)} lap pairs...")
-            self._precomputed_contexts = [None] * len(self.lap_pairs)
-            self._precomputed_targets = [None] * len(self.lap_pairs)
-            self._precomputed_meta = [None] * len(self.lap_pairs)
+            # Attempt to load precomputed cache if available to speed startup.
+            # Cache must match: years, context_window, scaler_type and numeric column set.
+            cache_loaded = False
+            if self.cache_path is None:
+                # default cache location inside data_path/precomputed/
+                cache_dir = Path(self.data_path) / "precomputed"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                years_key = "_".join(map(str, sorted(self.years)))
+                cache_fname = f"ar_cache_{years_key}_cw{self.context_window}_{scaler_type}.pt"
+                self.cache_path = cache_dir / cache_fname
+
+            if self.cache_path.exists():
+                try:
+                    logger.info(f"Loading cached precomputed dataset from {self.cache_path}...")
+                    cached = torch.load(self.cache_path)
+                    # Validate cache compatibility
+                    valid = (
+                        cached.get('years') == self.years and
+                        cached.get('context_window') == self.context_window and
+                        cached.get('scaler_type') == scaler_type and
+                        cached.get('numeric_columns') == self.numeric_columns
+                    )
+                    if valid:
+                        # Reconstruct contexts: skip None entries safely
+                        loaded_contexts = []
+                        for x in cached.get('contexts', []):
+                            if x is None:
+                                loaded_contexts.append(None)
+                            elif isinstance(x, torch.Tensor):
+                                loaded_contexts.append(x)
+                            else:
+                                loaded_contexts.append(torch.from_numpy(x))
+                        self._precomputed_contexts = loaded_contexts
+
+                        # Reconstruct target tensors from saved primitives (handle None)
+                        loaded_targets = []
+                        for tp in cached.get('targets', []):
+                            if tp is None:
+                                loaded_targets.append(None)
+                                continue
+                            lt = torch.tensor(tp['lap_time'], dtype=torch.float32)
+                            is_pit = torch.tensor(int(tp.get('is_pitlap', 0)), dtype=torch.long)
+                            comp = torch.tensor(int(tp.get('compound', 0)), dtype=torch.long)
+                            loaded_targets.append({'lap_time': lt, 'is_pitlap': is_pit, 'compound': comp})
+                        self._precomputed_targets = loaded_targets
+                        self._precomputed_meta = cached['meta']
+                        cache_loaded = True
+                        logger.info(f"Loaded {len(self._precomputed_contexts)} cached context tensors")
+                    else:
+                        logger.info("Cache file did not match current dataloader configuration; ignoring cache.")
+                except Exception:
+                    logger.exception("Failed to load cache; will recompute precomputed tensors.")
+
+            if not cache_loaded:
+                # Precompute feature tensors for all lap pairs to avoid heavy
+                # pandas->numpy work inside __getitem__ which blocks the GPU.
+                # This produces slightly higher memory usage but greatly reduces
+                # per-sample CPU overhead during training.
+                logger.info(f"Precomputing feature tensors for all {len(self.lap_pairs)} lap pairs...")
+                self._precomputed_contexts = [None] * len(self.lap_pairs)
+                self._precomputed_targets = [None] * len(self.lap_pairs)
+                self._precomputed_meta = [None] * len(self.lap_pairs)
 
             for i in range(len(self.lap_pairs)):
                 pair = self.lap_pairs[i]
@@ -258,7 +315,39 @@ class AutoregressiveLapDataloader(Dataset):
                 self._precomputed_targets[i] = target_tensor
                 self._precomputed_meta[i] = metadata
 
-            logger.info(f"Precomputed all {len(self.lap_pairs)} context tensors in RAM for maximum training speed")
+                logger.info(f"Precomputed all {len(self.lap_pairs)} context tensors in RAM for maximum training speed")
+
+                # Persist cache to disk for faster subsequent loads
+                try:
+                    logger.info(f"Saving precomputed cache to {self.cache_path} ...")
+                    # Convert tensors to numpy for safer serialization
+                    contexts_np = [c.cpu().numpy() if isinstance(c, torch.Tensor) else c for c in self._precomputed_contexts]
+                    # targets are small dicts with tensors; convert to primitives (handle None)
+                    targets_primitives = []
+                    for t in self._precomputed_targets:
+                        if t is None:
+                            targets_primitives.append(None)
+                            continue
+                        tp = {}
+                        for k, v in t.items():
+                            if isinstance(v, torch.Tensor):
+                                tp[k] = v.cpu().item() if v.numel() == 1 else v.cpu().numpy()
+                            else:
+                                tp[k] = v
+                        targets_primitives.append(tp)
+
+                    torch.save({
+                        'years': self.years,
+                        'context_window': self.context_window,
+                        'scaler_type': scaler_type,
+                        'numeric_columns': self.numeric_columns,
+                        'contexts': contexts_np,
+                        'targets': targets_primitives,
+                        'meta': self._precomputed_meta,
+                    }, self.cache_path)
+                    logger.info(f"Cache saved to {self.cache_path}")
+                except Exception:
+                    logger.exception("Failed to save precomputed cache")
     
     def _generate_lap_pairs(self) -> List[Dict]:
         """

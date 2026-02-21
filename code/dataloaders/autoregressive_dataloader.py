@@ -15,6 +15,7 @@ from typing import Union, List, Tuple, Dict, Optional
 import numpy as np
 import pandas as pd
 import os
+from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
 
@@ -144,6 +145,12 @@ class AutoregressiveLapDataloader(Dataset):
             self.boolean_columns +
             self.compound_columns
         )
+        self._numeric_index = {c: i for i, c in enumerate(self.numeric_columns)}
+        self._weather_numeric_indices = [
+            self._numeric_index[c]
+            for c in ['AirTemp', 'TrackTemp', 'Humidity', 'WindSpeed', 'WindDirection']
+            if c in self._numeric_index
+        ]
         
         # Load and prepare data
         logger.info(f"Loading race data for years {self.years}...")
@@ -203,7 +210,48 @@ class AutoregressiveLapDataloader(Dataset):
             if self.cache_path.exists():
                 try:
                     logger.info(f"Loading cached precomputed dataset from {self.cache_path}...")
-                    cached = torch.load(self.cache_path)
+                    def _safe_torch_load(p):
+                        safe_globals = [
+                            np._core.multiarray.scalar,
+                            np._core.multiarray._reconstruct,
+                            np.ndarray,
+                            np.dtype,
+                        ]
+
+                        # Pre-allowlist for PyTorch>=2.6 weights_only default behavior
+                        try:
+                            if hasattr(torch.serialization, 'add_safe_globals'):
+                                torch.serialization.add_safe_globals(safe_globals)
+                        except Exception:
+                            pass
+
+                        # 1) Preferred: safe weights-only load
+                        try:
+                            return torch.load(p, weights_only=True)
+                        except Exception:
+                            pass
+
+                        # 2) Safe globals context fallback (older/alternate torch APIs)
+                        try:
+                            if hasattr(torch.serialization, 'safe_globals'):
+                                with torch.serialization.safe_globals(safe_globals):
+                                    return torch.load(p, weights_only=True)
+                        except Exception:
+                            pass
+
+                        # 3) Trusted-local-file fallback for legacy caches
+                        try:
+                            logger.info("Falling back to torch.load(weights_only=False) for trusted local cache")
+                            return torch.load(p, weights_only=False)
+                        except Exception:
+                            pass
+
+                        # 4) Last resort: pickle
+                        import pickle
+                        with open(p, 'rb') as f:
+                            return pickle.load(f)
+
+                    cached = _safe_torch_load(self.cache_path)
                     # Validate cache compatibility
                     valid = (
                         cached.get('years') == self.years and
@@ -212,15 +260,26 @@ class AutoregressiveLapDataloader(Dataset):
                         cached.get('numeric_columns') == self.numeric_columns
                     )
                     if valid:
-                        # Reconstruct contexts: skip None entries safely
+                        # Reconstruct contexts: skip None entries safely and accept lists/ndarrays/tensors
                         loaded_contexts = []
                         for x in cached.get('contexts', []):
                             if x is None:
                                 loaded_contexts.append(None)
                             elif isinstance(x, torch.Tensor):
                                 loaded_contexts.append(x)
-                            else:
+                            elif isinstance(x, np.ndarray):
                                 loaded_contexts.append(torch.from_numpy(x))
+                            elif isinstance(x, list):
+                                try:
+                                    loaded_contexts.append(torch.tensor(x, dtype=torch.float32))
+                                except Exception:
+                                    loaded_contexts.append(torch.tensor(np.array(x), dtype=torch.float32))
+                            else:
+                                # unknown type, try torch.tensor
+                                try:
+                                    loaded_contexts.append(torch.tensor(x))
+                                except Exception:
+                                    loaded_contexts.append(None)
                         self._precomputed_contexts = loaded_contexts
 
                         # Reconstruct target tensors from saved primitives (handle None)
@@ -252,76 +311,91 @@ class AutoregressiveLapDataloader(Dataset):
                 self._precomputed_targets = [None] * len(self.lap_pairs)
                 self._precomputed_meta = [None] * len(self.lap_pairs)
 
-            for i in range(len(self.lap_pairs)):
-                pair = self.lap_pairs[i]
-                context_indices = pair['context_indices']
-                target_index = pair['target_index']
+            if not cache_loaded:
+                for i in tqdm(range(len(self.lap_pairs)), desc="Precomputing contexts", unit="pairs"):
+                    pair = self.lap_pairs[i]
+                    context_indices = pair['context_indices']
+                    target_index = pair['target_index']
 
-                context_laps = self.data.loc[context_indices].copy()
-                target_lap = self.data.loc[target_index].copy()
+                    context_laps = self.data.loc[context_indices].copy()
+                    target_lap = self.data.loc[target_index].copy()
 
-                # NOTE: precompute without augmentation (augmentation per-sample
-                # would re-introduce CPU work). If augment_prob > 0, augmentation
-                # will be skipped for precomputed path to maximize throughput.
-                if self.normalizer is not None:
-                    context_laps = self.normalizer.transform(context_laps)
-                    target_lap_norm = self.normalizer.transform(target_lap.to_frame().T)
-                    target_lap = target_lap_norm.iloc[0]
+                    # NOTE: precompute without augmentation (augmentation per-sample
+                    # would re-introduce CPU work). If augment_prob > 0, augmentation
+                    # will be skipped for precomputed path to maximize throughput.
+                    if self.normalizer is not None:
+                        context_laps = self.normalizer.transform(context_laps)
+                        target_lap_norm = self.normalizer.transform(target_lap.to_frame().T)
+                        target_lap = target_lap_norm.iloc[0]
 
-                # Extract features for context
-                context_features = []
-                for _, lap in context_laps.iterrows():
-                    feat = self._get_lap_features(lap)
-                    context_features.append(feat)
+                    # Extract features for context
+                    context_features = []
+                    for _, lap in context_laps.iterrows():
+                        feat = self._get_lap_features(lap)
+                        context_features.append(feat)
 
-                if context_features:
-                    context_array = np.array(context_features, dtype=np.float32)
-                else:
-                    # Empty context
-                    num_features = len(self._get_lap_features(context_laps.iloc[0])) if len(context_laps) > 0 else 100
-                    context_array = np.zeros((0, num_features), dtype=np.float32)
+                    if context_features:
+                        context_array = np.array(context_features, dtype=np.float32)
+                    else:
+                        # Empty context
+                        num_features = len(self._get_lap_features(context_laps.iloc[0])) if len(context_laps) > 0 else 100
+                        context_array = np.zeros((0, num_features), dtype=np.float32)
 
-                # Pad context to window size
-                if len(context_array) < self.context_window:
-                    padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
-                    context_array = np.vstack([padding, context_array])
+                    # Pad context to window size
+                    if len(context_array) < self.context_window:
+                        padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
+                        context_array = np.vstack([padding, context_array])
 
-                # Target values
-                target_laptime = float(target_lap['LapTime'])
-                pit_flag = int(target_lap.get('is_pitlap', 0))
-                comp_vals = target_lap[self.compound_columns].values.astype(np.int32)
-                if comp_vals.sum() == 0:
-                    compound_idx = len(self.compound_columns) - 1
-                else:
-                    compound_idx = int(np.argmax(comp_vals))
+                    # Target values
+                    target_laptime = float(target_lap['LapTime'])
+                    pit_flag = int(target_lap.get('is_pitlap', 0))
+                    comp_vals = target_lap[self.compound_columns].values.astype(np.int32)
+                    if comp_vals.sum() == 0:
+                        compound_idx = len(self.compound_columns) - 1
+                    else:
+                        compound_idx = int(np.argmax(comp_vals))
 
-                # Convert to tensors and store
-                context_tensor = torch.from_numpy(context_array)
-                target_tensor = {
-                    'lap_time': torch.tensor(target_laptime, dtype=torch.float32),
-                    'is_pitlap': torch.tensor(pit_flag, dtype=torch.long),
-                    'compound': torch.tensor(compound_idx, dtype=torch.long),
-                }
+                    # Convert to tensors and store
+                    context_tensor = torch.from_numpy(context_array)
+                    target_tensor = {
+                        'lap_time': torch.tensor(target_laptime, dtype=torch.float32),
+                        'is_pitlap': torch.tensor(pit_flag, dtype=torch.long),
+                        'compound': torch.tensor(compound_idx, dtype=torch.long),
+                    }
 
-                metadata = {
-                    'driver': pair['driver'],
-                    'year': pair['year'],
-                    'circuit': pair['circuit'],
-                    'race_name': pair['race_name'],
-                    'context_length': len(context_features),
-                }
+                    metadata = {
+                        'driver': pair['driver'],
+                        'year': pair['year'],
+                        'circuit': pair['circuit'],
+                        'race_name': pair['race_name'],
+                        'context_length': len(context_features),
+                    }
 
-                self._precomputed_contexts[i] = context_tensor
-                self._precomputed_targets[i] = target_tensor
-                self._precomputed_meta[i] = metadata
+                    self._precomputed_contexts[i] = context_tensor
+                    self._precomputed_targets[i] = target_tensor
+                    self._precomputed_meta[i] = metadata
 
                 logger.info(f"Precomputed all {len(self.lap_pairs)} context tensors in RAM for maximum training speed")
 
                 # Persist cache to disk for faster subsequent loads
                 try:
                     logger.info(f"Saving precomputed cache to {self.cache_path} ...")
-                    # Convert tensors to numpy for safer serialization
-                    contexts_np = [c.cpu().numpy() if isinstance(c, torch.Tensor) else c for c in self._precomputed_contexts]
+                    # Convert contexts to plain lists to avoid numpy reconstruction issues on load
+                    contexts_np = []
+                    for c in self._precomputed_contexts:
+                        if c is None:
+                            contexts_np.append(None)
+                        elif isinstance(c, torch.Tensor):
+                            contexts_np.append(c.cpu().numpy().tolist())
+                        elif isinstance(c, np.ndarray):
+                            contexts_np.append(c.tolist())
+                        elif isinstance(c, list):
+                            contexts_np.append(c)
+                        else:
+                            try:
+                                contexts_np.append(np.array(c).tolist())
+                            except Exception:
+                                contexts_np.append(None)
                     # targets are small dicts with tensors; convert to primitives (handle None)
                     targets_primitives = []
                     for t in self._precomputed_targets:
@@ -336,6 +410,19 @@ class AutoregressiveLapDataloader(Dataset):
                                 tp[k] = v
                         targets_primitives.append(tp)
 
+                    meta_primitives = []
+                    for m in self._precomputed_meta:
+                        if m is None:
+                            meta_primitives.append(None)
+                            continue
+                        meta_primitives.append({
+                            'driver': int(m.get('driver', 0)),
+                            'year': int(m.get('year', 0)),
+                            'circuit': int(m.get('circuit', 0)),
+                            'race_name': str(m.get('race_name', 'Unknown')),
+                            'context_length': int(m.get('context_length', 0)),
+                        })
+
                     torch.save({
                         'years': self.years,
                         'context_window': self.context_window,
@@ -343,11 +430,13 @@ class AutoregressiveLapDataloader(Dataset):
                         'numeric_columns': self.numeric_columns,
                         'contexts': contexts_np,
                         'targets': targets_primitives,
-                        'meta': self._precomputed_meta,
+                        'meta': meta_primitives,
                     }, self.cache_path)
                     logger.info(f"Cache saved to {self.cache_path}")
                 except Exception:
                     logger.exception("Failed to save precomputed cache")
+            else:
+                logger.info("Using cached precomputed tensors; skipping recomputation.")
     
     def _generate_lap_pairs(self) -> List[Dict]:
         """
@@ -485,6 +574,49 @@ class AutoregressiveLapDataloader(Dataset):
     def __len__(self) -> int:
         """Return total number of lap pairs."""
         return len(self.lap_pairs)
+
+    def _apply_cached_tensor_augmentation(
+        self,
+        context_tensor: torch.Tensor,
+        target_tensor: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Apply lightweight augmentation directly on precomputed normalized tensors.
+
+        This keeps cache speed while restoring stochastic augmentation during training.
+        """
+        context_aug = context_tensor.clone()
+        target_aug = {
+            k: (v.clone() if isinstance(v, torch.Tensor) else v)
+            for k, v in target_tensor.items()
+        }
+
+        aug_type = int(np.random.choice(3))
+
+        if aug_type == 0:
+            noise_scale = float(np.random.normal(0.0, 0.02))
+            lap_idx = self._numeric_index.get('LapTime', None)
+            dca_idx = self._numeric_index.get('delta_to_car_ahead', None)
+            for idx in [lap_idx, dca_idx]:
+                if idx is not None:
+                    context_aug[:, idx] = context_aug[:, idx] * (1.0 + noise_scale)
+            if 'lap_time' in target_aug and isinstance(target_aug['lap_time'], torch.Tensor):
+                target_aug['lap_time'] = target_aug['lap_time'] * (1.0 + noise_scale)
+
+        elif aug_type == 1:
+            scale = float(np.random.uniform(0.97, 1.03))
+            lap_idx = self._numeric_index.get('LapTime', None)
+            if lap_idx is not None:
+                context_aug[:, lap_idx] = context_aug[:, lap_idx] * scale
+            if 'lap_time' in target_aug and isinstance(target_aug['lap_time'], torch.Tensor):
+                target_aug['lap_time'] = target_aug['lap_time'] * scale
+
+        else:
+            for idx in self._weather_numeric_indices:
+                if np.random.random() < 0.1:
+                    context_aug[:, idx] = 0.0
+
+        return context_aug, target_aug
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
@@ -508,8 +640,16 @@ class AutoregressiveLapDataloader(Dataset):
         """
         # Fast path: if this index was precomputed, return cached tensors
         if idx < len(self._precomputed_contexts) and self._precomputed_contexts[idx] is not None:
-            context_tensor = self._precomputed_contexts[idx].to(self.device)
-            target_tensor = self._precomputed_targets[idx]
+            context_tensor = self._precomputed_contexts[idx].clone()
+            target_tensor = {
+                k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                for k, v in self._precomputed_targets[idx].items()
+            }
+
+            if self.augment_prob > 0.0 and np.random.random() < self.augment_prob:
+                context_tensor, target_tensor = self._apply_cached_tensor_augmentation(context_tensor, target_tensor)
+
+            context_tensor = context_tensor.to(self.device)
             for k, v in list(target_tensor.items()):
                 if isinstance(v, torch.Tensor):
                     target_tensor[k] = v.to(self.device)

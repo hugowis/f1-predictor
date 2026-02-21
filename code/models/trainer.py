@@ -74,6 +74,12 @@ class Trainer:
         use_mixed_precision: bool = True,
         early_stopping_use_ema: bool = False,
         early_stopping_ema_alpha: float = 0.3,
+        dynamic_aux_balance: bool = True,
+        dynamic_aux_ema_alpha: float = 0.05,
+        dynamic_aux_min_scale: float = 0.05,
+        dynamic_aux_max_scale: float = 20.0,
+        compound_label_smoothing: float = 0.02,
+        compound_class_weights: Optional[List[float]] = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -87,6 +93,26 @@ class Trainer:
         self.use_mixed_precision = use_mixed_precision and device == 'cuda'
         self.early_stopping_use_ema = early_stopping_use_ema
         self.early_stopping_ema_alpha = float(early_stopping_ema_alpha)
+        self.dynamic_aux_balance = bool(dynamic_aux_balance)
+        self.dynamic_aux_ema_alpha = float(dynamic_aux_ema_alpha)
+        self.dynamic_aux_min_scale = float(dynamic_aux_min_scale)
+        self.dynamic_aux_max_scale = float(dynamic_aux_max_scale)
+        self.compound_label_smoothing = float(compound_label_smoothing)
+
+        self._lap_loss_ema = None
+        self._pit_loss_ema = None
+        self._compound_loss_ema = None
+        self._compound_class_weight_tensor = None
+        if compound_class_weights is not None:
+            try:
+                self._compound_class_weight_tensor = torch.tensor(
+                    compound_class_weights,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            except Exception:
+                logger.exception("Failed to set provided compound_class_weights; falling back to automatic inference")
+                self._compound_class_weight_tensor = None
         
         # Initialize gradient scaler for mixed precision training
         self.scaler = GradScaler() if self.use_mixed_precision else None
@@ -117,6 +143,46 @@ class Trainer:
         
         if self.use_mixed_precision:
             logger.info("Mixed precision training enabled (FP16)")
+
+    def _update_loss_ema(self, current_ema: Optional[float], value: float) -> float:
+        if current_ema is None:
+            return float(value)
+        alpha = self.dynamic_aux_ema_alpha
+        return alpha * float(value) + (1.0 - alpha) * float(current_ema)
+
+    def _maybe_initialize_compound_class_weights(self, dataset: Optional[Any]) -> None:
+        if self._compound_class_weight_tensor is not None or dataset is None:
+            return
+
+        try:
+            num_classes = int(getattr(self.model, 'compound_classes', 4))
+            counts = np.zeros(num_classes, dtype=np.float64)
+            precomputed_targets = getattr(dataset, '_precomputed_targets', None)
+            if not precomputed_targets:
+                return
+
+            for target in precomputed_targets:
+                if target is None or 'compound' not in target:
+                    continue
+                comp_val = target['compound']
+                if isinstance(comp_val, torch.Tensor):
+                    comp_idx = int(comp_val.item())
+                else:
+                    comp_idx = int(comp_val)
+                if 0 <= comp_idx < num_classes:
+                    counts[comp_idx] += 1.0
+
+            if counts.sum() <= 0:
+                return
+
+            counts = np.clip(counts, 1.0, None)
+            inv_freq = counts.sum() / (len(counts) * counts)
+            weights = inv_freq / max(inv_freq.mean(), 1e-8)
+            self._compound_class_weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
+            logger.info(f"Initialized compound class weights: {weights.tolist()}")
+        except Exception:
+            logger.exception("Failed to infer compound class weights from dataset")
+            self._compound_class_weight_tensor = None
     
     def train_epoch(
         self,
@@ -146,7 +212,12 @@ class Trainer:
         total_lap_loss = 0.0
         total_pit_loss = 0.0
         total_comp_loss = 0.0
+        total_pit_scale = 0.0
+        total_comp_scale = 0.0
+        num_multitask_batches = 0
         num_batches = 0
+
+        self._maybe_initialize_compound_class_weights(getattr(train_loader, 'dataset', None))
         
         for batch_idx, batch in enumerate(train_loader):
             # Extract batch data (pass dataset so decoder targets can be normalized/asserted)
@@ -226,20 +297,57 @@ class Trainer:
                         comp_t_rs = comp_t.unsqueeze(-1).expand(-1, seq_len).reshape(-1)
                     else:
                         comp_t_rs = comp_t.reshape(-1)
-                    ce = nn.CrossEntropyLoss(reduction='none')
-                    comp_raw = ce(comp_pred_flat, comp_t_rs)
+                    comp_weight = self._compound_class_weight_tensor
+                    if comp_weight is not None:
+                        comp_weight = comp_weight.to(device=comp_pred_flat.device, dtype=torch.float32)
+                    try:
+                        ce = nn.CrossEntropyLoss(
+                            reduction='none',
+                            weight=comp_weight,
+                            label_smoothing=self.compound_label_smoothing,
+                        )
+                    except TypeError:
+                        ce = nn.CrossEntropyLoss(
+                            reduction='none',
+                            weight=comp_weight,
+                        )
+                    with autocast(device_type='cuda', enabled=False):
+                        comp_raw = ce(comp_pred_flat.float(), comp_t_rs.long())
                     comp_loss = comp_raw.mean()
+
+                pit_scale = 1.0
+                comp_scale = 1.0
+                if self.dynamic_aux_balance:
+                    self._lap_loss_ema = self._update_loss_ema(self._lap_loss_ema, float(lap_loss.detach().item()))
+                    self._pit_loss_ema = self._update_loss_ema(self._pit_loss_ema, float(pit_loss.detach().item()))
+                    self._compound_loss_ema = self._update_loss_ema(self._compound_loss_ema, float(comp_loss.detach().item()))
+
+                    if self._pit_loss_ema is not None and self._pit_loss_ema > 0:
+                        pit_scale = float(np.clip(
+                            self._lap_loss_ema / (self._pit_loss_ema + 1e-8),
+                            self.dynamic_aux_min_scale,
+                            self.dynamic_aux_max_scale,
+                        ))
+                    if self._compound_loss_ema is not None and self._compound_loss_ema > 0:
+                        comp_scale = float(np.clip(
+                            self._lap_loss_ema / (self._compound_loss_ema + 1e-8),
+                            self.dynamic_aux_min_scale,
+                            self.dynamic_aux_max_scale,
+                        ))
 
                 # Combine losses with configurable weighting
                 loss_batch = (
                     lap_loss +
-                    float(self.pit_loss_weight) * pit_loss +
-                    float(self.compound_loss_weight) * comp_loss
+                    float(self.pit_loss_weight) * pit_scale * pit_loss +
+                    float(self.compound_loss_weight) * comp_scale * comp_loss
                 )
 
                 lap_loss_value = float(lap_loss.detach().item())
                 pit_loss_value = float(pit_loss.detach().item())
                 comp_loss_value = float(comp_loss.detach().item())
+                total_pit_scale += pit_scale
+                total_comp_scale += comp_scale
+                num_multitask_batches += 1
 
             else:
                 # Old single-target behavior
@@ -346,9 +454,12 @@ class Trainer:
         avg_lap_loss = total_lap_loss / num_batches if num_batches > 0 else 0.0
         avg_pit_loss = total_pit_loss / num_batches if num_batches > 0 else 0.0
         avg_comp_loss = total_comp_loss / num_batches if num_batches > 0 else 0.0
+        avg_pit_scale = total_pit_scale / num_multitask_batches if num_multitask_batches > 0 else 1.0
+        avg_comp_scale = total_comp_scale / num_multitask_batches if num_multitask_batches > 0 else 1.0
         logger.info(
             f"Epoch {epoch} - Train Loss: {avg_loss:.6f} "
-            f"(lap={avg_lap_loss:.6f}, pit={avg_pit_loss:.6f}, compound={avg_comp_loss:.6f})"
+            f"(lap={avg_lap_loss:.6f}, pit={avg_pit_loss:.6f}, compound={avg_comp_loss:.6f}, "
+            f"pit_scale={avg_pit_scale:.3f}, comp_scale={avg_comp_scale:.3f})"
         )
 
         return {

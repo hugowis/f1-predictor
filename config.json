@@ -1,0 +1,71 @@
+{
+  "model": {
+    "name": "seq2seq",
+    "input_size": 33,
+    "output_size": 1,
+    "hidden_size": 256,
+    "num_layers": 3,
+    "dropout": 0.3,
+    "encoder": "gru",
+    "embedding_dims": {
+      "Driver": 32,
+      "Team": 16,
+      "Circuit": 16,
+      "Year": 8
+    },
+    "vocab_sizes": {
+      "Driver": 81,
+      "Team": 20,
+      "Circuit": 36,
+      "Year": 9
+    }
+  },
+  "training": {
+    "batch_size": 16,
+    "learning_rate": 0.0005,
+    "num_epochs": 200,
+    "weight_decay": 5e-05,
+    "gradient_clip": 1.0,
+    "accumulation_steps": 1,
+    "use_mixed_precision": true,
+    "scheduler_type": "cosine",
+    "warm_up_epochs": 5,
+    "teacher_forcing_start": 1.0,
+    "teacher_forcing_end": 0.3,
+    "teacher_forcing_decay": "exponential",
+    "early_stopping_patience": 20,
+    "validation_freq": 1,
+    "early_stopping_use_ema": true,
+    "early_stopping_ema_alpha": 0.25,
+    "pit_loss_weight": 0.1,
+    "compound_loss_weight": 0.02,
+    "train_years": [
+      2018,
+      2019,
+      2020,
+      2021,
+      2022,
+      2023
+    ],
+    "val_years": [
+      2024
+    ],
+    "test_years": [
+      2025
+    ]
+  },
+  "data": {
+    "window_size": 50,
+    "context_window": 10,
+    "augment_prob": 0.05,
+    "normalize": true,
+    "scaler_type": "standard",
+    "num_workers": 0,
+    "shuffle_train": true,
+    "shuffle_val": false,
+    "shuffle_test": false
+  },
+  "device": "cuda",
+  "seed": 42,
+  "output_dir": "./results/phase2"
+}

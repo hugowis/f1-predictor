@@ -428,6 +428,9 @@ def main():
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning-rate', type=float, help='Learning rate')
     parser.add_argument('--no-mixed-precision', action='store_true', help='Disable mixed precision training (FP16)')
+    parser.add_argument('--seed', type=int, help='Random seed (overrides config)')
+    parser.add_argument('--pit-loss-weight', type=float, help='Pit stop auxiliary loss weight (overrides config)')
+    parser.add_argument('--compound-loss-weight', type=float, help='Compound auxiliary loss weight (overrides config)')
     
     args = parser.parse_args()
     
@@ -466,6 +469,12 @@ def main():
         config.training.learning_rate = args.learning_rate
     if args.no_mixed_precision:
         config.training.use_mixed_precision = False
+    if args.seed is not None:
+        config.seed = args.seed
+    if args.pit_loss_weight is not None:
+        config.training.pit_loss_weight = args.pit_loss_weight
+    if args.compound_loss_weight is not None:
+        config.training.compound_loss_weight = args.compound_loss_weight
     
     output_dir = args.output or Path(config.output_dir)
     

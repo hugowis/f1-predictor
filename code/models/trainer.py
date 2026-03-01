@@ -76,7 +76,7 @@ class Trainer:
         early_stopping_ema_alpha: float = 0.3,
         dynamic_aux_balance: bool = True,
         dynamic_aux_ema_alpha: float = 0.05,
-        dynamic_aux_min_scale: float = 0.05,
+        dynamic_aux_min_scale: float = 0.001,
         dynamic_aux_max_scale: float = 20.0,
         compound_label_smoothing: float = 0.02,
         compound_class_weights: Optional[List[float]] = None,
@@ -581,6 +581,7 @@ class Trainer:
         val_loader: Optional[DataLoader] = None,
         num_epochs: int = 50,
         early_stopping_patience: int = 10,
+        early_stopping_min_epochs: int = 0,
         teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
     ) -> Dict[str, Any]:
         """
@@ -596,6 +597,10 @@ class Trainer:
             Number of epochs to train
         early_stopping_patience : int
             Number of epochs without improvement before stopping
+        early_stopping_min_epochs : int
+            Grace period: patience counter won't start before this epoch.
+            Prevents a lucky low val loss in the first few epochs from
+            triggering early stopping before training has stabilised.
         teacher_forcing_schedule : callable, optional
             Function that takes epoch number and returns teacher_forcing_ratio
             If None, uses constant 1.0
@@ -615,6 +620,8 @@ class Trainer:
             logger.info(f"Early stopping monitor: EMA(val_loss), alpha={self.early_stopping_ema_alpha:.2f}")
         else:
             logger.info("Early stopping monitor: val_loss")
+        if early_stopping_min_epochs > 0:
+            logger.info(f"Early stopping grace period: {early_stopping_min_epochs} epochs")
         
         for epoch in range(num_epochs):
             # Update learning rate
@@ -660,8 +667,8 @@ class Trainer:
                 else:
                     self.epochs_without_improvement += 1
                 
-                # Early stopping
-                if self.epochs_without_improvement >= early_stopping_patience:
+                # Early stopping (only after grace period)
+                if epoch >= early_stopping_min_epochs and self.epochs_without_improvement >= early_stopping_patience:
                     logger.info(
                         f"Early stopping at epoch {epoch} "
                         f"(no improvement for {early_stopping_patience} epochs)"

@@ -91,13 +91,14 @@ class TrainingConfig:
     
     # Early stopping
     early_stopping_patience: int = 50
+    early_stopping_min_epochs: int = 0  # Grace period: don't start patience counter before this epoch
     validation_freq: int = 1  # Validate every N epochs
     early_stopping_use_ema: bool = False
     early_stopping_ema_alpha: float = 0.3
 
     # Multi-task loss weights
     pit_loss_weight: float = 0.5
-    compound_loss_weight: float = 0.5
+    compound_loss_weight: float = 0.01
     
     # Data
     train_years: list = None
@@ -280,11 +281,12 @@ def get_phase2_config() -> Config:
         teacher_forcing_start=1.0,
         teacher_forcing_end=0.3,
         teacher_forcing_decay="exponential",
-        early_stopping_patience=20,
+        early_stopping_patience=30,
+        early_stopping_min_epochs=30,
         early_stopping_use_ema=True,
         early_stopping_ema_alpha=0.25,
-        pit_loss_weight=0.1,
-        compound_loss_weight=0.02,
+        pit_loss_weight=0.0,
+        compound_loss_weight=0.01,
         train_years=[2018, 2019, 2020, 2021, 2022, 2023],
         val_years=[2024],
         test_years=[2025],
@@ -293,7 +295,7 @@ def get_phase2_config() -> Config:
     data_config = DataConfig(
         window_size=50,
         context_window=10,
-        augment_prob=0.2,
+        augment_prob=0.05,
     )
     
     return Config(

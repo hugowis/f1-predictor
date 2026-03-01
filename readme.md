@@ -17,51 +17,6 @@ This project builds a **sequence-to-sequence (seq2seq) model** to solve the lap 
 
 ---
 
-## Current Solution: Phase 1 (✅ Complete)
-
-### Architecture
-- **Model**: Seq2Seq with GRU encoder-decoder
-- **Parameters**: 363,921 trainable parameters
-- **Hidden size**: 128 units, 2 stacked layers, 0.2 dropout
-- **Teacher forcing**: 100% during training (Phase 1 approach)
-- **Sequence length**: 20 laps max per stint
-
-### Training Details
-- **Data**: 5,311 stints (2019-2023 seasons)
-  - Train: 2019-2023 (5,311 sequences)
-  - Validation: 2024 (1,235 sequences)
-  - Test: 2025 (1,225 sequences)
-- **Hardware**: NVIDIA RTX 5080 (13.0 CUDA)
-- **Optimizer**: SGD with learning rate 1e-3, cosine scheduler (5 warm-up epochs)
-- **Loss**: MSE with gradient clipping (1.0)
-- **Early stopping**: Patience=15 epochs → stopped at epoch 60
-
- - **Batch size**: 32 (this evaluation run)
- - **Early stopping**: Patience=15 epochs → stopped at epoch 57
-
-### Performance Results
-| Metric | Value |
-|--------|-------|
-| **MAE** | 51.10 ms |
-| **RMSE** | 92.38 ms |
-| **Median AE** | 31.92 ms |
-| **MAPE** | 4.22 % |
-
-### Error Distribution
-- **0-10 ms** (Very Accurate): 16.74%
-- **10-50 ms** (Accurate): 52.17% ⭐ *Most common*
-- **50-100 ms** (Good): 20.18%
-- **100-200 ms** (Fair): 7.38%
-- **200+ ms** (Poor): 3.53%
-
-**Key insight**: 68.91% of predictions have <50ms error (16.74% + 52.17%), demonstrating improved accuracy for the bs32 training run.
-
----
-
-
-**LSTM vs GRU Comparison (concise)**: The LSTM Phase 1 run achieves similar MAE to the GRU run but shows notably lower RMSE and MAPE, while the median absolute error is slightly higher — see the GRU summary above and the LSTM metrics here for direct comparison.
-
-
 ## Quick Start - Training Pipeline
 
 All training and evaluation scripts are located in the `code/` folder for better organization.
@@ -241,43 +196,57 @@ Predict the **next lap times** for a given driver.
 - ✅ Visualization suite (loss curves, error breakdown, metrics plots)
 - ✅ Comprehensive evaluation reports
 
-**Deliverables:**
-- Trained model checkpoint: `results/phase1/checkpoints/best_model.pt`
-- Training history: `results/phase1/history.json`
-- Test metrics: `results/phase1/evaluation/evaluation_results.json`
-- Visualizations: `.png` files in `results/phase1/`
-- Configuration: `results/phase1/config.json`
+---
+### Performance Results
+| Metric | Value |
+|--------|-------|
+| **MAE** | 51.10 ms |
+| **RMSE** | 92.38 ms |
+| **Median AE** | 31.92 ms |
+| **MAPE** | 4.22 % |
+
+### Error Distribution
+- **0-10 ms** (Very Accurate): 16.74%
+- **10-50 ms** (Accurate): 52.17% ⭐ *Most common*
+- **50-100 ms** (Good): 20.18%
+- **100-200 ms** (Fair): 7.38%
+- **200+ ms** (Poor): 3.53%
+
+**Key insight**: 68.91% of predictions have <50ms error (16.74% + 52.17%), demonstrating improved accuracy for the bs32 training run.
 
 ---
 
-### 🚀 Phase 2: Autoregressive (Trained)
 
-**Status:** ✅ Trained and evaluated (autoregressive / free-running mode)
+**LSTM vs GRU Comparison (concise)**: The LSTM Phase 1 run achieves similar MAE to the GRU run but shows notably lower RMSE and MAPE, while the median absolute error is slightly higher — see the GRU summary above and the LSTM metrics here for direct comparison.
 
-**Denormalized test metrics (Phase 2):**
-- **MAE:** 39.08 ms
-- **RMSE:** 63.84 ms
-- **Median AE:** 24.89 ms
+### ✅ Phase 2: Complete
 
-**Error distribution:**
-- 0-10 ms: 23.05%
-- 10-50 ms: 55.29%
-- 50-100 ms: 13.95%
-- 100-200 ms: 5.17%
-- 200+ ms: 2.54%
-
-
-
-**Objectives:**
-- ✅ Extend sequence length to full races, masking for not normal laps
+**Completed tasks:**
+- ✅ Extend sequence length to full races
 - ✅ Implement autoregressive predictions (free-running mode)
 - ✅ Auxiliary pit head and compound head
 - ✅ Scheduled sampling (gradual removal of teacher forcing)
 - ✅ Error analysis by driver and circuit
 
-**Expected improvements:**
-- Predictions across full race (not just stints)
-- Handling of strategy changes and pit stops
+**Current best test metrics with  compound-loss-weight = 0.01 and pit-loss-weight = 0.0:**
+- **MAE:** 23.05 ms
+- **RMSE:** 40.97 ms
+- **Median AE:** 15.68 ms
+- **MAPE:** 0.0256 %
+- **Mean bias:** 3.20 ms
+
+**Error distribution (percent):**
+- 0-10 ms: 33.80%
+- 10-50 ms: 56.85%
+- 50-100 ms: 6.89%
+- 100-200 ms: 2.05%
+- 200+ ms: 0.41%
+
+### Analysis & comparison with Phase 1
+
+- **Summary:** The current best Phase 2 run substantially improves core metrics versus the Phase 1 baseline. MAE falls from 51.10 ms → 23.05 ms (~55% reduction), RMSE from 92.38 ms → 40.97 ms (~56% reduction), and median AE from 31.92 ms → 15.68 ms (~51% reduction).
+- **Error distribution shift:** Predictions with error <50 ms increase from ~68.9% (Phase 1) to ~90.7% (Phase 2), indicating a marked shift toward tighter, more reliable predictions. 
+- **Likely contributors:** autoregressive/free‑running training (reduces exposure bias), auxiliary heads for pit/compound (better modeling of strategy changes), scheduled sampling and full‑race context (longer sequences improve robustness).
 
 ---
 
@@ -286,9 +255,11 @@ Predict the **next lap times** for a given driver.
 **Long-term items:**
 - [ ] Transformer-based architecture
 - [ ] Uncertainty estimation (mean + variance predictions)
+- [ ] Pretraining on FP/qualifying data for better generalization
+
+### Additional experiments
 - [ ] Web dashboard
 - [ ] Real-time prediction pipeline for races
-- [ ] Pretraining on FP/qualifying data for better generalization
 - [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
 
 
@@ -357,8 +328,10 @@ Predict the **next lap times** for a given driver.
 
 ## Experiments
 - ✅ Add 2018 season data
-- [ ] Test with dropped features (sectors, speeds, position)
-- [ ] Pretraining on FP sessions, qualifycation data, sprin, etc.
+- [ ] Pretraining on FP sessions, qualifying data, sprint races, etc.
 - [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
 
-
+## Further work
+- [ ] Web dashboard
+- [ ] Real-time prediction pipeline for races
+- [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")

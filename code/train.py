@@ -277,9 +277,12 @@ def train(config: Config, output_dir: Path = None):
         output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Set random seed
+    # Set random seed for full reproducibility
     torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
     np.random.seed(config.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     
     logger.info("=" * 60)
     logger.info("F1 LAP TIME PREDICTION - TRAINING")
@@ -396,6 +399,7 @@ def train(config: Config, output_dir: Path = None):
         val_loader=val_loader,
         num_epochs=config.training.num_epochs,
         early_stopping_patience=config.training.early_stopping_patience,
+        early_stopping_min_epochs=getattr(config.training, 'early_stopping_min_epochs', 0),
         teacher_forcing_schedule=lambda epoch: teacher_forcing_schedule(epoch, config),
     )
     

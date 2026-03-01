@@ -222,7 +222,48 @@ class Seq2Seq(BaseModel):
         self.fc_compound = nn.Linear(hidden_size, self.compound_classes)
         
         self.to(device)
+        self._init_weights()
     
+    def _init_weights(self):
+        """Initialise weights for stable training across random seeds.
+
+        - Recurrent weights (weight_hh): orthogonal init — standard best
+          practice for GRU/LSTM; prevents vanishing/exploding gradients and
+          dramatically reduces seed sensitivity.
+        - Input weights (weight_ih): Xavier uniform.
+        - Biases: zeros (LSTM forget-gate bias set to 1 for better gradient
+          flow through time).
+        - Linear projection layers: Xavier uniform, bias = zeros.
+        - Embeddings: normal(0, 0.1) for compact, stable initial vectors.
+        """
+        for rnn in [self.encoder, self.decoder]:
+            for name, param in rnn.named_parameters():
+                if 'weight_hh' in name:
+                    # Orthogonal init for hidden-to-hidden (recurrent) weights
+                    # Each GRU gate weight is a [hidden, hidden] block stacked;
+                    # init each block independently.
+                    nn.init.orthogonal_(param)
+                elif 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param)
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+                    # For LSTM: set forget gate bias to 1
+                    if self.rnn_type == 'lstm':
+                        n = param.size(0)
+                        param.data[n // 4: n // 2].fill_(1.0)
+
+        for fc in [
+            self.fc_encoder_to_hidden,
+            self.fc_decoder_output,
+            self.fc_pit,
+            self.fc_compound,
+        ]:
+            nn.init.xavier_uniform_(fc.weight)
+            nn.init.zeros_(fc.bias)
+
+        for emb in self.embeddings.values():
+            nn.init.normal_(emb.weight, mean=0.0, std=0.1)
+
     def forward(
         self,
         encoder_input: torch.Tensor,

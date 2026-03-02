@@ -80,6 +80,8 @@ class Trainer:
         dynamic_aux_max_scale: float = 20.0,
         compound_label_smoothing: float = 0.02,
         compound_class_weights: Optional[List[float]] = None,
+        lap_loss_kind: str = 'mse',
+        lap_huber_delta: float = 0.1,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -98,6 +100,9 @@ class Trainer:
         self.dynamic_aux_min_scale = float(dynamic_aux_min_scale)
         self.dynamic_aux_max_scale = float(dynamic_aux_max_scale)
         self.compound_label_smoothing = float(compound_label_smoothing)
+        # Lap loss configuration: 'mse' or 'huber'
+        self.lap_loss_kind = str(lap_loss_kind).lower()
+        self.lap_huber_delta = float(lap_huber_delta)
 
         self._lap_loss_ema = None
         self._pit_loss_ema = None
@@ -257,7 +262,6 @@ class Trainer:
                 pit_t = targets.get('is_pitlap', None)
                 comp_t = targets.get('compound', None)
 
-                # Compute lap loss (MSE) with masking
                 with torch.no_grad():
                     mask = torch.isfinite(lap_t_rs)
                 if mask.sum() == 0:
@@ -267,10 +271,19 @@ class Trainer:
                 if not torch.isfinite(lap_pred).all():
                     continue
 
-                se = (lap_pred - lap_t_rs) ** 2
-                masked_se = se * mask.float()
                 denom = mask.float().sum()
-                lap_loss = masked_se.sum() / denom
+                # Compute lap loss: Huber (preferred) or MSE
+                if self.lap_loss_kind == 'huber':
+                    diff = lap_pred - lap_t_rs
+                    ad = diff.abs()
+                    delta = self.lap_huber_delta
+                    huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+                    masked = huber * mask.float()
+                    lap_loss = masked.sum() / denom
+                else:
+                    se = (lap_pred - lap_t_rs) ** 2
+                    masked_se = se * mask.float()
+                    lap_loss = masked_se.sum() / denom
 
                 # Pit loss (BCEWithLogits)
                 pit_loss = torch.tensor(0.0, device=self.device)
@@ -369,10 +382,18 @@ class Trainer:
                 if not torch.isfinite(lap_pred).all():
                     continue
 
-                se = (lap_pred - targets_reshaped) ** 2
-                masked_se = se * mask.float()
                 denom = mask.float().sum()
-                loss_batch = masked_se.sum() / denom
+                if self.lap_loss_kind == 'huber':
+                    diff = lap_pred - targets_reshaped
+                    ad = diff.abs()
+                    delta = self.lap_huber_delta
+                    huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+                    masked = huber * mask.float()
+                    loss_batch = masked.sum() / denom
+                else:
+                    se = (lap_pred - targets_reshaped) ** 2
+                    masked_se = se * mask.float()
+                    loss_batch = masked_se.sum() / denom
                 lap_loss_value = float(loss_batch.detach().item())
                 pit_loss_value = 0.0
                 comp_loss_value = 0.0
@@ -540,9 +561,18 @@ class Trainer:
                 if not torch.isfinite(lap_pred).all():
                     continue
 
-                se = (lap_pred - targets_reshaped) ** 2
-                masked_se = se * mask_t.float()
-                loss_val = masked_se.sum().item() / float(mask_t.sum().item())
+                denom_val = mask_t.float().sum()
+                if self.lap_loss_kind == 'huber':
+                    diff = lap_pred - targets_reshaped
+                    ad = diff.abs()
+                    delta = self.lap_huber_delta
+                    huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+                    masked_huber = huber * mask_t.float()
+                    loss_val = masked_huber.sum().item() / float(denom_val.item())
+                else:
+                    se = (lap_pred - targets_reshaped) ** 2
+                    masked_se = se * mask_t.float()
+                    loss_val = masked_se.sum().item() / float(denom_val.item())
                 total_loss += loss_val
                 num_batches += 1
 

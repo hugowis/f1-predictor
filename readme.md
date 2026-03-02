@@ -255,7 +255,7 @@ Predict the **next lap times** for a given driver.
 **Long-term items:**
 - [ ] Transformer-based architecture
 - [ ] Uncertainty estimation (mean + variance predictions)
-- [ ] Pretraining on FP/qualifying data for better generalization
+- [ ] Pretraining on FP/qualifying data for better generalization (train pit head)
 
 ### Additional experiments
 - [ ] Web dashboard

@@ -97,7 +97,7 @@ class TrainingConfig:
     early_stopping_ema_alpha: float = 0.3
 
     # Multi-task loss weights
-    pit_loss_weight: float = 0.5
+    pit_loss_weight: float = 0.0
     compound_loss_weight: float = 0.01
     
     # Data

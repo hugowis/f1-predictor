@@ -15,13 +15,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from analyze_results import analyze_results as run_analysis
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataloaders import StintDataloader, LapTimeNormalizer
+from dataloaders import StintDataloader
 from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
 from dataloaders.utils import get_compound_columns
 from models import Seq2Seq, Trainer, create_scheduler
@@ -34,6 +34,128 @@ logging.basicConfig(
     format='[%(asctime)s] [%(levelname)s] %(name)s: %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _set_global_seed(seed: int):
+    """Set random seeds for deterministic training behavior."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _run_dataset_normalizer_consistency_check(train_loader: DataLoader):
+    """Validate that dataset normalizer.transform matches __getitem__ lap_time output."""
+    try:
+        dataset = train_loader.dataset
+        if not (hasattr(dataset, 'normalizer') and dataset.normalizer is not None):
+            return
+
+        import numpy as _np
+
+        numeric_cols = getattr(dataset, 'numeric_columns', ['LapTime'])
+        max_checks = min(50, len(getattr(dataset, 'lap_pairs', [])))
+        mismatches = []
+
+        # Temporarily disable augmentation to keep __getitem__ deterministic.
+        orig_aug = getattr(dataset, 'augment_prob', 0.0)
+        try:
+            dataset.augment_prob = 0.0
+            for i in range(max_checks):
+                pair = dataset.lap_pairs[i]
+                tidx = pair['target_index']
+                raw_row = dataset.data.loc[[tidx]]
+                raw_numeric = raw_row[numeric_cols]
+
+                try:
+                    transformed = dataset.normalizer.transform(raw_numeric)
+                    transformed_val = float(transformed['LapTime'].iloc[0])
+                except Exception:
+                    transformed_val = float('nan')
+
+                try:
+                    _, tgt, _ = dataset.__getitem__(i)
+                    lap_val = tgt['lap_time']
+                    returned = float(lap_val.cpu().numpy()) if hasattr(lap_val, 'cpu') else float(lap_val)
+                except Exception:
+                    returned = float('nan')
+
+                if not (_np.isfinite(transformed_val) and _np.isfinite(returned) and abs(transformed_val - returned) < 1e-3):
+                    mismatches.append((tidx, float(raw_row['LapTime'].iloc[0]), transformed_val, returned))
+        finally:
+            dataset.augment_prob = orig_aug
+
+        if mismatches:
+            logger.error(f"Normalizer consistency check failed: {len(mismatches)} mismatches (showing up to 20)")
+            for row in mismatches[:20]:
+                logger.error(f"{row[0]}: raw={row[1]} -> transformed={row[2]} -> returned={row[3]}")
+            raise RuntimeError(
+                "Dataset normalizer.transform does not match dataset.__getitem__ returned lap_time values. "
+                "See logs for samples."
+            )
+        logger.info("Normalizer consistency check passed: transformed values match dataset returns on sample rows")
+    except StopIteration:
+        logger.warning("Could not sample a batch from train_loader for normalizer check")
+    except Exception:
+        logger.exception("Normalizer sanity check failed during consistency verification")
+        raise
+
+
+def _apply_cli_overrides(config: Config, args: argparse.Namespace):
+    """Apply CLI-provided configuration overrides in one place."""
+    if args.device:
+        config.device = args.device
+
+    if getattr(args, 'decoder_type', None):
+        try:
+            config.model.decoder_type = args.decoder_type
+        except Exception:
+            setattr(config.model, 'decoder_type', args.decoder_type)
+
+    if args.batch_size:
+        config.training.batch_size = args.batch_size
+    if args.epochs:
+        config.training.num_epochs = args.epochs
+    if args.learning_rate:
+        config.training.learning_rate = args.learning_rate
+    if args.augment_prob is not None:
+        if args.augment_prob < 0.0 or args.augment_prob > 1.0:
+            raise ValueError(f"--augment-prob must be between 0.0 and 1.0, got {args.augment_prob}")
+        config.data.augment_prob = args.augment_prob
+    if args.no_mixed_precision:
+        config.training.use_mixed_precision = False
+    if args.seed is not None:
+        config.seed = args.seed
+    if args.pit_loss_weight is not None:
+        config.training.pit_loss_weight = args.pit_loss_weight
+    if args.compound_loss_weight is not None:
+        config.training.compound_loss_weight = args.compound_loss_weight
+
+
+def _run_post_training_steps(config: Config, output_dir: Path):
+    """Run evaluation and analysis after training finishes."""
+    try:
+        checkpoint_path = output_dir / "checkpoints" / "best_model.pt"
+        if checkpoint_path.exists():
+            logger.info(f"Running evaluation on checkpoint: {checkpoint_path}")
+            run_evaluation(
+                checkpoint_path=checkpoint_path,
+                test_years=config.training.test_years,
+                config_path=output_dir / "config.json",
+                device=config.device,
+                output_dir=output_dir / "evaluation",
+            )
+        else:
+            logger.warning(f"Checkpoint not found: {checkpoint_path}. Skipping evaluation.")
+    except Exception as exc:
+        logger.exception(f"Evaluation failed: {exc}")
+
+    try:
+        logger.info("Running post-training analysis...")
+        run_analysis(run=output_dir.name, results_dir=output_dir)
+    except Exception as exc:
+        logger.exception(f"Post-training analysis failed: {exc}")
 
 
 def create_dataloaders(config: Config, batch_size: int = 32):
@@ -168,9 +290,27 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
     logger.info(f"Val set: {len(val_ds)} lap pairs")
     logger.info(f"Test set: {len(test_ds)} lap pairs")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=config.data.shuffle_train, num_workers=config.data.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=config.data.shuffle_val, num_workers=config.data.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=config.data.shuffle_test, num_workers=config.data.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=config.data.shuffle_train,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=config.data.shuffle_val,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=config.data.shuffle_test,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
 
     return train_loader, val_loader, test_loader
 
@@ -278,11 +418,7 @@ def train(config: Config, output_dir: Path = None):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Set random seed for full reproducibility
-    torch.manual_seed(config.seed)
-    torch.cuda.manual_seed_all(config.seed)
-    np.random.seed(config.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    _set_global_seed(config.seed)
     
     logger.info("=" * 60)
     logger.info("F1 LAP TIME PREDICTION - TRAINING")
@@ -301,59 +437,7 @@ def train(config: Config, output_dir: Path = None):
             batch_size=config.training.batch_size
         )
 
-    # Sanity-check that dataset.normalizer.transform applied to raw rows matches
-    # the normalized lap_time returned by the dataset's __getitem__ implementation.
-    try:
-        dataset = train_loader.dataset
-        if hasattr(dataset, 'normalizer') and dataset.normalizer is not None:
-            import numpy as _np
-            import pandas as _pd
-
-            numeric_cols = getattr(dataset, 'numeric_columns', ['LapTime'])
-            max_checks = min(50, len(getattr(dataset, 'lap_pairs', [])))
-            mismatches = []
-
-            # Temporarily disable augmentation to get deterministic __getitem__ behavior
-            orig_aug = getattr(dataset, 'augment_prob', 0.0)
-            try:
-                dataset.augment_prob = 0.0
-                for i in range(max_checks):
-                    pair = dataset.lap_pairs[i]
-                    tidx = pair['target_index']
-                    raw_row = dataset.data.loc[[tidx]]
-                    # Ensure numeric columns exist in raw_row
-                    raw_numeric = raw_row[numeric_cols]
-                    try:
-                        transformed = dataset.normalizer.transform(raw_numeric)
-                        transformed_val = float(transformed['LapTime'].iloc[0])
-                    except Exception:
-                        transformed_val = float('nan')
-
-                    try:
-                        _, tgt, _ = dataset.__getitem__(i)
-                        returned = float(tgt['lap_time'].cpu().numpy()) if hasattr(tgt['lap_time'], 'cpu') else float(tgt['lap_time'])
-                    except Exception:
-                        returned = float('nan')
-
-                    if not (_np.isfinite(transformed_val) and _np.isfinite(returned) and abs(transformed_val - returned) < 1e-3):
-                        mismatches.append((tidx, float(raw_row['LapTime'].iloc[0]), transformed_val, returned))
-
-            finally:
-                # Restore augmentation probability
-                dataset.augment_prob = orig_aug
-
-            if mismatches:
-                logger.error(f"Normalizer consistency check failed: {len(mismatches)} mismatches (showing up to 20)")
-                for row in mismatches[:20]:
-                    logger.error(f"{row[0]}: raw={row[1]} -> transformed={row[2]} -> returned={row[3]}")
-                raise RuntimeError("Dataset normalizer.transform does not match dataset.__getitem__ returned lap_time values. See logs for samples.")
-            else:
-                logger.info("Normalizer consistency check passed: transformed values match dataset returns on sample rows")
-    except StopIteration:
-        logger.warning("Could not sample a batch from train_loader for normalizer check")
-    except Exception:
-        logger.exception("Normalizer sanity check failed during consistency verification")
-        raise
+    _run_dataset_normalizer_consistency_check(train_loader)
     
     # Create model
     model = create_model(config, device=config.device)
@@ -456,34 +540,7 @@ def main():
         config = get_phase1_config()
         logger.info("Using default Phase 1 config")
     
-    # Override config with command line arguments
-    if args.device:
-        config.device = args.device
-    if getattr(args, 'decoder_type', None):
-        # Attach decoder_type to model config dynamically
-        try:
-            config.model.decoder_type = args.decoder_type
-        except Exception:
-            setattr(config.model, 'decoder_type', args.decoder_type)
-
-    if args.batch_size:
-        config.training.batch_size = args.batch_size
-    if args.epochs:
-        config.training.num_epochs = args.epochs
-    if args.learning_rate:
-        config.training.learning_rate = args.learning_rate
-    if args.augment_prob is not None:
-        if args.augment_prob < 0.0 or args.augment_prob > 1.0:
-            raise ValueError(f"--augment-prob must be between 0.0 and 1.0, got {args.augment_prob}")
-        config.data.augment_prob = args.augment_prob
-    if args.no_mixed_precision:
-        config.training.use_mixed_precision = False
-    if args.seed is not None:
-        config.seed = args.seed
-    if args.pit_loss_weight is not None:
-        config.training.pit_loss_weight = args.pit_loss_weight
-    if args.compound_loss_weight is not None:
-        config.training.compound_loss_weight = args.compound_loss_weight
+    _apply_cli_overrides(config, args)
     
     output_dir = args.output or Path(config.output_dir)
     
@@ -501,30 +558,7 @@ def main():
     logger.info(f"Final train loss: {history['train_loss'][-1]:.6f}")
     logger.info(f"Total epochs trained: {len(history['train_loss'])}")
 
-    # Post-training: run evaluation using the best checkpoint then analysis
-    try:
-        checkpoint_path = (output_dir / "checkpoints" / "best_model.pt")
-        if checkpoint_path.exists():
-            logger.info(f"Running evaluation on checkpoint: {checkpoint_path}")
-            run_evaluation(
-                checkpoint_path=checkpoint_path,
-                test_years=config.training.test_years,
-                config_path=output_dir / "config.json",
-                device=config.device,
-                output_dir=output_dir / "evaluation",
-            )
-        else:
-            logger.warning(f"Checkpoint not found: {checkpoint_path}. Skipping evaluation.")
-    except Exception as e:
-        logger.exception(f"Evaluation failed: {e}")
-
-    # Run post-training analysis (call function directly)
-    try:
-        logger.info("Running post-training analysis...")
-        # call with explicit results_dir to avoid relying on run name
-        run_analysis(run=output_dir.name, results_dir=output_dir)
-    except Exception as e:
-        logger.exception(f"Post-training analysis failed: {e}")
+    _run_post_training_steps(config, output_dir)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dataloaders import StintDataloader, LapTimeNormalizer
 from dataloaders.utils import load_all_races
-from models import Seq2Seq, Evaluator, report_evaluation
+from models import Seq2Seq, Evaluator, compute_regression_metrics, report_evaluation
 from config.base import Config
 
 # Setup logging
@@ -33,50 +33,208 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def compute_regression_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict:
-    """
-    Compute regression metrics from flat prediction/target arrays.
+def _collate_with_none_filter(batch):
+    """Filter out None samples before default collation."""
+    return default_collate([sample for sample in batch if sample is not None])
 
-    Parameters
-    ----------
-    predictions : np.ndarray
-        Predicted values
-    targets : np.ndarray
-        Ground truth values
 
-    Returns
-    -------
-    dict
-        Metrics dictionary with MAE/RMSE/MAPE/quantiles/bias/loss
-    """
-    pred_flat = np.asarray(predictions).reshape(-1)
-    target_flat = np.asarray(targets).reshape(-1)
-
-    metrics = {
-        'mae': float(np.mean(np.abs(pred_flat - target_flat))),
-        'rmse': float(np.sqrt(np.mean((pred_flat - target_flat) ** 2))),
-        'median_ae': float(np.median(np.abs(pred_flat - target_flat))),
+def _load_eval_runtime_config(config_path: Path):
+    """Load evaluation runtime settings from config and optional normalizer."""
+    runtime = {
+        'batch_size': 32,
+        'window_size': 20,
+        'normalize': True,
+        'scaler_type': 'standard',
+        'normalizer': None,
     }
 
-    mape_mask = target_flat != 0
-    if mape_mask.any():
-        metrics['mape'] = float(np.mean(np.abs((pred_flat[mape_mask] - target_flat[mape_mask]) / target_flat[mape_mask])) * 100)
-    else:
-        metrics['mape'] = 0.0
+    if not (config_path and config_path.exists()):
+        return runtime
 
-    errors = np.abs(pred_flat - target_flat)
-    metrics['q25_ae'] = float(np.percentile(errors, 25))
-    metrics['q50_ae'] = float(np.percentile(errors, 50))
-    metrics['q75_ae'] = float(np.percentile(errors, 75))
-    metrics['q95_ae'] = float(np.percentile(errors, 95))
-    metrics['q99_ae'] = float(np.percentile(errors, 99))
+    config = Config.load(config_path)
+    runtime['batch_size'] = config.training.batch_size
+    runtime['window_size'] = config.data.window_size
+    runtime['normalize'] = config.data.normalize
+    runtime['scaler_type'] = config.data.scaler_type
 
-    bias = pred_flat - target_flat
-    metrics['mean_bias'] = float(np.mean(bias))
-    metrics['median_bias'] = float(np.median(bias))
-    metrics['loss'] = float(np.mean((pred_flat - target_flat) ** 2))
+    if runtime['normalize']:
+        normalizer = LapTimeNormalizer(scaler_type=runtime['scaler_type'])
+        try:
+            normalizer.load(config.training.train_years)
+            logger.info("Loaded training normalizer for evaluation")
+        except FileNotFoundError:
+            logger.info("Training normalizer not found; fitting on train data")
+            train_data = load_all_races(config.training.train_years, session="Race")
+            normalizer.fit(train_data, years=config.training.train_years)
+        runtime['normalizer'] = normalizer
 
-    return metrics
+    return runtime
+
+
+def _log_core_metrics(metrics: dict):
+    """Log core regression metrics."""
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST METRICS")
+    logger.info("=" * 60)
+
+    for key in ['loss', 'mae', 'rmse', 'mape', 'median_ae']:
+        value = metrics.get(key, 0)
+        if key == 'mape':
+            logger.info(f"  {key.upper()}: {value:.2f}%")
+        else:
+            logger.info(f"  {key.upper()}: {value:.2f}")
+
+
+def _attach_auxiliary_metrics(metrics: dict, predictions: dict):
+    """Compute and attach pit/compound metrics if auxiliary outputs exist."""
+    pit_preds = predictions.get('pit_predictions')
+    pit_targs = predictions.get('pit_targets')
+    if pit_preds is not None and pit_targs is not None:
+        try:
+            from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
+
+            pit_probs = pit_preds.reshape(-1)
+            pit_labels = pit_targs.reshape(-1).astype(int)
+            try:
+                pit_auroc = float(roc_auc_score(pit_labels, pit_probs))
+            except Exception:
+                pit_auroc = float('nan')
+            pit_pred_binary = (pit_probs >= 0.5).astype(int)
+            pit_acc = float(accuracy_score(pit_labels, pit_pred_binary))
+            pit_cm = confusion_matrix(pit_labels, pit_pred_binary).tolist()
+            logger.info(f"  PIT_AUROC: {pit_auroc:.3f}")
+            logger.info(f"  PIT_ACC: {pit_acc:.3f}")
+            logger.info(f"  PIT_CONFUSION: {pit_cm}")
+            metrics['pit_auroc'] = pit_auroc
+            metrics['pit_accuracy'] = pit_acc
+            metrics['pit_confusion'] = pit_cm
+        except Exception:
+            try:
+                pit_acc = float(((pit_preds >= 0.5).astype(int).reshape(-1) == pit_targs.reshape(-1)).mean())
+            except Exception:
+                pit_acc = float('nan')
+            logger.info(f"  PIT_ACC: {pit_acc:.3f}")
+            metrics['pit_accuracy'] = pit_acc
+
+    comp_preds = predictions.get('compound_predictions')
+    comp_targs = predictions.get('compound_targets')
+    if comp_preds is not None and comp_targs is not None:
+        try:
+            from sklearn.metrics import confusion_matrix, accuracy_score
+
+            comp_pred_flat = comp_preds.reshape(-1)
+            comp_targ_flat = comp_targs.reshape(-1)
+            comp_acc = float(accuracy_score(comp_targ_flat, comp_pred_flat))
+            comp_cm = confusion_matrix(comp_targ_flat, comp_pred_flat).tolist()
+            logger.info(f"  COMPOUND_ACC: {comp_acc:.3f}")
+            logger.info(f"  COMPOUND_CONFUSION: {comp_cm}")
+            metrics['compound_accuracy'] = comp_acc
+            metrics['compound_confusion'] = comp_cm
+        except Exception:
+            try:
+                comp_acc = float((comp_preds.reshape(-1) == comp_targs.reshape(-1)).mean())
+            except Exception:
+                comp_acc = float('nan')
+            logger.info(f"  COMPOUND_ACC: {comp_acc:.3f}")
+            metrics['compound_accuracy'] = comp_acc
+
+
+def _denormalize_predictions(predictions: dict, normalizer: LapTimeNormalizer):
+    """Convert normalized outputs back to milliseconds when normalizer stats are known."""
+    if normalizer is None:
+        logger.warning("No normalizer available; skipping denormalized metrics")
+        return predictions['predictions'], predictions['targets']
+
+    stats = normalizer.get_statistics()
+    if stats is None:
+        logger.warning("No normalizer statistics available; skipping denormalized metrics")
+        return predictions['predictions'], predictions['targets']
+
+    col_index = stats['columns'].index('LapTime') if 'columns' in stats else 0
+    if 'std' in stats and 'mean' in stats:
+        pred_denorm = predictions['predictions'] * stats['std'][col_index] + stats['mean'][col_index]
+        targ_denorm = predictions['targets'] * stats['std'][col_index] + stats['mean'][col_index]
+        return pred_denorm, targ_denorm
+    if 'min' in stats and 'max' in stats:
+        span = stats['max'][col_index] - stats['min'][col_index]
+        pred_denorm = predictions['predictions'] * span + stats['min'][col_index]
+        targ_denorm = predictions['targets'] * span + stats['min'][col_index]
+        return pred_denorm, targ_denorm
+    if 'center' in stats and 'scale' in stats:
+        pred_denorm = predictions['predictions'] * stats['scale'][col_index] + stats['center'][col_index]
+        targ_denorm = predictions['targets'] * stats['scale'][col_index] + stats['center'][col_index]
+        return pred_denorm, targ_denorm
+
+    logger.warning("Unknown normalizer stats; skipping denormalized metrics")
+    return predictions['predictions'], predictions['targets']
+
+
+def _build_ms_metrics(pred_denorm: np.ndarray, target_denorm: np.ndarray) -> tuple:
+    """Build denormalized metrics and error bucket breakdown."""
+    metrics_denorm_full = compute_regression_metrics(pred_denorm, target_denorm)
+    metrics_denorm = {
+        'mae_ms': metrics_denorm_full['mae'],
+        'rmse_ms': metrics_denorm_full['rmse'],
+        'median_ae_ms': metrics_denorm_full['median_ae'],
+        'mape_percent': metrics_denorm_full['mape'],
+        'q25_ae_ms': metrics_denorm_full['q25_ae'],
+        'q50_ae_ms': metrics_denorm_full['q50_ae'],
+        'q75_ae_ms': metrics_denorm_full['q75_ae'],
+        'q95_ae_ms': metrics_denorm_full['q95_ae'],
+        'q99_ae_ms': metrics_denorm_full['q99_ae'],
+        'mean_bias_ms': metrics_denorm_full['mean_bias'],
+        'median_bias_ms': metrics_denorm_full['median_bias'],
+        'mse_ms2': metrics_denorm_full['loss'],
+    }
+
+    errors = np.abs(pred_denorm - target_denorm)
+    error_breakdown = {
+        'error_0_10ms': float((errors < 10).sum() / len(errors) * 100),
+        'error_10_50ms': float(((errors >= 10) & (errors < 50)).sum() / len(errors) * 100),
+        'error_50_100ms': float(((errors >= 50) & (errors < 100)).sum() / len(errors) * 100),
+        'error_100_200ms': float(((errors >= 100) & (errors < 200)).sum() / len(errors) * 100),
+        'error_200plus_ms': float((errors >= 200).sum() / len(errors) * 100),
+    }
+    return metrics_denorm_full, metrics_denorm, error_breakdown
+
+
+def _save_evaluation_artifacts(
+    output_dir: Path,
+    checkpoint_path: Path,
+    test_years: list,
+    metrics: dict,
+    metrics_denorm: dict,
+    error_breakdown: dict,
+    pred_denorm: np.ndarray,
+    target_denorm: np.ndarray,
+    metadata: list,
+):
+    """Persist evaluation outputs and return results path."""
+    preds_file = output_dir / 'predictions.npz'
+    meta_file = output_dir / 'predictions_metadata.json'
+    try:
+        np.savez_compressed(preds_file, predictions=pred_denorm, targets=target_denorm)
+        with open(meta_file, 'w', encoding='utf-8') as mf:
+            json.dump(metadata, mf, default=str, indent=2)
+        logger.info(f"Saved per-sample predictions to {preds_file} and metadata to {meta_file}")
+    except Exception as exc:
+        logger.warning(f"Failed to save predictions/metadata: {exc}")
+
+    results = {
+        'checkpoint': str(checkpoint_path),
+        'test_years': test_years,
+        'metrics_normalized': metrics,
+        'metrics_denormalized_ms': metrics_denorm,
+        'error_breakdown': error_breakdown,
+        'predictions_file': str(preds_file),
+        'predictions_metadata_file': str(meta_file),
+        'metrics': metrics,
+    }
+    results_path = output_dir / "evaluation_results.json"
+    with open(results_path, 'w') as out:
+        json.dump(results, out, indent=2)
+    logger.info(f"\nEvaluation results saved to {results_path}")
+    return results_path
 
 
 def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
@@ -178,7 +336,7 @@ def create_test_dataloader(
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=lambda batch: default_collate([b for b in batch if b is not None])
+        collate_fn=_collate_with_none_filter,
     )
     
     return test_loader
@@ -218,38 +376,16 @@ def evaluate(
     # Load model
     model, checkpoint = load_model_from_checkpoint(checkpoint_path, device=device)
     
-    # Load config if available
-    config = None
-    normalizer = None
-    normalize = True
-    scaler_type = "standard"
-    if config_path and config_path.exists():
-        config = Config.load(config_path)
-        batch_size = config.training.batch_size
-        window_size = config.data.window_size
-        normalize = config.data.normalize
-        scaler_type = config.data.scaler_type
-        if normalize:
-            normalizer = LapTimeNormalizer(scaler_type=scaler_type)
-            try:
-                normalizer.load(config.training.train_years)
-                logger.info("Loaded training normalizer for evaluation")
-            except FileNotFoundError:
-                logger.info("Training normalizer not found; fitting on train data")
-                train_data = load_all_races(config.training.train_years, session="Race")
-                normalizer.fit(train_data, years=config.training.train_years)
-    else:
-        batch_size = 32
-        window_size = 20
+    runtime = _load_eval_runtime_config(config_path)
     
     # Create test dataloader
     test_loader = create_test_dataloader(
         years=test_years,
-        batch_size=batch_size,
-        window_size=window_size,
-        normalize=normalize,
-        scaler_type=scaler_type,
-        normalizer=normalizer,
+        batch_size=runtime['batch_size'],
+        window_size=runtime['window_size'],
+        normalize=runtime['normalize'],
+        scaler_type=runtime['scaler_type'],
+        normalizer=runtime['normalizer'],
     )
     
     # Create evaluator
@@ -260,170 +396,38 @@ def evaluate(
     logger.info("\nRunning evaluation...")
     metrics, predictions = evaluator.evaluate(test_loader, return_predictions=True)
     
-    # Log metrics
-    logger.info("\n" + "=" * 60)
-    logger.info("TEST METRICS")
-    logger.info("=" * 60)
-    
-    for key in ['loss', 'mae', 'rmse', 'mape', 'median_ae']:
-        value = metrics.get(key, 0)
-        if key == 'mape':
-            logger.info(f"  {key.upper()}: {value:.2f}%")
-        else:
-            logger.info(f"  {key.upper()}: {value:.2f}")
-
-    # Additional multi-task metrics (pit, compound) if available in predictions
-    pit_preds = predictions.get('pit_predictions')
-    pit_targs = predictions.get('pit_targets')
-    # Try to compute AUROC + accuracy for pit predictions using sklearn if available
-    if pit_preds is not None and pit_targs is not None:
-        try:
-            from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
-            pit_probs = pit_preds.reshape(-1)
-            pit_labels = pit_targs.reshape(-1)
-            # Ensure binary labels 0/1
-            pit_labels = pit_labels.astype(int)
-            # AUROC (requires both classes present)
-            try:
-                pit_auroc = float(roc_auc_score(pit_labels, pit_probs))
-            except Exception:
-                pit_auroc = float('nan')
-            pit_pred_binary = (pit_probs >= 0.5).astype(int)
-            pit_acc = float(accuracy_score(pit_labels, pit_pred_binary))
-            pit_cm = confusion_matrix(pit_labels, pit_pred_binary).tolist()
-            logger.info(f"  PIT_AUROC: {pit_auroc:.3f}")
-            logger.info(f"  PIT_ACC: {pit_acc:.3f}")
-            logger.info(f"  PIT_CONFUSION: {pit_cm}")
-            metrics['pit_auroc'] = pit_auroc
-            metrics['pit_accuracy'] = pit_acc
-            metrics['pit_confusion'] = pit_cm
-        except Exception:
-            # Fallback to simple accuracy only
-            try:
-                pit_acc = float(((pit_preds >= 0.5).astype(int).reshape(-1) == pit_targs.reshape(-1)).mean())
-            except Exception:
-                pit_acc = float('nan')
-            logger.info(f"  PIT_ACC: {pit_acc:.3f}")
-            metrics['pit_accuracy'] = pit_acc
-
-    comp_preds = predictions.get('compound_predictions')
-    comp_targs = predictions.get('compound_targets')
-    if comp_preds is not None and comp_targs is not None:
-        try:
-            from sklearn.metrics import confusion_matrix, accuracy_score
-            comp_pred_flat = comp_preds.reshape(-1)
-            comp_targ_flat = comp_targs.reshape(-1)
-            comp_acc = float(accuracy_score(comp_targ_flat, comp_pred_flat))
-            comp_cm = confusion_matrix(comp_targ_flat, comp_pred_flat).tolist()
-            logger.info(f"  COMPOUND_ACC: {comp_acc:.3f}")
-            logger.info(f"  COMPOUND_CONFUSION: {comp_cm}")
-            metrics['compound_accuracy'] = comp_acc
-            metrics['compound_confusion'] = comp_cm
-        except Exception:
-            try:
-                comp_acc = float((comp_preds.reshape(-1) == comp_targs.reshape(-1)).mean())
-            except Exception:
-                comp_acc = float('nan')
-            logger.info(f"  COMPOUND_ACC: {comp_acc:.3f}")
-            metrics['compound_accuracy'] = comp_acc
+    _log_core_metrics(metrics)
+    _attach_auxiliary_metrics(metrics, predictions)
     
     # Denormalize predictions for interpretability
     logger.info("\nDenormalizing predictions...")
 
+    normalizer = runtime['normalizer']
     if normalizer is None:
         normalizer = test_loader.dataset.normalizer
-
-    stats = normalizer.get_statistics() if normalizer is not None else None
-    if stats is None:
-        logger.warning("No normalizer available; skipping denormalized metrics")
-        pred_denorm = predictions['predictions']
-        target_denorm = predictions['targets']
-    else:
-        col_index = stats['columns'].index('LapTime') if 'columns' in stats else 0
-        if 'std' in stats and 'mean' in stats:
-            pred_denorm = predictions['predictions'] * stats['std'][col_index]
-            pred_denorm += stats['mean'][col_index]
-            target_denorm = predictions['targets'] * stats['std'][col_index]
-            target_denorm += stats['mean'][col_index]
-        elif 'min' in stats and 'max' in stats:
-            span = stats['max'][col_index] - stats['min'][col_index]
-            pred_denorm = predictions['predictions'] * span + stats['min'][col_index]
-            target_denorm = predictions['targets'] * span + stats['min'][col_index]
-        elif 'center' in stats and 'scale' in stats:
-            pred_denorm = predictions['predictions'] * stats['scale'][col_index]
-            pred_denorm += stats['center'][col_index]
-            target_denorm = predictions['targets'] * stats['scale'][col_index]
-            target_denorm += stats['center'][col_index]
-        else:
-            logger.warning("Unknown normalizer stats; skipping denormalized metrics")
-            pred_denorm = predictions['predictions']
-            target_denorm = predictions['targets']
+    pred_denorm, target_denorm = _denormalize_predictions(predictions, normalizer)
     
-    # Compute denormalized metrics (milliseconds)
-    metrics_denorm_full = compute_regression_metrics(pred_denorm, target_denorm)
-    metrics_denorm = {
-        'mae_ms': metrics_denorm_full['mae'],
-        'rmse_ms': metrics_denorm_full['rmse'],
-        'median_ae_ms': metrics_denorm_full['median_ae'],
-        'mape_percent': metrics_denorm_full['mape'],
-        'q25_ae_ms': metrics_denorm_full['q25_ae'],
-        'q50_ae_ms': metrics_denorm_full['q50_ae'],
-        'q75_ae_ms': metrics_denorm_full['q75_ae'],
-        'q95_ae_ms': metrics_denorm_full['q95_ae'],
-        'q99_ae_ms': metrics_denorm_full['q99_ae'],
-        'mean_bias_ms': metrics_denorm_full['mean_bias'],
-        'median_bias_ms': metrics_denorm_full['median_bias'],
-        'mse_ms2': metrics_denorm_full['loss'],
-    }
+    metrics_denorm_full, metrics_denorm, error_breakdown = _build_ms_metrics(pred_denorm, target_denorm)
     
     logger.info("\nDenormalized Metrics (ms):")
     for key, value in metrics_denorm.items():
         logger.info(f"  {key}: {value:.2f}")
     
-    # Error breakdown
-    errors = np.abs(pred_denorm - target_denorm)
-    error_breakdown = {
-        'error_0_10ms': float((errors < 10).sum() / len(errors) * 100),
-        'error_10_50ms': float(((errors >= 10) & (errors < 50)).sum() / len(errors) * 100),
-        'error_50_100ms': float(((errors >= 50) & (errors < 100)).sum() / len(errors) * 100),
-        'error_100_200ms': float(((errors >= 100) & (errors < 200)).sum() / len(errors) * 100),
-        'error_200plus_ms': float((errors >= 200).sum() / len(errors) * 100),
-    }
-    
     logger.info("\nError Breakdown:")
     for category, percentage in error_breakdown.items():
         logger.info(f"  {category}: {percentage:.2f}%")
-    
-    # Save evaluation results
-    # Save per-sample predictions and metadata (for downstream analysis)
-    preds_file = output_dir / 'predictions.npz'
-    meta_file = output_dir / 'predictions_metadata.json'
-    try:
-        np.savez_compressed(preds_file, predictions=pred_denorm, targets=target_denorm)
-        with open(meta_file, 'w', encoding='utf-8') as mf:
-            json.dump(predictions.get('metadata', []), mf, default=str, indent=2)
-        logger.info(f"Saved per-sample predictions to {preds_file} and metadata to {meta_file}")
-    except Exception as e:
-        logger.warning(f"Failed to save predictions/metadata: {e}")
 
-    results = {
-        'checkpoint': str(checkpoint_path),
-        'test_years': test_years,
-        'metrics_normalized': metrics,
-        'metrics_denormalized_ms': metrics_denorm,
-        'error_breakdown': error_breakdown,
-        'predictions_file': str(preds_file),
-        'predictions_metadata_file': str(meta_file),
-    }
-
-    # Backward compatibility with older consumers expecting key name `metrics`
-    results['metrics'] = metrics
-    
-    results_path = output_dir / "evaluation_results.json"
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    logger.info(f"\nEvaluation results saved to {results_path}")
+    _save_evaluation_artifacts(
+        output_dir=output_dir,
+        checkpoint_path=checkpoint_path,
+        test_years=test_years,
+        metrics=metrics,
+        metrics_denorm=metrics_denorm,
+        error_breakdown=error_breakdown,
+        pred_denorm=pred_denorm,
+        target_denorm=target_denorm,
+        metadata=predictions.get('metadata', []),
+    )
     
     # Generate report on denormalized metrics for interpretability
     report_path = output_dir / "evaluation_report.txt"

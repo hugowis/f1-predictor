@@ -17,6 +17,8 @@ from torch.amp import autocast, GradScaler
 import json
 from datetime import datetime
 
+from .evaluator import compute_regression_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -776,20 +778,11 @@ class Trainer:
         dict
             Metrics (MAE, RMSE, MAPE, etc.)
         """
-        mae = np.mean(np.abs(predictions - targets))
-        rmse = np.sqrt(np.mean((predictions - targets) ** 2))
-        
-        # MAPE (avoid division by zero)
-        mask = targets != 0
-        if mask.any():
-            mape = np.mean(np.abs((predictions[mask] - targets[mask]) / targets[mask])) * 100
-        else:
-            mape = 0.0
-        
+        metrics = compute_regression_metrics(predictions, targets)
         return {
-            'mae': mae,
-            'rmse': rmse,
-            'mape': mape,
+            'mae': metrics['mae'],
+            'rmse': metrics['rmse'],
+            'mape': metrics['mape'],
         }
     
     def _save_checkpoint(self, epoch: int, val_loss: float, metrics: Dict[str, float]):

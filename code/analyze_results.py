@@ -404,21 +404,6 @@ last_train_lap_loss: {diagnostics.get('training_dynamics', {}).get('last_train_l
 gap_last_train_total_minus_val: {diagnostics.get('training_dynamics', {}).get('gap_last_train_minus_val', float('nan')):.6f}
 gap_last_train_lap_minus_val: {diagnostics.get('training_dynamics', {}).get('gap_last_train_lap_minus_val', float('nan')):.6f}
 
-BASELINE COMPARISON (vs experiment_100epochs_gru_run1)
-{'-'*80}
-MAE delta: {baseline_comparison.get('mae_delta_ms', float('nan')):.2f} ms
-RMSE delta: {baseline_comparison.get('rmse_delta_ms', float('nan')):.2f} ms
-Median AE delta: {baseline_comparison.get('median_ae_delta_ms', float('nan')):.2f} ms
-
-RECOMMENDED NEXT TRAINING RUN
-{'-'*80}
-- Lower auxiliary-task weighting (pit/compound) to prioritize lap-time objective
-- Reduce augmentation intensity for stability on 2025 distribution
-- Keep early stopping tighter and use best checkpoint epoch
-- Compare tuned run against baseline with denormalized MAE/RMSE first
-
-{'='*80}
-"""
 
     with open(results_dir / 'error_analysis_report.txt', 'w', encoding='utf-8') as f:
         f.write(analysis_report)

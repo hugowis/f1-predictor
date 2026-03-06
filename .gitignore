@@ -237,6 +237,11 @@ analysis/
 *.temp
 *.swap
 
-# Data files
-*.csv
-*.json
+# Project datasets and caches (reproducible/generated)
+data/raw_data/
+data/clean_data/
+data/precomputed/
+data/vocabs/Circuit.json
+data/vocabs/Driver.json
+data/vocabs/Team.json
+data/vocabs/Year.json

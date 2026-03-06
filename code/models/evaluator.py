@@ -1,10 +1,6 @@
-"""
-Evaluation utilities for F1 lap time prediction models.
+"""Evaluation utilities for F1 lap time prediction models."""
 
-Provides comprehensive metrics and analysis tools.
-"""
-
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,6 +9,39 @@ from torch.amp import autocast
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def compute_regression_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+    """Compute regression metrics from prediction and target arrays."""
+    pred_flat = np.asarray(predictions).reshape(-1)
+    target_flat = np.asarray(targets).reshape(-1)
+
+    metrics = {
+        'mae': float(np.mean(np.abs(pred_flat - target_flat))),
+        'rmse': float(np.sqrt(np.mean((pred_flat - target_flat) ** 2))),
+        'median_ae': float(np.median(np.abs(pred_flat - target_flat))),
+        'loss': float(np.mean((pred_flat - target_flat) ** 2)),
+    }
+
+    mape_mask = target_flat != 0
+    if mape_mask.any():
+        metrics['mape'] = float(
+            np.mean(np.abs((pred_flat[mape_mask] - target_flat[mape_mask]) / target_flat[mape_mask])) * 100
+        )
+    else:
+        metrics['mape'] = 0.0
+
+    errors = np.abs(pred_flat - target_flat)
+    metrics['q25_ae'] = float(np.percentile(errors, 25))
+    metrics['q50_ae'] = float(np.percentile(errors, 50))
+    metrics['q75_ae'] = float(np.percentile(errors, 75))
+    metrics['q95_ae'] = float(np.percentile(errors, 95))
+    metrics['q99_ae'] = float(np.percentile(errors, 99))
+
+    bias = pred_flat - target_flat
+    metrics['mean_bias'] = float(np.mean(bias))
+    metrics['median_bias'] = float(np.median(bias))
+    return metrics
 
 
 class Evaluator:
@@ -313,7 +342,7 @@ class Evaluator:
         # (keeps backward compatibility if keys absent)
 
         # Compute metrics
-        metrics = self._compute_all_metrics(predictions, targets) if total_count > 0 else {
+        metrics = compute_regression_metrics(predictions, targets) if total_count > 0 else {
             'mae': float('nan'), 'rmse': float('nan'), 'median_ae': float('nan'), 'mape': float('nan')
         }
         metrics['loss'] = float(sum_se / total_count) if total_count > 0 else float('nan')
@@ -337,158 +366,6 @@ class Evaluator:
         else:
             return metrics, None
     
-    def _compute_all_metrics(
-        self,
-        predictions: np.ndarray,
-        targets: np.ndarray,
-    ) -> Dict[str, float]:
-        """
-        Compute all evaluation metrics.
-        
-        Parameters
-        ----------
-        predictions : np.ndarray
-            Model predictions, shape (n_samples, seq_len, 1)
-        targets : np.ndarray
-            Ground truth targets, same shape
-        
-        Returns
-        -------
-        dict
-            Dictionary of metrics
-        """
-        # Flatten for overall metrics
-        pred_flat = predictions.reshape(-1)
-        target_flat = targets.reshape(-1)
-        
-        metrics = {}
-        
-        # Basic metrics
-        metrics['mae'] = float(np.mean(np.abs(pred_flat - target_flat)))
-        metrics['rmse'] = float(np.sqrt(np.mean((pred_flat - target_flat) ** 2)))
-        metrics['median_ae'] = float(np.median(np.abs(pred_flat - target_flat)))
-        
-        # MAPE
-        mask = target_flat != 0
-        if mask.any():
-            mape = np.mean(np.abs((pred_flat[mask] - target_flat[mask]) / target_flat[mask])) * 100
-            metrics['mape'] = float(mape)
-        else:
-            metrics['mape'] = 0.0
-        
-        # Quantile metrics
-        errors = np.abs(pred_flat - target_flat)
-        metrics['q25_ae'] = float(np.percentile(errors, 25))
-        metrics['q50_ae'] = float(np.percentile(errors, 50))
-        metrics['q75_ae'] = float(np.percentile(errors, 75))
-        metrics['q95_ae'] = float(np.percentile(errors, 95))
-        metrics['q99_ae'] = float(np.percentile(errors, 99))
-        
-        # Bias (signed error)
-        bias = pred_flat - target_flat
-        metrics['mean_bias'] = float(np.mean(bias))
-        metrics['median_bias'] = float(np.median(bias))
-        
-        return metrics
-    
-    def evaluate_by_stint_phase(
-        self,
-        predictions: np.ndarray,
-        targets: np.ndarray,
-        stint_lengths: np.ndarray,
-    ) -> Dict[str, Dict[str, float]]:
-        """
-        Evaluate performance by stint phase (early, mid, late).
-        
-        Parameters
-        ----------
-        predictions : np.ndarray
-            Predictions from evaluation
-        targets : np.ndarray
-            Targets from evaluation
-        stint_lengths : np.ndarray
-            Length of each stint
-        
-        Returns
-        -------
-        dict
-            Metrics grouped by stint phase
-        """
-        metrics_by_phase = {'early': {}, 'mid': {}, 'late': {}}
-        
-        # Determine stint phase boundaries
-        early_threshold = 0.33
-        late_threshold = 0.67
-        
-        # This would require mapping lap indices to stint positions
-        # For now, a simplified version:
-        logger.warning("Stint phase analysis requires additional metadata")
-        
-        return metrics_by_phase
-    
-    def error_breakdown(
-        self,
-        predictions: np.ndarray,
-        targets: np.ndarray,
-    ) -> Dict[str, float]:
-        """
-        Categorize errors into ranges.
-        
-        Returns
-        -------
-        dict
-            Percentage of predictions in each error category
-        """
-        errors = np.abs(predictions.reshape(-1) - targets.reshape(-1))
-        
-        total = len(errors)
-        breakdown = {
-            'error_0_10ms': float((errors < 10).sum() / total * 100),
-            'error_10_50ms': float(((errors >= 10) & (errors < 50)).sum() / total * 100),
-            'error_50_100ms': float(((errors >= 50) & (errors < 100)).sum() / total * 100),
-            'error_100_200ms': float(((errors >= 100) & (errors < 200)).sum() / total * 100),
-            'error_200plus_ms': float((errors >= 200).sum() / total * 100),
-        }
-        
-        logger.info("Error Breakdown:")
-        for category, percentage in breakdown.items():
-            logger.info(f"  {category}: {percentage:.2f}%")
-        
-        return breakdown
-
-
-def denormalize_predictions(
-    predictions: np.ndarray,
-    normalizer,
-    feature_index: int = 0,
-) -> np.ndarray:
-    """
-    Denormalize predictions to original scale.
-    
-    Parameters
-    ----------
-    predictions : np.ndarray
-        Normalized predictions
-    normalizer : LapTimeNormalizer
-        Fitted normalizer
-    feature_index : int
-        Which feature to denormalize (usually 0 for lap time)
-    
-    Returns
-    -------
-    np.ndarray
-        Predictions in original scale
-    """
-    # Get normalization statistics
-    stats = normalizer.get_statistics()
-    mean = stats['mean'][feature_index]
-    std = stats['std'][feature_index]
-    
-    # Reverse normalization: x = (z * std) + mean
-    denormalized = (predictions * std) + mean
-    return denormalized
-
-
 def report_evaluation(
     metrics: Dict[str, float],
     save_path: Optional[str] = None,

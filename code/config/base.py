@@ -295,7 +295,7 @@ def get_phase2_config() -> Config:
     data_config = DataConfig(
         window_size=50,
         context_window=10,
-        augment_prob=0.05,
+        augment_prob=0.20,
     )
     
     return Config(

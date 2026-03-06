@@ -431,6 +431,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning-rate', type=float, help='Learning rate')
+    parser.add_argument('--augment-prob', type=float, help='Training data augmentation probability (overrides config.data.augment_prob)')
     parser.add_argument('--no-mixed-precision', action='store_true', help='Disable mixed precision training (FP16)')
     parser.add_argument('--seed', type=int, help='Random seed (overrides config)')
     parser.add_argument('--pit-loss-weight', type=float, help='Pit stop auxiliary loss weight (overrides config)')
@@ -471,6 +472,10 @@ def main():
         config.training.num_epochs = args.epochs
     if args.learning_rate:
         config.training.learning_rate = args.learning_rate
+    if args.augment_prob is not None:
+        if args.augment_prob < 0.0 or args.augment_prob > 1.0:
+            raise ValueError(f"--augment-prob must be between 0.0 and 1.0, got {args.augment_prob}")
+        config.data.augment_prob = args.augment_prob
     if args.no_mixed_precision:
         config.training.use_mixed_precision = False
     if args.seed is not None:

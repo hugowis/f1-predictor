@@ -5,6 +5,7 @@ Provides a flexible Trainer class that can work with different model architectur
 """
 
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any, Callable, List
 import numpy as np
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 import json
 from datetime import datetime
+from tqdm.auto import tqdm
 
 from .evaluator import compute_regression_metrics
 
@@ -147,6 +149,7 @@ class Trainer:
             'val_loss_monitored': [],
             'learning_rate': [],
         }
+        self._show_progress = True
         
         if self.use_mixed_precision:
             logger.info("Mixed precision training enabled (FP16)")
@@ -225,8 +228,17 @@ class Trainer:
         num_batches = 0
 
         self._maybe_initialize_compound_class_weights(getattr(train_loader, 'dataset', None))
-        
-        for batch_idx, batch in enumerate(train_loader):
+
+        progress = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1} [train]",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not self._show_progress,
+        )
+
+        for batch_idx, batch in progress:
             # Extract batch data (pass dataset so decoder targets can be normalized/asserted)
             encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch, dataset=train_loader.dataset)
             # Encoder input may be a dict (structured numeric+categorical); let the
@@ -466,12 +478,15 @@ class Trainer:
             total_pit_loss += pit_loss_value
             total_comp_loss += comp_loss_value
             num_batches += 1
-            
-            if (batch_idx + 1) % max(1, len(train_loader) // 5) == 0:
-                logger.info(
-                    f"Epoch {epoch} [{batch_idx + 1}/{len(train_loader)}] "
-                    f"Loss: {loss_value:.6f}"
-                )
+
+            if num_batches > 0:
+                progress.set_postfix({
+                    'loss': f"{(total_loss / num_batches):.4f}",
+                    'lap': f"{(total_lap_loss / num_batches):.4f}",
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                })
+
+        progress.close()
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         avg_lap_loss = total_lap_loss / num_batches if num_batches > 0 else 0.0
@@ -511,9 +526,18 @@ class Trainer:
         num_batches = 0
         all_predictions = []
         all_targets = []
+
+        progress = tqdm(
+            val_loader,
+            total=len(val_loader),
+            desc="Validation",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not self._show_progress,
+        )
         
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in progress:
                 encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch, dataset=val_loader.dataset)
                 # Encoder input may be structured dict; don't call .to on dicts
                 if not isinstance(encoder_input, dict):
@@ -590,6 +614,11 @@ class Trainer:
                 valid_idx = np.isfinite(targs_np) & np.isfinite(preds_np)
                 all_predictions.append(preds_np[valid_idx])
                 all_targets.append(targs_np[valid_idx])
+
+                if num_batches > 0:
+                    progress.set_postfix({'val_loss': f"{(total_loss / num_batches):.4f}"})
+
+        progress.close()
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         
@@ -602,8 +631,13 @@ class Trainer:
             metrics = {'mae': float('nan'), 'rmse': float('nan'), 'mape': float('nan')}
         metrics['loss'] = avg_loss
         
-        logger.info(f"Validation Loss: {avg_loss:.6f}")
-        logger.info(f"Validation MAE (normalized): {metrics.get('mae', 0):.4f}")
+        logger.info(
+            "Validation summary: loss=%.6f, mae=%.4f, rmse=%.4f, mape=%.2f%%",
+            avg_loss,
+            metrics.get('mae', float('nan')),
+            metrics.get('rmse', float('nan')),
+            metrics.get('mape', float('nan')),
+        )
         
         return avg_loss, metrics
     
@@ -656,6 +690,7 @@ class Trainer:
             logger.info(f"Early stopping grace period: {early_stopping_min_epochs} epochs")
         
         for epoch in range(num_epochs):
+            epoch_start = time.perf_counter()
             # Update learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
             self.history['learning_rate'].append(current_lr)
@@ -702,10 +737,35 @@ class Trainer:
                 # Early stopping (only after grace period)
                 if epoch >= early_stopping_min_epochs and self.epochs_without_improvement >= early_stopping_patience:
                     logger.info(
-                        f"Early stopping at epoch {epoch} "
+                        f"Early stopping at epoch {epoch + 1} "
                         f"(no improvement for {early_stopping_patience} epochs)"
                     )
                     break
+
+                elapsed = time.perf_counter() - epoch_start
+                logger.info(
+                    "Epoch %d/%d | tf=%.3f | lr=%.2e | train=%.6f | val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
+                    epoch + 1,
+                    num_epochs,
+                    tf_ratio,
+                    current_lr,
+                    train_stats.get('loss', float('nan')),
+                    val_loss,
+                    monitored_val,
+                    self.best_monitored_val,
+                    elapsed,
+                )
+            else:
+                elapsed = time.perf_counter() - epoch_start
+                logger.info(
+                    "Epoch %d/%d | tf=%.3f | lr=%.2e | train=%.6f | time=%.1fs",
+                    epoch + 1,
+                    num_epochs,
+                    tf_ratio,
+                    current_lr,
+                    train_stats.get('loss', float('nan')),
+                    elapsed,
+                )
             
             # Scheduler step
             if self.scheduler is not None:

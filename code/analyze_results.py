@@ -404,6 +404,7 @@ last_train_lap_loss: {diagnostics.get('training_dynamics', {}).get('last_train_l
 gap_last_train_total_minus_val: {diagnostics.get('training_dynamics', {}).get('gap_last_train_minus_val', float('nan')):.6f}
 gap_last_train_lap_minus_val: {diagnostics.get('training_dynamics', {}).get('gap_last_train_lap_minus_val', float('nan')):.6f}
 
+"""
 
     with open(results_dir / 'error_analysis_report.txt', 'w', encoding='utf-8') as f:
         f.write(analysis_report)

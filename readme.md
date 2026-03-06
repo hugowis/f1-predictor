@@ -1,337 +1,257 @@
 # F1 Lap Time Predictor
 
-A deep learning solution to predict **next lap times in Formula 1 racing** using historical lap data and race telemetry.
+Deep learning project to predict next-lap F1 race pace from historical lap, weather, and race-context features.
 
-## Overview
+## Highlights
 
-This project builds a **sequence-to-sequence (seq2seq) model** to solve the lap time prediction problem:
+- Seq2Seq recurrent models (GRU/LSTM) for lap-time forecasting.
+- Two training modes:
+  - Phase 1: stint-based supervised forecasting.
+  - Phase 2: autoregressive full-race forecasting with auxiliary pit/compound heads.
+- End-to-end pipeline:
+  - data download, cleaning, training, evaluation, and analysis plots/reports.
+- Built-in safeguards:
+  - no-leakage feature design, normalization consistency checks, early stopping, checkpointing.
 
-> **Given**: Lap times and telemetry data from laps 1 to t  
-> **Predict**: Lap times for lap t+1, t+2, ... within a stint  
+## Problem Definition
 
-**Key constraints:**
-- Only information available *up to lap t* can be used (no data leakage)
-- Focus on race laps (not qualifying sessions)
-- Must handle varying stint lengths, pit stops, and track conditions
-- Real-world applicability to race strategy and driver performance analysis
+Given race data up to lap `t` for a driver, predict future lap time(s), while using only information available at or before `t`.
 
----
+- Input: lap history window and race context.
+- Output: next lap time (and, in autoregressive mode, iterative future lap times).
+- Constraints:
+  - no future leakage,
+  - varying stint lengths,
+  - pit events and compound changes,
+  - weather and circuit variability.
 
-## Quick Start - Training Pipeline
+## Latest Results
 
-All training and evaluation scripts are located in the `code/` folder for better organization.
+Results are read from tracked experiment outputs in `results/*/evaluation/evaluation_results.json`.
 
-### Prepare the data
+### Best Run (current best in repository)
+
+- Run: `results/step2_compound_0.01/`
+- Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.0`
+
+| Metric | Value |
+|---|---:|
+| MAE (ms) | 23.05 |
+| RMSE (ms) | 40.97 |
+| Median AE (ms) | 15.68 |
+| MAPE (%) | 0.0256 |
+| Mean Bias (ms) | 3.20 |
+| Errors < 50 ms (%) | 90.65 |
+
+### Latest Run
+
+- Run: `results/step6b_150ep_aug0.20/`
+- Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.0`
+
+| Metric | Value |
+|---|---:|
+| MAE (ms) | 29.43 |
+| RMSE (ms) | 59.20 |
+| Median AE (ms) | 16.61 |
+| MAPE (%) | 0.0315 |
+| Mean Bias (ms) | 12.91 |
+| Errors < 50 ms (%) | 88.43 |
+
+
+
+## Repository Structure
+
+```text
+code/
+  train.py
+  evaluate.py
+  analyze_results.py
+  config/
+  data/
+  dataloaders/
+  models/
+data/
+  raw_data/
+  clean_data/
+  precomputed/
+  vocabs/
+results/
+  <experiment_name>/
+```
+
+## Installation
+
+### Requirements
+
+- Python 3.10+
+- Optional GPU for faster training (CUDA-compatible PyTorch)
+
+### 1. Clone
 
 ```bash
-# Download data
-python code/data/data_downloader.py 
-# Prepare it
+git clone <your-repo-url>
+cd f1-predictor
+```
+
+### 2. Create Environment
+
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Linux/macOS:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 3. Install Dependencies
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+### 1. Download and prepare data
+
+```bash
+python code/data/data_downloader.py
 python code/data/data_preparation.py
 ```
 
-### Precomputed / Cached Dataloader (new)
+### 2. Train
 
-To speed up development and testing you can persist the autoregressive dataloader's
-precomputed context tensors to disk so subsequent runs load instantly.
-
-- Default behavior: the `AutoregressiveLapDataloader` will attempt to load a cache
-  file under `data/precomputed/` named like `ar_cache_<years>_cw<context>_<scaler>.pt`.
-- You can override or explicitly set the cache file with the `cache_path` parameter.
-- The dataloader validates cache compatibility (years, `context_window`, `scaler_type`, numeric columns).
-- To skip precomputation entirely (interactive debugging), set the environment variable `SKIP_PRECOMPUTE=1`.
-
-Examples
-
-Python API (use explicit cache path):
-
-```python
-from pathlib import Path
-from code.dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
-
-ds = AutoregressiveLapDataloader(
-    year=[2019, 2020],
-    context_window=5,
-    cache_path=Path('data/precomputed/my_ar_cache.pt'),
-    scaler_type='standard',
-    device='cpu'
-)
-# On first instantiation this will precompute tensors and save the cache.
-# On subsequent runs it will load the cache (if compatible) which is much faster.
-```
-
-Quick precompute from Python (bulk):
-
-```python
-from pathlib import Path
-from code.dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
-
-def build_cache(years, cw):
-    p = Path(f'data/precomputed/ar_cache_{"_".join(map(str, years))}_cw{cw}_standard.pt')
-    ds = AutoregressiveLapDataloader(year=years, context_window=cw, cache_path=p)
-
-# Example: precompute caches for 2018-2020 with cw=5
-build_cache([2018,2019,2020], 5)
-```
-
-Clearing cache
+Phase 1 (stint mode):
 
 ```bash
-rm -f data/precomputed/ar_cache_*
-```
-
-Notes
-
-- The cache stores context arrays (numpy), target primitives and metadata. If you change
-  the dataloader feature set (numeric columns) or scaler type, the cache will be ignored
-  and recomputed.
-- Keep an eye on disk usage for very large year ranges; caches can become large when
-  precomputing many races.
-
-
-### Training a Model
-
-```bash
-# Train Phase 1 model (default config)
 python code/train.py --phase 1 --device cuda
-
-# Train with custom batch size and epochs
-python code/train.py --phase 1 --batch-size 16 --epochs 100 --device cuda
-
-# Train with custom config file
-python code/train.py --config path/to/config.json --device cuda
 ```
 
-### Evaluating a Model
+Phase 2 (autoregressive mode):
 
 ```bash
-# Evaluate checkpoint on 2025 test data
-python code/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --device cuda
-
-# Evaluate on specific years
-python code/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --test-years 2022 2023 2024
+python code/train.py --phase 2 --autoregressive --device cuda
 ```
 
-### Visualizing Results
+Custom run example:
 
 ```bash
-
-# Generate error analysis report, loss curves and error distribution plots
-python code/analyze_results.py
+python code/train.py \
+  --phase 2 \
+  --autoregressive \
+  --epochs 150 \
+  --batch-size 64 \
+  --compound-loss-weight 0.01 \
+  --pit-loss-weight 0.0 \
+  --augment-prob 0.20 \
+  --output results/my_run
 ```
 
-All results are saved to `results/phase1/` including:
-- `loss_curves.png` - Training/validation loss progression
-- `error_breakdown.png` - Error distribution visualization
-- `test_metrics_summary.png` - Test performance metrics
-- `analysis_report.txt` - Comprehensive analysis report
-- `evaluation_results.json` - Detailed evaluation metrics
+### 3. Evaluate a checkpoint
 
----
+```bash
+python code/evaluate.py \
+  --checkpoint results/my_run/checkpoints/best_model.pt \
+  --config results/my_run/config.json \
+  --test-years 2025 \
+  --device cuda
+```
 
-## Data
+### 4. Generate analysis plots/reports
 
-All data is obtained using the **FastF1** Python framework and downloaded via:
-```code/data/data_downloader.py```
+```bash
+python code/analyze_results.py --run my_run
+```
 
+## Reproducibility
 
-### Raw Lap Data (FastF1)
+This project is designed for practical reproducibility, but exact bitwise reproduction across different machines/driver stacks is not guaranteed.
 
-Each row corresponds to a single lap for a driver in a race and includes:
+### What is already implemented
 
-- Lap timing information
-- Sector times
-- Speed traps
-- Tyre information
-- Driver and team metadata
-- Track status flags (yellow flags, safety car, etc.)
+- Fixed random seed support (`--seed` in `code/train.py`).
+- Deterministic CuDNN settings enabled in training script.
+- Config snapshot is saved per run (`results/<run>/config.json`).
+- Training history, checkpoints, evaluation outputs, and reports are persisted under each run directory.
 
-Example columns:
+### Recommended reproducibility workflow
 
-```Time, Driver, LapTime, LapNumber, Stint, Sector1Time, Sector2Time, Sector3Time,SpeedI1, SpeedI2, SpeedFL, SpeedST, Compound, TyreLife, FreshTyre, Team, TrackStatus, Position, PitInTime, PitOutTime, ...```
+1. Pin environment:
+   - use a fresh virtual environment,
+   - install with `pip install -r requirements.txt`.
+2. Use explicit run names and seed:
+   - `--seed 42 --output results/repro_seed42`.
+3. Reuse cached/precomputed data only when feature schema is unchanged.
+4. Report both:
+   - exact command used,
+   - `results/<run>/config.json` and `history.json`.
+5. Keep train/val/test year splits identical across comparisons.
 
+### Example reproducible command
 
-### Additional Data
+```bash
+python code/train.py \
+  --phase 2 \
+  --autoregressive \
+  --seed 42 \
+  --epochs 150 \
+  --batch-size 64 \
+  --compound-loss-weight 0.01 \
+  --pit-loss-weight 0.0 \
+  --output results/repro_phase2_seed42
+```
 
-The following data sources are joined at lap level:
+## Data Notes
 
-- **Weather data**
-  - Track temperature
-  - Air temperature
-  - Humidity
-  - Rain
-  - Wind speed (if available)
-- **Track / schedule metadata**
-  - Circuit name
-  - Track length
-  - Season / year
-  - Race total laps
+- Primary source: FastF1 race sessions.
+- Typical features include lap timing, sector timing, speed traps, tire metadata, race status, weather, circuit metadata, and encoded entities (driver/team/circuit/year).
+- Local data directories:
+  - `data/raw_data/` (downloaded source data)
+  - `data/clean_data/` (prepared datasets)
+  - `data/precomputed/` (cached autoregressive tensors)
 
----
+## Caching and Performance
 
-## Task Definition
+`AutoregressiveLapDataloader` supports precomputed cache files under `data/precomputed/`.
 
-**Primary task**:  
-Predict the **next lap times** for a given driver.
+- Default cache naming pattern:
+  - `ar_cache_<years>_cw<context>_<scaler>.pt`
+- Cache is validated for compatibility (years, context window, scaler type, numeric schema).
+- To bypass precompute cache for debugging:
+  - set `SKIP_PRECOMPUTE=1`.
 
-- Input: laps `[t-N, ..., t]`
-- Output: `LapTime(t+1), LapTime(t+2), ...`
-- Only information available **up to lap t** is allowed (no data leakage)
+## Outputs
 
----
+Each run folder in `results/<run_name>/` can include:
 
-## Project Status & Roadmap
+- `config.json` (resolved run config)
+- `history.json` (training curves)
+- `checkpoints/best_model.pt`
+- `evaluation/evaluation_results.json`
+- `evaluation/predictions.npz`
+- `evaluation/evaluation_report.txt`
+- analysis figures (`loss_curves.png`, `error_breakdown.png`, etc.)
 
-### ✅ Phase 1: Complete
+## Development Status
 
-**Completed tasks:**
-- ✅ Data loading and preprocessing (stint-based sequences)
-- ✅ Seq2Seq GRU model architecture
-- ✅ Training infrastructure (trainer, scheduler, early stopping)
-- ✅ Evaluation metrics (MAE, RMSE, MAPE, quantiles)
-- ✅ GPU support (CUDA 13.0, automatic device detection)
-- ✅ Masking for missing/non-finite data
-- ✅ Full training pipeline (100 epochs, converged at epoch 60)
-- ✅ Model checkpointing and restoration
-- ✅ Visualization suite (loss curves, error breakdown, metrics plots)
-- ✅ Comprehensive evaluation reports
+### Completed
 
----
-### Performance Results
-| Metric | Value |
-|--------|-------|
-| **MAE** | 51.10 ms |
-| **RMSE** | 92.38 ms |
-| **Median AE** | 31.92 ms |
-| **MAPE** | 4.22 % |
+- Phase 1 stint-based modeling and evaluation.
+- Phase 2 autoregressive setup with auxiliary heads.
+- Per-run reporting and grouped error analysis.
 
-### Error Distribution
-- **0-10 ms** (Very Accurate): 16.74%
-- **10-50 ms** (Accurate): 52.17% ⭐ *Most common*
-- **50-100 ms** (Good): 20.18%
-- **100-200 ms** (Fair): 7.38%
-- **200+ ms** (Poor): 3.53%
+### Next
 
-**Key insight**: 68.91% of predictions have <50ms error (16.74% + 52.17%), demonstrating improved accuracy for the bs32 training run.
+- Transformer-based architecture experiments.
+- Uncertainty-aware forecasting.
+- Better metadata-driven scenario simulation.
 
----
+## License
 
-
-**LSTM vs GRU Comparison (concise)**: The LSTM Phase 1 run achieves similar MAE to the GRU run but shows notably lower RMSE and MAPE, while the median absolute error is slightly higher — see the GRU summary above and the LSTM metrics here for direct comparison.
-
-### ✅ Phase 2: Complete
-
-**Completed tasks:**
-- ✅ Extend sequence length to full races
-- ✅ Implement autoregressive predictions (free-running mode)
-- ✅ Auxiliary pit head and compound head
-- ✅ Scheduled sampling (gradual removal of teacher forcing)
-- ✅ Error analysis by driver and circuit
-
-**Current best test metrics with  compound-loss-weight = 0.01 and pit-loss-weight = 0.0:**
-- **MAE:** 23.05 ms
-- **RMSE:** 40.97 ms
-- **Median AE:** 15.68 ms
-- **MAPE:** 0.0256 %
-- **Mean bias:** 3.20 ms
-
-**Error distribution (percent):**
-- 0-10 ms: 33.80%
-- 10-50 ms: 56.85%
-- 50-100 ms: 6.89%
-- 100-200 ms: 2.05%
-- 200+ ms: 0.41%
-
-### Analysis & comparison with Phase 1
-
-- **Summary:** The current best Phase 2 run substantially improves core metrics versus the Phase 1 baseline. MAE falls from 51.10 ms → 23.05 ms (~55% reduction), RMSE from 92.38 ms → 40.97 ms (~56% reduction), and median AE from 31.92 ms → 15.68 ms (~51% reduction).
-- **Error distribution shift:** Predictions with error <50 ms increase from ~68.9% (Phase 1) to ~90.7% (Phase 2), indicating a marked shift toward tighter, more reliable predictions. 
-- **Likely contributors:** autoregressive/free‑running training (reduces exposure bias), auxiliary heads for pit/compound (better modeling of strategy changes), scheduled sampling and full‑race context (longer sequences improve robustness).
-
----
-
-### 🔮 Phase 3: Future Enhancements
-
-**Long-term items:**
-- [ ] Transformer-based architecture
-- [ ] Uncertainty estimation (mean + variance predictions)
-- [ ] Pretraining on FP/qualifying data for better generalization (train pit head)
-
-### Additional experiments
-- [ ] Web dashboard
-- [ ] Real-time prediction pipeline for races
-- [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
-
-
----
-
-## Detailed TODO List
-
-### Data Pipeline
-- ✅ Lap data loading (FastF1 framework)
-- ✅ Weather data integration
-- ✅ Track metadata joining
-- ✅ Stint-based sequence creation
-- ✅ Data normalization (per-year StandardScaler)
-- ✅ Masking for non-finite values
-- ✅ Add 2018 season (different compounds and missing data)
-
-### Modeling - Phase 1
-- ✅ GRU encoder-decoder architecture
-- ✅ Teacher forcing (full schedule)
-- ✅ Stint-based sequences (1-20 laps)
-- ✅ Multi-layer RNN (2 layers)
-- ✅ Dropout and gradient clipping
-- ✅ LSTM variant comparison
-- ✅ Driver embeddings
-- ✅ Team/car embeddings
-
-### Modeling - Phase 2
-- [✅] Full-race sequences
-- [✅] Autoregressive
-- [✅] Pit stop modeling (head for pit lap prediction)
-- [✅] Compound modeling (head for tire compound prediction)
-
-### Modeling - Phase 3
-- [ ] Transformer-based architecture
-- [ ] Uncertainty estimation (mean + variance predictions)
-
-### Training & Optimization
-- ✅ PyTorch training loop
-- ✅ GPU acceleration
-- ✅ Learning rate scheduling (cosine annealing)
-- ✅ Early stopping with patience
-- ✅ Gradient accumulation support
-- ✅ Checkpointing and restoration
-
-### Evaluation & Analysis
-- ✅ Test set evaluation
-- ✅ Denormalization of predictions
-- ✅ MAE/RMSE/MAPE/Quantiles computation
-- ✅ Error breakdown by ranges
-- ✅ Loss curve visualization
-- ✅ Error distribution plots
-- ✅ Driver-level error analysis
-- ✅ Circuit-level error analysis
-- ✅ Team-level error analysis
-- ✅ Compound-specific analysis
-
-### Infrastructure & Deployment
-- ✅ Modular code structure
-- ✅ Configuration system (dataclasses)
-- ✅ Training script with CLI
-- ✅ Evaluation script with checkpointing
-- ✅ Visualization suite
-- ✅ Git ignore for generated files
-- [ ] Web dashboard
----
-
-## Experiments
-- ✅ Add 2018 season data
-- [ ] Pretraining on FP sessions, qualifying data, sprint races, etc.
-- [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
-
-## Further work
-- [ ] Web dashboard
-- [ ] Real-time prediction pipeline for races
-- [ ] Scenario-based predictions (e.g., "What if I pit on lap 10?")
+This project is released under the terms of the `LICENSE` file in the repository root.

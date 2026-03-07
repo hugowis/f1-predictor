@@ -207,6 +207,22 @@ python code/train.py \
   --output results/repro_phase2_seed42
 ```
 
+### Multi-seed launcher
+
+Use the launcher when you want to repeat the same training configuration across several seeds and optionally run them in parallel.
+
+```bash
+python code/launch_seed_experiments.py \
+  --config results/step2_compound_0.01/config.json \
+  --seeds 42 123 789 \
+  --batch-size 128 \
+  --mode parallel \
+  --max-parallel 3 \
+  --output-root results/step2_multiseed
+```
+
+Any extra CLI flags that are not consumed by the launcher are forwarded to `code/train.py`, so you can still sweep things like `--epochs`, `--augment-prob`, or `--compound-loss-weight`. The launcher creates one subdirectory per seed, keeps a `launch_manifest.json`, and writes `leaderboard.csv` plus `leaderboard.json` at the output root after all runs finish.
+
 ## Data Notes
 
 - Primary source: FastF1 race sessions.
@@ -248,9 +264,8 @@ Each run folder in `results/<run_name>/` can include:
 
 ### Next
 
-- Transformer-based architecture experiments.
-- Uncertainty-aware forecasting.
-- Better metadata-driven scenario simulation.
+Cf. `ROADMAP_TODO.md` for detailed next steps.
+
 
 ## License
 

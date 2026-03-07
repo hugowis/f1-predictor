@@ -15,10 +15,9 @@ Hypothesis:
 - Running the current best configs across multiple random seeds will produce a stable, statistically-significant baseline and expose variance; this makes future comparisons fair and reproducible.
 
 Tasks:
-- [ ] Implement `scripts/run_seeds.py` to launch N-seed experiments (default N=3)
-- [ ] Select canonical config(s): `step2_compound_0.01` and `step6b_150ep_aug0.20` (or other top candidates)
-- [ ] Create a leaderboard to aggrecate and compare runs
-- [ ] Run canonical configs to add to leaderboard, and commit configs files and results to repository.
+- [V] Implement a script to launch N-seed experiments (default N=3) (launch can be done in parallel on gpu, with high batch sizes)
+- [V] Create a leaderboard to aggrecate and compare runs
+- [Running] Run canonical configs to add to leaderboard.
 
 ## Priority 1: High-Impact Modeling Experiments
 

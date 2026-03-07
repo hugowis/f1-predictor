@@ -1,23 +1,6 @@
 # F1 Predictor Roadmap and Detailed TODO
 
-This file tracks the next experimentation steps and development axes beyond the current README summary. It is meant to provide a more detailed and structured plan for improving the model and repository over time.
-
-## Current Baselines (Reference)
-
-- Best known run: `results/step2_compound_0.01/`
-  - MAE: 23.05 ms
-  - RMSE: 40.97 ms
-  - Median AE: 15.68 ms
-  - Error < 50 ms: 90.65%
-
-### Priority 0: Representative Run for Comparison
-Hypothesis:
-- Running the current best configs across multiple random seeds will produce a stable, statistically-significant baseline and expose variance; this makes future comparisons fair and reproducible.
-
-Tasks:
-- [V] Implement a script to launch N-seed experiments (default N=3) (launch can be done in parallel on gpu, with high batch sizes)
-- [V] Create a leaderboard to aggrecate and compare runs
-- [Running] Run canonical configs to add to leaderboard.
+This file tracks the next experimentation steps and development axes beyond the current README summary. It is meant to provide a more detailed and structured plan for improving the model and repository over time. All experiments are run using the `code/launch_seed_experiments.py` launcher, and results are tracked in `leaderboard.md` for easy comparison. The roadmap is organized by priority and axis of improvement, with specific hypotheses, tasks, and success criteria for each experiment.
 
 ## Priority 1: High-Impact Modeling Experiments
 

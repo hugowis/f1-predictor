@@ -89,7 +89,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
         plt.tight_layout()
         plt.savefig(results_dir / 'loss_curves.png', dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"✓ Saved loss_curves.png")
+        print("Saved loss_curves.png")
 
         # Optional training loss components for multi-task runs
         if train_lap_losses and (train_pit_losses or train_compound_losses):
@@ -116,7 +116,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
             plt.tight_layout()
             plt.savefig(results_dir / 'loss_components.png', dpi=300, bbox_inches='tight')
             plt.close()
-            print(f"✓ Saved loss_components.png")
+            print("Saved loss_components.png")
 
         if train_losses and val_losses:
             best_idx = int(np.argmin(val_losses))
@@ -154,7 +154,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
         plt.tight_layout()
         plt.savefig(results_dir / 'error_breakdown.png', dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"✓ Saved error_breakdown.png")
+        print("Saved error_breakdown.png")
 
         # Metrics summary bar
         if metrics_denorm:
@@ -169,7 +169,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
             plt.tight_layout()
             plt.savefig(results_dir / 'test_metrics_summary.png', dpi=300, bbox_inches='tight')
             plt.close()
-            print(f"✓ Saved test_metrics_summary.png")
+            print("Saved test_metrics_summary.png")
     else:
         print("No evaluation error breakdown found — skipping error plots.")
 
@@ -337,7 +337,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
                 except Exception:
                     print('Compound analysis failed')
 
-            print(f"✓ Saved driver/circuit/phase/compound analyses (CSV + plots) to {results_dir}")
+                print(f"Saved driver/circuit/phase/compound analyses (CSV + plots) to {results_dir}")
         except Exception as e:
             print(f"Failed to run group analyses: {e}")
 
@@ -371,7 +371,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
         diagnostics_path = results_dir / 'phase_diagnostics.json'
         with open(diagnostics_path, 'w', encoding='utf-8') as f:
             json.dump(diagnostics, f, indent=2)
-        print(f"✓ Saved phase_diagnostics.json")
+        print(f"Saved phase_diagnostics.json")
 
     mae = metrics_denorm.get('mae_ms', float('nan'))
     rmse = metrics_denorm.get('rmse_ms', float('nan'))
@@ -410,7 +410,7 @@ gap_last_train_lap_minus_val: {diagnostics.get('training_dynamics', {}).get('gap
         f.write(analysis_report)
 
     print(analysis_report)
-    print(f"\n✓ Error analysis report saved: {results_dir / 'error_analysis_report.txt'}")
+    print(f"\nError analysis report saved: {results_dir / 'error_analysis_report.txt'}")
 
     print("\n" + "=" * 80)
     print("ANALYSIS COMPLETE")

@@ -31,8 +31,8 @@ Results are read from tracked experiment outputs in `results/*/evaluation/evalua
 
 ### Best Run (current best in repository)
 
-- Run: `results/step2_compound_0.01/`
-- Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.0`
+ - Run: `results/step2_compound_0.01/`
+ - Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.001`
 
 | Metric | Value |
 |---|---:|
@@ -46,7 +46,7 @@ Results are read from tracked experiment outputs in `results/*/evaluation/evalua
 ### Latest Run
 
 - Run: `results/step6b_150ep_aug0.20/`
-- Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.0`
+- Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.001`
 
 | Metric | Value |
 |---|---:|
@@ -203,7 +203,7 @@ python code/train.py \
   --epochs 150 \
   --batch-size 64 \
   --compound-loss-weight 0.01 \
-  --pit-loss-weight 0.0 \
+  --pit-loss-weight 0.001 \
   --output results/repro_phase2_seed42
 ```
 

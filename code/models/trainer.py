@@ -73,7 +73,7 @@ class Trainer:
         checkpoint_dir: Optional[Path] = None,
         gradient_clip: Optional[float] = 1.0,
         accumulation_steps: int = 1,
-        pit_loss_weight: float = 0.0,
+        pit_loss_weight: float = 1e-3,
         compound_loss_weight: float = 0.01,
         use_mixed_precision: bool = True,
         early_stopping_use_ema: bool = False,

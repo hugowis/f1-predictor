@@ -97,7 +97,7 @@ class TrainingConfig:
     early_stopping_ema_alpha: float = 0.3
 
     # Multi-task loss weights
-    pit_loss_weight: float = 0.0
+    pit_loss_weight: float = 1e-3
     compound_loss_weight: float = 0.01
     
     # Data
@@ -285,7 +285,7 @@ def get_phase2_config() -> Config:
         early_stopping_min_epochs=30,
         early_stopping_use_ema=True,
         early_stopping_ema_alpha=0.25,
-        pit_loss_weight=0.0,
+        pit_loss_weight=1e-3,
         compound_loss_weight=0.01,
         train_years=[2018, 2019, 2020, 2021, 2022, 2023],
         val_years=[2024],

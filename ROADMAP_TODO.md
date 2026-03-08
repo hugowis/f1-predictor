@@ -10,10 +10,18 @@ Hypothesis:
 - Better balancing of lap/pit/compound losses can reduce large-error tails.
 
 Tasks:
-- [ ] Grid search `compound_loss_weight` in `{0.005, 0.01, 0.02, 0.05}`.
-- [ ] Grid search `pit_loss_weight` in `{0.0, 1e-4, 5e-4, 1e-3}`.
+- [x] Grid search `compound_loss_weight` in `{0.005, 0.01, 0.02, 0.05}`.
+- [x] Grid search `pit_loss_weight` in `{0.0, 1e-4, 5e-4, 1e-3}`.
 - [ ] Compare dynamic aux scaling on vs off.
 - [ ] Evaluate Huber lap loss with deltas `{0.05, 0.1, 0.2}`.
+
+Result:
+- Best setting remains `compound_loss_weight=0.01` (best-seed metrics: MAE `25.08` ms, RMSE `49.43` ms, Median AE `13.00` ms, Error < 50 ms `89.25%`).
+- Higher weights (`0.02`, `0.05`) degraded performance; `0.005` underperformed and showed higher seed variance.
+
+Pit-loss sweep Result:
+- Best setting from the pit-weight grid search: `pit_loss_weight=1e-3` (best-seed metrics: MAE `21.66` ms, RMSE `41.24` ms, Median AE `12.11` ms, Error < 50 ms `91.14%`).
+- `5e-4` showed high seed variance (one good seed, two poor); `1e-4` underperformed relative to baseline `0.0`.
 
 Metrics to watch:
 - MAE, RMSE, q95/q99 absolute error, error < 50 ms, mean bias.

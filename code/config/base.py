@@ -99,6 +99,11 @@ class TrainingConfig:
     # Multi-task loss weights
     pit_loss_weight: float = 1e-3
     compound_loss_weight: float = 0.01
+    # Dynamic auxiliary loss balancing (automatic scaling of pit/compound losses)
+    dynamic_aux_balance: bool = True
+    dynamic_aux_ema_alpha: float = 0.05
+    dynamic_aux_min_scale: float = 0.001
+    dynamic_aux_max_scale: float = 20.0
     
     # Data
     train_years: list = None

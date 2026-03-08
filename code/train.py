@@ -131,6 +131,8 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.pit_loss_weight = args.pit_loss_weight
     if args.compound_loss_weight is not None:
         config.training.compound_loss_weight = args.compound_loss_weight
+    if getattr(args, 'disable_aux_scaling', False):
+        config.training.dynamic_aux_balance = False
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
@@ -474,6 +476,10 @@ def train(config: Config, output_dir: Path = None):
         use_mixed_precision=getattr(config.training, 'use_mixed_precision', True),
         early_stopping_use_ema=getattr(config.training, 'early_stopping_use_ema', False),
         early_stopping_ema_alpha=getattr(config.training, 'early_stopping_ema_alpha', 0.3),
+        dynamic_aux_balance=getattr(config.training, 'dynamic_aux_balance', True),
+        dynamic_aux_ema_alpha=getattr(config.training, 'dynamic_aux_ema_alpha', 0.05),
+        dynamic_aux_min_scale=getattr(config.training, 'dynamic_aux_min_scale', 0.001),
+        dynamic_aux_max_scale=getattr(config.training, 'dynamic_aux_max_scale', 20.0),
     )
     
     # Training loop
@@ -520,6 +526,7 @@ def main():
     parser.add_argument('--seed', type=int, help='Random seed (overrides config)')
     parser.add_argument('--pit-loss-weight', type=float, help='Pit stop auxiliary loss weight (overrides config)')
     parser.add_argument('--compound-loss-weight', type=float, help='Compound auxiliary loss weight (overrides config)')
+    parser.add_argument('--disable-aux-scaling', action='store_true', help='Disable dynamic auxiliary loss scaling (pit/compound)')
     
     args = parser.parse_args()
     

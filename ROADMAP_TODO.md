@@ -13,10 +13,7 @@ Tasks:
 - [x] Grid search `compound_loss_weight` in `{0.005, 0.01, 0.02, 0.05}`.
 - [x] Grid search `pit_loss_weight` in `{0.0, 1e-4, 5e-4, 1e-3}`.
 - [x] Compare dynamic aux scaling on vs off.
- - [x] Evaluate Huber lap loss with deltas `{0.05, 0.1, 0.2}`.
-
-Huber-loss Result:
-- Tested Huber lap loss with delta=0.05 (three seeds). Best seed (seed 456) produced MAE 37.31 ms, RMSE 69.64 ms, Median AE 18.91 ms, %<50ms 86.63 — substantially worse than the MSE baseline (MAE ~25.08 ms). Based on these runs, we will keep MSE as the primary lap loss.
+- [x] Evaluate Huber lap loss with deltas `{0.05, 0.1, 0.2}`.
 
 Compound-loss Result:
 - Best setting remains `compound_loss_weight=0.01` (best-seed metrics: MAE `25.08` ms, RMSE `49.43` ms, Median AE `13.00` ms, Error < 50 ms `89.25%`).
@@ -30,6 +27,8 @@ Dynamic aux scaling Result:
 - Dynamic aux scaling ON performed best (best-seed metrics: MAE 21.66 ms, RMSE 41.24 ms, Median AE 12.11 ms, %<50ms 91.14%).
 - Dynamic aux scaling OFF showed high seed variance and unstable runs (best seed MAE 26.70 ms but two seeds had very large errors / poor validation), indicating the automatic balancing helps stability for this setup.
 
+Huber-loss Result:
+- Tested Huber lap loss with delta=0.05 (three seeds). Best seed (seed 456) produced MAE 37.31 ms, RMSE 69.64 ms, Median AE 18.91 ms, %<50ms 86.63 — substantially worse than the MSE baseline (MAE ~25.08 ms). Based on these runs, we will keep MSE as the primary lap loss.
 
 ### P1.2 Scheduled sampling and teacher forcing schedule
 
@@ -37,12 +36,14 @@ Hypothesis:
 - Better schedule can improve autoregressive stability and reduce drift.
 
 Tasks:
-- [ ] Compare linear vs exponential teacher forcing decay.
-- [ ] Sweep start/end TF ratios and decay duration.
-- [ ] Add a "hold then decay" schedule option.
+- [x] Compare linear vs exponential teacher forcing decay.
+- [x] Sweep start/end TF ratios and decay duration.
+- [x] Add a "hold then decay" schedule option.
 
-Success criteria:
-- Lower autoregressive error accumulation on long stints/races.
+TF-grid results (summary):
+- Hold epochs: `0` performed best overall; 
+- Decay type: `linear` and `exponential` produced comparable aggregate metrics when `hold=0`.
+- End ratio: varying `end` in {0.5, 0.3, 0.0} had minor impact for `hold=0` in these experiments.
 
 ### P1.3 Context window and sequence strategy
 

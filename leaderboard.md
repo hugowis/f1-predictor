@@ -10,6 +10,7 @@ Last updated: 2026-03-08
 | phase1_gru_multiseed | results/phase1_gru_multiseed | 128 | 42, 123, 789 | 100 | 123 | 33.20 | 62.22 | 18.13 | 83.59 | Phase 1 stint-based, default seq2seq GRU encoder |
 | phase1_lstm_multiseed | results/phase1_lstm_multiseed | 128 | 42, 123, 789 | 100 | 789 | 59.71 | 94.99 | 36.84 | 63.66 | Phase 1 stint-based, LSTM encoder run |
 | phase2_ar_multiseed | results/phase2_ar_multiseed | 128 | 42, 123, 789 | 150 | 42 | 25.08 | 49.43 | 13.00 | 89.25 | Phase 2 autoregressive baseline, p_aug=0.2, compound_loss=0.01, pit_loss=0.0 |
+| tf_teacher_forcing_grid | results/tf_grid/tf_linear_end0p5_hold0 | 128 | 42, 456, 789 | 150 | 789 | 21.66 | 41.24 | 12.11 | 91.14 | TF schedule grid (linear, end=0.5, hold=0) — best seed 789 |
 | comp_w0.005 | results/comp_w0.005 | 128 | 42, 456, 789 | 150 | 456 | 40.46 | 80.46 | 18.11 | 80.64 | Phase 2 AR sweep: compound_loss_weight=0.005 |
 | comp_w0.01 | results/comp_w0.01 | 128 | 42, 456, 789 | 150 | 42 | 25.08 | 49.43 | 13.00 | 89.25 | Phase 2 AR sweep: compound_loss_weight=0.01 (best in compound sweep) |
 | comp_w0.02 | results/comp_w0.02 | 128 | 42, 456, 789 | 150 | 42 | 40.42 | 74.62 | 24.07 | 78.84 | Phase 2 AR sweep: compound_loss_weight=0.02 (high seed variance) |

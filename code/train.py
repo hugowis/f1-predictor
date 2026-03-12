@@ -133,6 +133,21 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.compound_loss_weight = args.compound_loss_weight
     if getattr(args, 'disable_aux_scaling', False):
         config.training.dynamic_aux_balance = False
+    # Teacher forcing CLI overrides
+    if getattr(args, 'teacher_forcing_decay', None):
+        config.training.teacher_forcing_decay = args.teacher_forcing_decay
+    if getattr(args, 'teacher_forcing_start', None) is not None:
+        if not (0.0 <= args.teacher_forcing_start <= 1.0):
+            raise ValueError("--teacher-forcing-start must be between 0.0 and 1.0")
+        config.training.teacher_forcing_start = args.teacher_forcing_start
+    if getattr(args, 'teacher_forcing_end', None) is not None:
+        if not (0.0 <= args.teacher_forcing_end <= 1.0):
+            raise ValueError("--teacher-forcing-end must be between 0.0 and 1.0")
+        config.training.teacher_forcing_end = args.teacher_forcing_end
+    if getattr(args, 'teacher_forcing_hold_epochs', None) is not None:
+        if args.teacher_forcing_hold_epochs < 0:
+            raise ValueError("--teacher-forcing-hold-epochs must be >= 0")
+        config.training.teacher_forcing_hold_epochs = args.teacher_forcing_hold_epochs
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
@@ -385,16 +400,35 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
     start = config.training.teacher_forcing_start
     end = config.training.teacher_forcing_end
     total_epochs = config.training.num_epochs
-    
-    if config.training.teacher_forcing_decay == "linear":
-        # Linear decay from start to end
-        ratio = start - (start - end) * (epoch / total_epochs)
-    elif config.training.teacher_forcing_decay == "exponential":
-        # Exponential decay
-        decay = (end / start) ** (1.0 / total_epochs)
-        ratio = start * (decay ** epoch)
+
+    decay_type = getattr(config.training, 'teacher_forcing_decay', 'linear')
+    hold_epochs = getattr(config.training, 'teacher_forcing_hold_epochs', 0)
+
+    # If hold_epochs covers the whole schedule, keep start constant
+    if hold_epochs >= total_epochs:
+        return start
+
+    # If we're still in the hold period, return start
+    if epoch < hold_epochs:
+        return start
+
+    # Compute effective epoch/count after hold
+    eff_epoch = epoch - hold_epochs
+    eff_total = max(1, total_epochs - hold_epochs)
+
+    if decay_type == "linear":
+        # Linear decay from start to end over effective total
+        ratio = start - (start - end) * (eff_epoch / eff_total)
+    elif decay_type == "exponential":
+        # Exponential decay over effective total
+        if start <= 0.0:
+            ratio = end
+        else:
+            decay = (end / start) ** (1.0 / eff_total)
+            ratio = start * (decay ** eff_epoch)
     else:
-        ratio = start  # Constant
+        # constant or unknown: return start
+        ratio = start
     
     return ratio
 
@@ -527,6 +561,11 @@ def main():
     parser.add_argument('--pit-loss-weight', type=float, help='Pit stop auxiliary loss weight (overrides config)')
     parser.add_argument('--compound-loss-weight', type=float, help='Compound auxiliary loss weight (overrides config)')
     parser.add_argument('--disable-aux-scaling', action='store_true', help='Disable dynamic auxiliary loss scaling (pit/compound)')
+    # Teacher forcing CLI options
+    parser.add_argument('--teacher-forcing-decay', choices=['linear', 'exponential', 'hold_then_decay', 'constant'], help='Teacher forcing decay type (overrides config.training.teacher_forcing_decay)')
+    parser.add_argument('--teacher-forcing-start', type=float, help='Start teacher forcing ratio (0.0-1.0)')
+    parser.add_argument('--teacher-forcing-end', type=float, help='End teacher forcing ratio (0.0-1.0)')
+    parser.add_argument('--teacher-forcing-hold-epochs', type=int, help='Number of epochs to hold start ratio before decaying (used with hold_then_decay)')
     
     args = parser.parse_args()
     

@@ -39,6 +39,11 @@ Tasks:
 - [x] Compare linear vs exponential teacher forcing decay.
 - [x] Sweep start/end TF ratios and decay duration.
 - [x] Add a "hold then decay" schedule option.
+- [ ] Add a metric for autoregressive error accumulation on long stints/races.
+- [ ] rerun experiment
+
+Success criteria:
+- Lower autoregressive error accumulation on long stints/races.
 
 TF-grid results (summary):
 - Hold epochs: `0` performed best overall; 

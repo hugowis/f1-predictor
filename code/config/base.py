@@ -287,7 +287,7 @@ def get_phase2_config() -> Config:
         weight_decay=5e-5,
         teacher_forcing_start=1.0,
         teacher_forcing_end=0.3,
-        teacher_forcing_decay="exponential",
+        teacher_forcing_decay="linear",
         early_stopping_patience=30,
         early_stopping_min_epochs=30,
         early_stopping_use_ema=True,

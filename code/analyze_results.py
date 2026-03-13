@@ -9,6 +9,9 @@ import argparse
 import json
 import numpy as np
 import pandas as pd
+import matplotlib
+# Use a non-interactive backend for headless environments (no $DISPLAY)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path

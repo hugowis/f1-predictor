@@ -245,3 +245,5 @@ data/vocabs/Circuit.json
 data/vocabs/Driver.json
 data/vocabs/Team.json
 data/vocabs/Year.json
+.vscode/settings.json
+.gitignore

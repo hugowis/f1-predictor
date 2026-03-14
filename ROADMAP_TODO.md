@@ -36,11 +36,11 @@ Hypothesis:
 - Better schedule can improve autoregressive stability and reduce drift.
 
 Tasks:
-- [x] Compare linear vs exponential teacher forcing decay.
-- [x] Sweep start/end TF ratios and decay duration.
-- [x] Add a "hold then decay" schedule option.
+- [ ] Compare linear vs exponential teacher forcing decay.
+- [ ] Sweep end TF ratios and decay duration.
+- [ ] Add a "hold then decay" schedule option.
 - [ ] Add a metric for autoregressive error accumulation on long stints/races.
-- [ ] rerun experiment
+- [ ] Test several epochs numbers: 100, 150, 200
 
 Success criteria:
 - Lower autoregressive error accumulation on long stints/races.

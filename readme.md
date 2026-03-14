@@ -223,6 +223,38 @@ python code/launch_seed_experiments.py \
 
 Any extra CLI flags that are not consumed by the launcher are forwarded to `code/train.py`, so you can still sweep things like `--epochs`, `--augment-prob`, or `--compound-loss-weight`. The launcher creates one subdirectory per seed, keeps a `launch_manifest.json`, and writes `leaderboard.csv` plus `leaderboard.json` at the output root after all runs finish.
 
+### Grid-search launcher
+
+Use the grid-search wrapper when you want to sweep several launcher or training arguments at once while keeping the existing multi-seed workflow.
+
+```bash
+python code/grid_search_experiments.py \
+  --search-root results/tf_schedule_grid \
+  --grid teacher-forcing-decay=linear,exponential \
+  --grid teacher-forcing-hold-epochs=0,10,20 \
+  --grid teacher-forcing-end=0.5,0.3,0.0 \
+  --grid epochs=100,150,200 \
+  --phase 2 \
+  --autoregressive \
+  --seeds 42 123 789 \
+  --device cuda
+```
+
+How it works:
+
+- Each `--grid` defines one Cartesian-product dimension.
+- Any non-wrapper arguments are forwarded to `code/launch_seed_experiments.py`.
+- Each hyperparameter combination gets its own output directory under `--search-root`.
+- The wrapper writes `grid_manifest.json`, `grid_search_results.csv`, and `grid_search_results.json` at the search root.
+
+Grid syntax notes:
+
+- Write flags with or without leading dashes: `epochs=100,150` and `--epochs=100,150` both work.
+- Use `true` or `false` for boolean flags.
+- Use `none` to omit an optional flag for one branch.
+- Use `|` inside a single value when an option needs multiple CLI tokens, for example `seeds=42|123|789,101|202|303`.
+- You can also provide a JSON `--grid-file` mapping flag names to value lists.
+
 ## Data Notes
 
 - Primary source: FastF1 race sessions.

@@ -53,7 +53,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         "--seeds",
         type=int,
         nargs="+",
-        default=[42, 123, 789],
+        default=[111, 222, 333],
         help="Explicit seed list to run",
     )
     parser.add_argument(

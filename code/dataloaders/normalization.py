@@ -146,6 +146,54 @@ class LapTimeNormalizer:
             self.save(self.years)
         
         return self
+
+    def _get_column_transform_params(self, column_index: int):
+        """Return per-column affine transform parameters for the fitted scaler."""
+        if isinstance(self.scaler, StandardScaler):
+            offset = float(self.scaler.mean_[column_index])
+            scale = float(self.scaler.scale_[column_index])
+            return offset, scale, 'standard'
+        if isinstance(self.scaler, MinMaxScaler):
+            offset = float(self.scaler.min_[column_index])
+            scale = float(self.scaler.scale_[column_index])
+            return offset, scale, 'minmax'
+        if isinstance(self.scaler, RobustScaler):
+            offset = float(self.scaler.center_[column_index])
+            scale = float(self.scaler.scale_[column_index])
+            return offset, scale, 'robust'
+        raise RuntimeError(f"Unsupported scaler type: {type(self.scaler).__name__}")
+
+    def _transform_column_values(self, values: pd.Series, column_index: int) -> pd.Series:
+        """Transform a single numeric column while preserving NaNs."""
+        offset, scale, mode = self._get_column_transform_params(column_index)
+        if np.isclose(scale, 0.0):
+            scale = 1.0
+
+        valid_mask = values.notna()
+        if not valid_mask.any():
+            return values
+
+        if mode == 'minmax':
+            values.loc[valid_mask] = values.loc[valid_mask] * scale + offset
+        else:
+            values.loc[valid_mask] = (values.loc[valid_mask] - offset) / scale
+        return values
+
+    def _inverse_transform_column_values(self, values: pd.Series, column_index: int) -> pd.Series:
+        """Inverse-transform a single numeric column while preserving NaNs."""
+        offset, scale, mode = self._get_column_transform_params(column_index)
+        if np.isclose(scale, 0.0):
+            scale = 1.0
+
+        valid_mask = values.notna()
+        if not valid_mask.any():
+            return values
+
+        if mode == 'minmax':
+            values.loc[valid_mask] = (values.loc[valid_mask] - offset) / scale
+        else:
+            values.loc[valid_mask] = values.loc[valid_mask] * scale + offset
+        return values
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -174,12 +222,11 @@ class LapTimeNormalizer:
         
         # Convert columns to float to avoid dtype warning when assigning normalized values
         data_copy[cols_to_transform] = data_copy[cols_to_transform].astype(np.float64)
-        
-        # Handle NaN values: keep them as is, only transform non-NaN
-        mask = data_copy[cols_to_transform].notna().all(axis=1)
-        if mask.any():
-            data_copy.loc[mask, cols_to_transform] = self.scaler.transform(
-                data_copy.loc[mask, cols_to_transform]
+
+        for column_index, column_name in enumerate(cols_to_transform):
+            data_copy[column_name] = self._transform_column_values(
+                data_copy[column_name].astype(np.float64).copy(),
+                column_index,
             )
         
         return data_copy
@@ -211,12 +258,11 @@ class LapTimeNormalizer:
         
         # Convert columns to float to handle denormalization properly
         data_copy[cols_to_inverse] = data_copy[cols_to_inverse].astype(np.float64)
-        
-        # Handle NaN values
-        mask = data_copy[cols_to_inverse].notna().all(axis=1)
-        if mask.any():
-            data_copy.loc[mask, cols_to_inverse] = self.scaler.inverse_transform(
-                data_copy.loc[mask, cols_to_inverse]
+
+        for column_index, column_name in enumerate(cols_to_inverse):
+            data_copy[column_name] = self._inverse_transform_column_values(
+                data_copy[column_name].astype(np.float64).copy(),
+                column_index,
             )
         
         return data_copy

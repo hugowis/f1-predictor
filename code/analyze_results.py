@@ -344,6 +344,109 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
         except Exception as e:
             print(f"Failed to run group analyses: {e}")
 
+    # 2.4 Rollout evaluation plots (autoregressive error accumulation)
+    rollout_path = eval_dir / 'rollout_evaluation.json'
+    if rollout_path.exists():
+        try:
+            with open(rollout_path, 'r', encoding='utf-8') as f:
+                rollout_data = json.load(f)
+            rollout_ms = rollout_data.get('rollout_metrics_ms', {})
+
+            if rollout_ms:
+                # Parse horizon-indexed dicts into sorted arrays
+                def _parse_horizon_dict(d):
+                    """Convert {"1": val, "2": val, ...} to (horizons, values) sorted arrays."""
+                    items = sorted(d.items(), key=lambda kv: int(kv[0]))
+                    h = [int(k) for k, _ in items]
+                    v = [float(val) for _, val in items]
+                    return np.array(h), np.array(v)
+
+                # --- Plot 1: Horizon MAE & RMSE ---
+                if 'horizon_mae' in rollout_ms and 'horizon_rmse' in rollout_ms:
+                    h_mae, v_mae = _parse_horizon_dict(rollout_ms['horizon_mae'])
+                    h_rmse, v_rmse = _parse_horizon_dict(rollout_ms['horizon_rmse'])
+                    # Convert ms to seconds for readability
+                    v_mae_s = v_mae / 1000.0
+                    v_rmse_s = v_rmse / 1000.0
+
+                    fig, ax = plt.subplots(figsize=(12, 5))
+                    ax.plot(h_mae, v_mae_s, 'o-', color='#3498db', linewidth=2, markersize=4, label='MAE')
+                    ax.plot(h_rmse, v_rmse_s, 's-', color='#e74c3c', linewidth=2, markersize=4, label='RMSE')
+                    ax.set_xlabel('Rollout Horizon (laps ahead)')
+                    ax.set_ylabel('Error (seconds)')
+                    ax.set_title('Autoregressive Rollout: Error vs Horizon')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    stability = rollout_ms.get('stability_ratio', None)
+                    if stability is not None:
+                        ax.annotate(f'Stability ratio: {stability:.2f}',
+                                    xy=(0.98, 0.98), xycoords='axes fraction',
+                                    ha='right', va='top', fontsize=9,
+                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', edgecolor='gray'))
+                    plt.tight_layout()
+                    plt.savefig(results_dir / 'rollout_horizon_error.png', dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print("Saved rollout_horizon_error.png")
+
+                # --- Plot 2: Cumulative drift ---
+                if 'horizon_mean_drift' in rollout_ms and 'horizon_median_abs_drift' in rollout_ms:
+                    h_drift, v_mean_drift = _parse_horizon_dict(rollout_ms['horizon_mean_drift'])
+                    h_abs, v_med_abs = _parse_horizon_dict(rollout_ms['horizon_median_abs_drift'])
+                    v_mean_drift_s = v_mean_drift / 1000.0
+                    v_med_abs_s = v_med_abs / 1000.0
+
+                    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+                    # Mean drift (signed)
+                    axes[0].plot(h_drift, v_mean_drift_s, 'o-', color='#8e44ad', linewidth=2, markersize=4)
+                    axes[0].axhline(y=0, color='gray', linestyle='--', linewidth=0.8)
+                    axes[0].set_xlabel('Rollout Horizon (laps ahead)')
+                    axes[0].set_ylabel('Mean Drift (seconds)')
+                    axes[0].set_title('Signed Drift (Bias Accumulation)')
+                    axes[0].grid(True, alpha=0.3)
+
+                    # Median absolute drift (unsigned)
+                    axes[1].plot(h_abs, v_med_abs_s, 's-', color='#e67e22', linewidth=2, markersize=4)
+                    axes[1].set_xlabel('Rollout Horizon (laps ahead)')
+                    axes[1].set_ylabel('Median |Drift| (seconds)')
+                    axes[1].set_title('Cumulative Absolute Drift')
+                    axes[1].grid(True, alpha=0.3)
+
+                    plt.tight_layout()
+                    plt.savefig(results_dir / 'rollout_drift.png', dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print("Saved rollout_drift.png")
+
+                # --- Plot 3: Rollout summary bar ---
+                stint_mae = rollout_ms.get('stint_total_time_mae')
+                stint_rmse = rollout_ms.get('stint_total_time_rmse')
+                if stint_mae is not None and stint_rmse is not None:
+                    fig, ax = plt.subplots(figsize=(7, 4))
+                    names = ['Stint Total MAE', 'Stint Total RMSE']
+                    vals = [stint_mae / 1000.0, stint_rmse / 1000.0]
+                    colors = ['#3498db', '#e74c3c']
+                    bars = ax.bar(names, vals, color=colors, edgecolor='black')
+                    for bar, v in zip(bars, vals):
+                        ax.text(bar.get_x() + bar.get_width() / 2., v * 1.02,
+                                f"{v:.1f}s", ha='center', va='bottom', fontsize=10)
+                    ax.set_ylabel('Error (seconds)')
+                    ax.set_title('Rollout: Stint Total Time Error')
+                    n_seq = rollout_ms.get('num_sequences', '?')
+                    ax.annotate(f'{n_seq} sequences evaluated',
+                                xy=(0.98, 0.98), xycoords='axes fraction',
+                                ha='right', va='top', fontsize=9,
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', edgecolor='gray'))
+                    ax.grid(axis='y', alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(results_dir / 'rollout_stint_error.png', dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print("Saved rollout_stint_error.png")
+
+                print("Rollout evaluation plots complete.")
+        except Exception as e:
+            print(f"Failed to generate rollout plots: {e}")
+    else:
+        print("No rollout_evaluation.json found — skipping rollout plots.")
+
     print("\n[3/3] Writing analysis report...")
 
     # Optional comparison with strong baseline if available

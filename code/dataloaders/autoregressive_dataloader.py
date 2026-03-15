@@ -715,3 +715,126 @@ class AutoregressiveLapDataloader(Dataset):
         }
 
         return context_tensor, target_tensor, metadata
+
+
+class AutoregressiveRolloutDataset(Dataset):
+    """
+    Dataset that provides multi-step rollout sequences for training.
+
+    Wraps an existing ``AutoregressiveLapDataloader`` and generates
+    (context, future_targets) pairs where the context has ``context_window``
+    laps and future_targets contain ``rollout_steps`` consecutive ground-truth
+    lap targets for computing loss over an unrolled autoregressive sequence.
+
+    Parameters
+    ----------
+    base_dataset : AutoregressiveLapDataloader
+        The base dataset with data, normalizer, feature extraction, etc.
+    rollout_steps : int
+        Number of future autoregressive steps per sample.
+    """
+
+    def __init__(self, base_dataset: AutoregressiveLapDataloader, rollout_steps: int = 5):
+        self.base = base_dataset
+        self.rollout_steps = rollout_steps
+        self.context_window = base_dataset.context_window
+        self.numeric_columns = base_dataset.numeric_columns
+        self.compound_columns = base_dataset.compound_columns
+        self.device = base_dataset.device
+        self.normalizer = base_dataset.normalizer
+        self.sequences = self._generate_sequences()
+        logger.info(
+            f"AutoregressiveRolloutDataset: {len(self.sequences)} sequences "
+            f"(context_window={self.context_window}, rollout_steps={rollout_steps})"
+        )
+
+    def _generate_sequences(self) -> List[Dict]:
+        """Generate sliding-window rollout sequences from driver-race groups."""
+        sequences = []
+        data = self.base.data
+        normal_laps = data[data['is_normal_lap'] == 1].copy()
+        grouped = normal_laps.groupby(['Driver', 'Year', 'Circuit'])
+
+        total_needed = self.context_window + self.rollout_steps
+        for (driver, year, circuit), group_data in grouped:
+            group_data = group_data.sort_values('LapNumber')
+            if len(group_data) < total_needed:
+                continue
+
+            indices = group_data.index.tolist()
+            for start in range(len(indices) - total_needed + 1):
+                ctx_indices = indices[start:start + self.context_window]
+                tgt_indices = indices[start + self.context_window:start + total_needed]
+                sequences.append({
+                    'context_indices': ctx_indices,
+                    'target_indices': tgt_indices,
+                    'driver': int(driver),
+                    'year': int(year),
+                    'circuit': int(circuit),
+                })
+        return sequences
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int):
+        seq = self.sequences[idx]
+
+        context_laps = self.base.data.loc[seq['context_indices']].copy()
+        target_laps = self.base.data.loc[seq['target_indices']].copy()
+
+        # Normalize
+        if self.normalizer is not None:
+            context_laps = self.normalizer.transform(context_laps)
+            target_laps = self.normalizer.transform(target_laps)
+
+        # Extract context features
+        context_features = []
+        for _, lap in context_laps.iterrows():
+            feat = self.base._get_lap_features(lap)
+            context_features.append(feat)
+        context_array = np.array(context_features, dtype=np.float32)
+
+        # Pad context if needed
+        if len(context_array) < self.context_window:
+            padding = np.zeros(
+                (self.context_window - len(context_array), context_array.shape[1]),
+                dtype=np.float32,
+            )
+            context_array = np.vstack([padding, context_array])
+
+        # Extract target data for all rollout steps
+        target_laptimes = target_laps['LapTime'].values.astype(np.float32)
+        if 'is_pitlap' in target_laps.columns:
+            target_pitlaps = target_laps['is_pitlap'].values.astype(np.int64)
+        else:
+            target_pitlaps = np.zeros(len(target_laps), dtype=np.int64)
+
+        compound_indices = []
+        for _, lap in target_laps.iterrows():
+            comp_vals = lap[self.compound_columns].values.astype(np.int32)
+            if comp_vals.sum() == 0:
+                compound_indices.append(len(self.compound_columns) - 1)
+            else:
+                compound_indices.append(int(np.argmax(comp_vals)))
+        compound_indices = np.array(compound_indices, dtype=np.int64)
+
+        # Replace NaN
+        np.nan_to_num(context_array, copy=False, nan=0.0)
+        np.nan_to_num(target_laptimes, copy=False, nan=0.0)
+
+        context_tensor = torch.from_numpy(context_array).to(self.device)
+        target_dict = {
+            'lap_time': torch.from_numpy(target_laptimes).to(self.device),
+            'is_pitlap': torch.from_numpy(target_pitlaps).to(self.device),
+            'compound': torch.from_numpy(compound_indices).to(self.device),
+        }
+
+        metadata = {
+            'driver': seq['driver'],
+            'year': seq['year'],
+            'circuit': seq['circuit'],
+            'context_length': len(context_features),
+        }
+
+        return context_tensor, target_dict, metadata

@@ -506,6 +506,205 @@ class Trainer:
             'pit_loss': avg_pit_loss,
             'compound_loss': avg_comp_loss,
         }
+
+    def train_epoch_rollout(
+        self,
+        rollout_loader: DataLoader,
+        epoch: int = 0,
+    ) -> Dict[str, float]:
+        """
+        Train for one epoch using multi-step autoregressive rollout.
+
+        For each batch the model encodes the context window and then runs the
+        decoder for ``rollout_steps`` with ``teacher_forcing=False``, feeding
+        predicted lap times back as decoder input.  Loss is computed at every
+        rollout step and backpropagated through the unrolled sequence.
+
+        Parameters
+        ----------
+        rollout_loader : DataLoader
+            DataLoader wrapping an ``AutoregressiveRolloutDataset``.
+        epoch : int
+            Epoch number (for logging).
+
+        Returns
+        -------
+        dict
+            Average total and component losses for the epoch.
+        """
+        self.model.train()
+        total_loss = 0.0
+        total_lap_loss = 0.0
+        total_pit_loss = 0.0
+        total_comp_loss = 0.0
+        num_batches = 0
+
+        progress = tqdm(
+            enumerate(rollout_loader),
+            total=len(rollout_loader),
+            desc=f"Epoch {epoch + 1} [rollout]",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not self._show_progress,
+        )
+
+        for batch_idx, batch in progress:
+            encoder_input, targets, metadata = batch[0], batch[1], batch[2]
+
+            # --- encoder input to device ---
+            if isinstance(encoder_input, dict):
+                for k, v in encoder_input.items():
+                    if isinstance(v, torch.Tensor):
+                        encoder_input[k] = v.to(self.device)
+            else:
+                encoder_input = encoder_input.to(self.device)
+
+            # --- targets to device ---
+            if isinstance(targets, dict):
+                for k, v in list(targets.items()):
+                    if isinstance(v, torch.Tensor):
+                        targets[k] = v.to(self.device)
+            else:
+                targets = targets.to(self.device)
+
+            lap_t = targets['lap_time'] if isinstance(targets, dict) else targets
+            # lap_t shape: (batch, rollout_steps)
+            rollout_steps = lap_t.size(1)
+
+            # Construct decoder_input: (batch, rollout_steps, 1)
+            # Position 0 = last context LapTime (LapTime is feature index 0)
+            if isinstance(encoder_input, dict):
+                last_lt = encoder_input['numeric'][:, -1, 0]
+            else:
+                last_lt = encoder_input[:, -1, 0]
+
+            decoder_input = torch.zeros(
+                lap_t.size(0), rollout_steps, 1,
+                dtype=torch.float32, device=self.device,
+            )
+            decoder_input[:, 0, 0] = last_lt
+            # Fill remaining positions with ground truth (used only if TF is on)
+            if rollout_steps > 1:
+                decoder_input[:, 1:, 0] = lap_t[:, :-1]
+
+            # Forward pass — autoregressive (no teacher forcing)
+            with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+                outputs = self.model(
+                    encoder_input,
+                    decoder_input,
+                    teacher_forcing=False,
+                )
+
+            # --- Loss computation (same logic as train_epoch) ---
+            lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs  # (B, R, 1)
+            lap_t_rs = lap_t.unsqueeze(-1)  # (B, R, 1)
+
+            with torch.no_grad():
+                mask = torch.isfinite(lap_t_rs)
+            if mask.sum() == 0:
+                continue
+            if not torch.isfinite(lap_pred).all():
+                continue
+
+            denom = mask.float().sum()
+            if self.lap_loss_kind == 'huber':
+                diff = lap_pred - lap_t_rs
+                ad = diff.abs()
+                delta = self.lap_huber_delta
+                huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+                lap_loss = (huber * mask.float()).sum() / denom
+            else:
+                se = (lap_pred - lap_t_rs) ** 2
+                lap_loss = (se * mask.float()).sum() / denom
+
+            pit_loss = torch.tensor(0.0, device=self.device)
+            pit_t = targets.get('is_pitlap', None) if isinstance(targets, dict) else None
+            if pit_t is not None and 'pit_logits' in outputs:
+                pit_pred = outputs['pit_logits']  # (B, R)
+                bce = nn.BCEWithLogitsLoss(reduction='mean')
+                pit_loss = bce(pit_pred, pit_t.float())
+
+            comp_loss = torch.tensor(0.0, device=self.device)
+            comp_t = targets.get('compound', None) if isinstance(targets, dict) else None
+            if comp_t is not None and 'compound_logits' in outputs:
+                comp_pred = outputs['compound_logits']  # (B, R, C)
+                bsz, seq_len, C = comp_pred.shape
+                comp_pred_flat = comp_pred.reshape(bsz * seq_len, C)
+                comp_t_flat = comp_t.reshape(-1)
+                comp_weight = self._compound_class_weight_tensor
+                if comp_weight is not None:
+                    comp_weight = comp_weight.to(device=comp_pred_flat.device, dtype=torch.float32)
+                try:
+                    ce = nn.CrossEntropyLoss(weight=comp_weight, label_smoothing=self.compound_label_smoothing)
+                except TypeError:
+                    ce = nn.CrossEntropyLoss(weight=comp_weight)
+                with autocast(device_type='cuda', enabled=False):
+                    comp_loss = ce(comp_pred_flat.float(), comp_t_flat.long())
+
+            loss_batch = (
+                lap_loss
+                + float(self.pit_loss_weight) * pit_loss
+                + float(self.compound_loss_weight) * comp_loss
+            )
+
+            if not torch.isfinite(loss_batch):
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            loss_value = float(loss_batch.detach().item())
+            if loss_value > 1e3:
+                logger.debug(f"Skipping pathological rollout batch at epoch {epoch}, batch {batch_idx}: loss={loss_value:.6f}")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            loss = loss_batch / self.accumulation_steps
+
+            if self.use_mixed_precision:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (batch_idx + 1) % self.accumulation_steps == 0:
+                if self.use_mixed_precision:
+                    if self.gradient_clip is not None:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    if self.gradient_clip is not None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
+
+            total_loss += loss_value
+            total_lap_loss += float(lap_loss.detach().item())
+            total_pit_loss += float(pit_loss.detach().item())
+            total_comp_loss += float(comp_loss.detach().item())
+            num_batches += 1
+
+            if num_batches > 0:
+                progress.set_postfix({
+                    'r_loss': f"{(total_loss / num_batches):.4f}",
+                    'r_lap': f"{(total_lap_loss / num_batches):.4f}",
+                })
+
+        progress.close()
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_lap = total_lap_loss / num_batches if num_batches > 0 else 0.0
+        avg_pit = total_pit_loss / num_batches if num_batches > 0 else 0.0
+        avg_comp = total_comp_loss / num_batches if num_batches > 0 else 0.0
+        logger.info(
+            f"Epoch {epoch} - Rollout Loss: {avg_loss:.6f} "
+            f"(lap={avg_lap:.6f}, pit={avg_pit:.6f}, compound={avg_comp:.6f})"
+        )
+        return {
+            'loss': avg_loss,
+            'lap_loss': avg_lap,
+            'pit_loss': avg_pit,
+            'compound_loss': avg_comp,
+        }
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
         """
@@ -649,6 +848,9 @@ class Trainer:
         early_stopping_patience: int = 10,
         early_stopping_min_epochs: int = 0,
         teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
+        rollout_loader: Optional[DataLoader] = None,
+        rollout_weight: float = 1.0,
+        rollout_start_epoch: int = 0,
     ) -> Dict[str, Any]:
         """
         Train model for multiple epochs.
@@ -670,6 +872,18 @@ class Trainer:
         teacher_forcing_schedule : callable, optional
             Function that takes epoch number and returns teacher_forcing_ratio
             If None, uses constant 1.0
+        rollout_loader : DataLoader, optional
+            DataLoader wrapping an ``AutoregressiveRolloutDataset`` for
+            multi-step rollout training.  When provided, an additional
+            rollout training pass is run each epoch (after the single-step
+            pass) starting from ``rollout_start_epoch``.
+        rollout_weight : float
+            Multiplier applied to rollout loss before combining with
+            single-step loss for logging purposes.  The rollout pass runs
+            its own backward so this weight scales the loss magnitude.
+        rollout_start_epoch : int
+            First epoch at which rollout training is activated.  This lets
+            the model warm up with single-step training first.
         
         Returns
         -------
@@ -678,10 +892,19 @@ class Trainer:
         """
         if teacher_forcing_schedule is None:
             teacher_forcing_schedule = lambda epoch: 1.0
+
+        # Extend history keys for rollout tracking
+        if 'rollout_loss' not in self.history:
+            self.history['rollout_loss'] = []
         
         logger.info(f"Starting training for {num_epochs} epochs")
         logger.info(f"Model: {self.model.model_info()}")
         logger.info(f"Device: {self.device}")
+        if rollout_loader is not None:
+            logger.info(
+                f"Rollout training enabled: weight={rollout_weight}, "
+                f"start_epoch={rollout_start_epoch}"
+            )
         if self.early_stopping_use_ema:
             logger.info(f"Early stopping monitor: EMA(val_loss), alpha={self.early_stopping_ema_alpha:.2f}")
         else:
@@ -698,12 +921,19 @@ class Trainer:
             # Get teacher forcing ratio for this epoch
             tf_ratio = teacher_forcing_schedule(epoch)
             
-            # Train
+            # Train (single-step)
             train_stats = self.train_epoch(train_loader, epoch, tf_ratio)
             self.history['train_loss'].append(float(train_stats.get('loss', 0.0)))
             self.history['train_lap_loss'].append(float(train_stats.get('lap_loss', train_stats.get('loss', 0.0))))
             self.history['train_pit_loss'].append(float(train_stats.get('pit_loss', 0.0)))
             self.history['train_compound_loss'].append(float(train_stats.get('compound_loss', 0.0)))
+
+            # Rollout training pass (multi-step autoregressive)
+            rollout_loss_value = 0.0
+            if rollout_loader is not None and epoch >= rollout_start_epoch:
+                rollout_stats = self.train_epoch_rollout(rollout_loader, epoch)
+                rollout_loss_value = rollout_stats.get('loss', 0.0) * rollout_weight
+            self.history['rollout_loss'].append(rollout_loss_value)
             
             # Validate
             if val_loader is not None:

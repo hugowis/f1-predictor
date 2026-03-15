@@ -22,7 +22,7 @@ from analyze_results import analyze_results as run_analysis
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataloaders import StintDataloader
-from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
+from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader, AutoregressiveRolloutDataset
 from dataloaders.utils import get_compound_columns
 from models import Seq2Seq, Trainer, create_scheduler
 from config.base import Config, get_phase1_config, get_phase2_config
@@ -148,6 +148,15 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         if args.teacher_forcing_hold_epochs < 0:
             raise ValueError("--teacher-forcing-hold-epochs must be >= 0")
         config.training.teacher_forcing_hold_epochs = args.teacher_forcing_hold_epochs
+    # Rollout training overrides
+    if getattr(args, 'rollout_training', False):
+        config.training.rollout_training = True
+    if getattr(args, 'rollout_steps', None) is not None:
+        config.training.rollout_steps = args.rollout_steps
+    if getattr(args, 'rollout_weight', None) is not None:
+        config.training.rollout_weight = args.rollout_weight
+    if getattr(args, 'rollout_start_epoch', None) is not None:
+        config.training.rollout_start_epoch = args.rollout_start_epoch
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
@@ -523,6 +532,24 @@ def train(config: Config, output_dir: Path = None):
     
     # Training loop
     logger.info("\nStarting training...")
+
+    # Create rollout dataloader if rollout training is enabled
+    rollout_loader = None
+    if getattr(config.training, 'rollout_training', False) and getattr(config, 'use_autoregressive', False):
+        rollout_steps = getattr(config.training, 'rollout_steps', 5)
+        logger.info(f"Creating rollout dataset with {rollout_steps} steps...")
+        rollout_train_ds = AutoregressiveRolloutDataset(
+            base_dataset=train_loader.dataset,
+            rollout_steps=rollout_steps,
+        )
+        rollout_loader = DataLoader(
+            rollout_train_ds,
+            batch_size=config.training.batch_size,
+            shuffle=True,
+            num_workers=config.data.num_workers,
+            pin_memory=True,
+        )
+
     history = trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -530,6 +557,9 @@ def train(config: Config, output_dir: Path = None):
         early_stopping_patience=config.training.early_stopping_patience,
         early_stopping_min_epochs=getattr(config.training, 'early_stopping_min_epochs', 0),
         teacher_forcing_schedule=lambda epoch: teacher_forcing_schedule(epoch, config),
+        rollout_loader=rollout_loader,
+        rollout_weight=getattr(config.training, 'rollout_weight', 1.0),
+        rollout_start_epoch=getattr(config.training, 'rollout_start_epoch', 0),
     )
     
     # Save config and history
@@ -571,6 +601,11 @@ def main():
     parser.add_argument('--teacher-forcing-start', type=float, help='Start teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-end', type=float, help='End teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-hold-epochs', type=int, help='Number of epochs to hold start ratio before decaying (used with hold_then_decay)')
+    # Rollout training CLI options
+    parser.add_argument('--rollout-training', action='store_true', help='Enable multi-step rollout training (requires --autoregressive)')
+    parser.add_argument('--rollout-steps', type=int, help='Number of autoregressive rollout steps per sample (default: 5)')
+    parser.add_argument('--rollout-weight', type=float, help='Weight multiplier for rollout loss (default: 1.0)')
+    parser.add_argument('--rollout-start-epoch', type=int, help='Epoch at which to start rollout training (default: 0)')
     
     args = parser.parse_args()
     

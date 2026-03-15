@@ -72,13 +72,14 @@ Using normalization:
 """
 
 from .stint_dataloader import StintDataloader
-from .autoregressive_dataloader import AutoregressiveLapDataloader
+from .autoregressive_dataloader import AutoregressiveLapDataloader, AutoregressiveRolloutDataset
 from .normalization import LapTimeNormalizer
 from . import utils
 
 __all__ = [
     'StintDataloader',
     'AutoregressiveLapDataloader',
+    'AutoregressiveRolloutDataset',
     'LapTimeNormalizer',
     'utils',
 ]

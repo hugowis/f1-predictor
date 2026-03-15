@@ -4,31 +4,27 @@ This file tracks the next experimentation steps and development axes beyond the 
 
 ## Priority 1: High-Impact Modeling Experiments
 
-### P1.1 Loss weighting and auxiliary task balancing
+
+### P1.1 Rollout training (multi-step rollout loss)
+
+Status:
+- Rollout training is now implemented in the training pipeline and is activated automatically when running with `--autoregressive`.
+- This is now the top active Priority 1 experiment axis because the implementation exists and the remaining work is empirical tuning.
 
 Hypothesis:
-- Better balancing of lap/pit/compound losses can reduce large-error tails.
+- Multi-step rollout training (explicit rollout loss on predicted sequences) reduces compounding error and drift during long stints compared to single-step teacher-forced training.
 
 Tasks:
-- [x] Grid search `compound_loss_weight` in `{0.005, 0.01, 0.02, 0.05}`.
-- [x] Grid search `pit_loss_weight` in `{0.0, 1e-4, 5e-4, 1e-3}`.
-- [x] Compare dynamic aux scaling on vs off.
-- [x] Evaluate Huber lap loss with deltas `{0.05, 0.1, 0.2}`.
+- [x] Implement `AutoregressiveRolloutDataset` usage across runs and validate batching.
+- [ ] Sweep `rollout_steps` in `{3, 5, 10}` with 3 seeds each.
+- [ ] Sweep `rollout_weight` in `{0.1, 0.5, 1.0, 2.0}` to find stability sweet spot.
+- [ ] Test `rollout_start_epoch` at `{0, 5, 10}` to assess warm-up vs immediate rollout.
+- [ ] Compare runs with and without rollout on long-race stints (metrics per-lap index).
+- [ ] Combine rollout with teacher-forcing schedule variants (linear, exponential, hold_then_decay).
 
-Compound-loss Result:
-- Best setting remains `compound_loss_weight=0.01` (best-seed metrics: MAE `25.08` ms, RMSE `49.43` ms, Median AE `13.00` ms, Error < 50 ms `89.25%`).
-- Higher weights (`0.02`, `0.05`) degraded performance; `0.005` underperformed and showed higher seed variance.
+Success criteria:
+- Lower autoregressive error accumulation over long stints (reduced slope of error vs lap index) and improved late-race MAE/RMSE without destabilizing early-race predictions.
 
-Pit-loss sweep Result:
-- Best setting from the pit-weight grid search: `pit_loss_weight=1e-3` (best-seed metrics: MAE `21.66` ms, RMSE `41.24` ms, Median AE `12.11` ms, Error < 50 ms `91.14%`).
-- `5e-4` showed high seed variance (one good seed, two poor); `1e-4` underperformed relative to baseline `0.0`.
-
-Dynamic aux scaling Result:
-- Dynamic aux scaling ON performed best (best-seed metrics: MAE 21.66 ms, RMSE 41.24 ms, Median AE 12.11 ms, %<50ms 91.14%).
-- Dynamic aux scaling OFF showed high seed variance and unstable runs (best seed MAE 26.70 ms but two seeds had very large errors / poor validation), indicating the automatic balancing helps stability for this setup.
-
-Huber-loss Result:
-- Tested Huber lap loss with delta=0.05 (three seeds). Best seed (seed 456) produced MAE 37.31 ms, RMSE 69.64 ms, Median AE 18.91 ms, %<50ms 86.63 — substantially worse than the MSE baseline (MAE ~25.08 ms). Based on these runs, we will keep MSE as the primary lap loss.
 
 ### P1.2 Scheduled sampling and teacher forcing schedule
 
@@ -40,8 +36,8 @@ Tasks:
 - [x] Add a metric for autoregressive error accumulation on long stints/races.
 - [ ] Compare linear vs exponential teacher forcing decay.
 - [ ] Sweep end TF ratios and decay duration. 
-- [ ] Add a "hold then decay" schedule option.  epochs
-- [ ] Test several epochs numbers.
+- [ ] Validate `hold_then_decay` end-to-end and tune `teacher_forcing_hold_epochs`.
+- [ ] Test several total epoch counts.
 
 Success criteria:
 - Lower autoregressive error accumulation on long stints/races.
@@ -59,6 +55,18 @@ Tasks:
 
 Success criteria:
 - Improved late-race MAE/RMSE without worsening early-race accuracy.
+
+
+### P1.4 Loss weighting and auxiliary task balancing
+
+Hypothesis:
+- Better balancing of lap/pit/compound losses can reduce large-error tails.
+
+Tasks:
+- [ ] Grid search `compound_loss_weight` in `{0.005, 0.01, 0.02, 0.05}`.
+- [ ] Grid search `pit_loss_weight` in `{0.0, 1e-4, 5e-4, 1e-3}`.
+- [ ] Compare dynamic aux scaling on vs off.
+- [ ] Evaluate Huber lap loss with deltas `{0.05, 0.1, 0.2}`.
 
 ## Priority 2: Data and Feature Engineering Axis
 

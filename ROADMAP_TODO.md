@@ -36,19 +36,16 @@ Hypothesis:
 - Better schedule can improve autoregressive stability and reduce drift.
 
 Tasks:
+
+- [x] Add a metric for autoregressive error accumulation on long stints/races.
 - [ ] Compare linear vs exponential teacher forcing decay.
-- [ ] Sweep end TF ratios and decay duration.
-- [ ] Add a "hold then decay" schedule option.
-- [ ] Add a metric for autoregressive error accumulation on long stints/races.
-- [ ] Test several epochs numbers: 100, 150, 200
+- [ ] Sweep end TF ratios and decay duration. 
+- [ ] Add a "hold then decay" schedule option.  epochs
+- [ ] Test several epochs numbers.
 
 Success criteria:
 - Lower autoregressive error accumulation on long stints/races.
 
-TF-grid results (summary):
-- Hold epochs: `0` performed best overall; 
-- Decay type: `linear` and `exponential` produced comparable aggregate metrics when `hold=0`.
-- End ratio: varying `end` in {0.5, 0.3, 0.0} had minor impact for `hold=0` in these experiments.
 
 ### P1.3 Context window and sequence strategy
 

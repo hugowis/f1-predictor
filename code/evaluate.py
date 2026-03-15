@@ -23,6 +23,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dataloaders import StintDataloader, LapTimeNormalizer
 from dataloaders.utils import load_all_races
 from models import Seq2Seq, Evaluator, compute_regression_metrics, report_evaluation
+from models.rollout_evaluator import (
+    evaluate_autoregressive_rollout,
+    report_rollout_evaluation,
+    denormalize_rollout_metrics,
+)
 from config.base import Config
 
 # Setup logging
@@ -237,6 +242,76 @@ def _save_evaluation_artifacts(
     return results_path
 
 
+def _run_rollout_evaluation(
+    model,
+    test_years: list,
+    config_path: Path,
+    normalizer,
+    device: str,
+    output_dir: Path,
+):
+    """
+    Run autoregressive rollout evaluation and save results.
+
+    Creates an AutoregressiveLapDataloader for test years, rolls out the model
+    over full driver-race sequences, and computes error-accumulation metrics.
+    """
+    from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
+
+    config = Config.load(config_path) if config_path and config_path.exists() else None
+    context_window = config.data.context_window if config else 10
+    normalize = config.data.normalize if config else True
+    scaler_type = config.data.scaler_type if config else 'standard'
+
+    logger.info("\nRunning autoregressive rollout evaluation...")
+    import os
+    old_skip = os.environ.get('SKIP_PRECOMPUTE')
+    os.environ['SKIP_PRECOMPUTE'] = '1'  # skip precompute; we only need raw data
+    try:
+        test_ds = AutoregressiveLapDataloader(
+            year=test_years,
+            context_window=context_window,
+            normalize=normalize,
+            scaler_type=scaler_type,
+            normalizer=normalizer,
+            augment_prob=0.0,
+        )
+    finally:
+        if old_skip is None:
+            os.environ.pop('SKIP_PRECOMPUTE', None)
+        else:
+            os.environ['SKIP_PRECOMPUTE'] = old_skip
+
+    rollout_metrics = evaluate_autoregressive_rollout(
+        model=model,
+        test_dataset=test_ds,
+        device=device,
+    )
+
+    # Denormalize to ms
+    rollout_denorm = denormalize_rollout_metrics(rollout_metrics, normalizer)
+
+    # Save results
+    rollout_output = {
+        'rollout_metrics_normalized': rollout_metrics,
+    }
+    if rollout_denorm is not None:
+        rollout_output['rollout_metrics_ms'] = rollout_denorm
+
+    rollout_path = output_dir / "rollout_evaluation.json"
+    with open(rollout_path, 'w') as f:
+        json.dump(rollout_output, f, indent=2)
+    logger.info(f"Rollout metrics saved to {rollout_path}")
+
+    # Print report
+    report = report_rollout_evaluation(
+        metrics=rollout_metrics,
+        denorm_metrics=rollout_denorm,
+        save_path=str(output_dir / "rollout_report.txt"),
+    )
+    print("\n" + report)
+
+
 def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
     """
     Load model from checkpoint.
@@ -434,6 +509,19 @@ def evaluate(
     report = report_evaluation(metrics_denorm_full, save_path=report_path, unit_label="ms")
     print("\n" + report)
     
+    # --- Autoregressive rollout evaluation ---
+    try:
+        _run_rollout_evaluation(
+            model=model,
+            test_years=test_years,
+            config_path=config_path,
+            normalizer=normalizer,
+            device=device,
+            output_dir=output_dir,
+        )
+    except Exception as exc:
+        logger.warning(f"Rollout evaluation failed (non-fatal): {exc}")
+
     return metrics
 
 

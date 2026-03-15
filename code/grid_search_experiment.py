@@ -12,7 +12,7 @@ Teacher forcing schedule sweep:
     python code/grid_search_experiments.py \
       --search-root results/tf_schedule_grid \
       --grid teacher-forcing-decay=linear,exponential \
-      --grid teacher-forcing-hold-epochs=0,10,20 \
+      --grid teacher-forcing-hold-epochs=0,10,20,30 \
       --grid teacher-forcing-end=0.5,0.3,0.0 \
       --grid epochs=100,150,200 \
       --phase 2 \

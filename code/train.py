@@ -420,12 +420,17 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
         # Linear decay from start to end over effective total
         ratio = start - (start - end) * (eff_epoch / eff_total)
     elif decay_type == "exponential":
-        # Exponential decay over effective total
+        # Exponential decay over effective total.
+        # Guard against end=0 which makes the base 0 and collapses the ratio
+        # to 0 on the very first step.  Use a small epsilon as a floor for the
+        # base calculation so the curve decays smoothly; the result is then
+        # clamped down to the true `end` value.
         if start <= 0.0:
             ratio = end
         else:
-            decay = (end / start) ** (1.0 / eff_total)
-            ratio = start * (decay ** eff_epoch)
+            end_eff = max(end, 1e-6)
+            decay = (end_eff / start) ** (1.0 / eff_total)
+            ratio = max(start * (decay ** eff_epoch), end)
     else:
         # constant or unknown: return start
         ratio = start

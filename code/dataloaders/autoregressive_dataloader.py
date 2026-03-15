@@ -125,6 +125,7 @@ class AutoregressiveLapDataloader(Dataset):
         self.years = normalize_year_input(year)
         self.context_window = context_window
         self.augment_prob = augment_prob
+        self.scaler_type = scaler_type
         self.device = device
         self.data_path = data_path or Path("./data")
         # Cache file for precomputed contexts/targets
@@ -742,11 +743,229 @@ class AutoregressiveRolloutDataset(Dataset):
         self.compound_columns = base_dataset.compound_columns
         self.device = base_dataset.device
         self.normalizer = base_dataset.normalizer
+        self.years = list(getattr(base_dataset, 'years', []))
+        self.data_path = getattr(base_dataset, 'data_path', Path('./data'))
+        self.scaler_type = getattr(base_dataset, 'scaler_type', 'standard')
         self.sequences = self._generate_sequences()
+        self.cache_path = self._build_cache_path()
+        self._precomputed_contexts = [None] * len(self.sequences)
+        self._precomputed_targets = [None] * len(self.sequences)
+        self._precomputed_meta = [None] * len(self.sequences)
+        self._load_or_precompute_cache()
         logger.info(
             f"AutoregressiveRolloutDataset: {len(self.sequences)} sequences "
             f"(context_window={self.context_window}, rollout_steps={rollout_steps})"
         )
+
+    def _build_cache_path(self) -> Path:
+        cache_dir = Path(self.data_path) / 'precomputed'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        years_key = "_".join(map(str, sorted(self.years)))
+        cache_fname = (
+            f"ar_rollout_cache_{years_key}_cw{self.context_window}"
+            f"_rw{self.rollout_steps}_{self.scaler_type}.pt"
+        )
+        return cache_dir / cache_fname
+
+    def _load_cache(self) -> bool:
+        if not self.cache_path.exists():
+            return False
+
+        try:
+            logger.info(f"Loading rollout cache from {self.cache_path}...")
+
+            def _safe_torch_load(path: Path):
+                safe_globals = [
+                    np._core.multiarray.scalar,
+                    np._core.multiarray._reconstruct,
+                    np.ndarray,
+                    np.dtype,
+                ]
+                try:
+                    if hasattr(torch.serialization, 'add_safe_globals'):
+                        torch.serialization.add_safe_globals(safe_globals)
+                except Exception:
+                    pass
+
+                try:
+                    return torch.load(path, weights_only=True)
+                except Exception:
+                    pass
+
+                try:
+                    if hasattr(torch.serialization, 'safe_globals'):
+                        with torch.serialization.safe_globals(safe_globals):
+                            return torch.load(path, weights_only=True)
+                except Exception:
+                    pass
+
+                try:
+                    logger.info("Falling back to torch.load(weights_only=False) for trusted local rollout cache")
+                    return torch.load(path, weights_only=False)
+                except Exception:
+                    pass
+
+                import pickle
+                with open(path, 'rb') as file_handle:
+                    return pickle.load(file_handle)
+
+            cached = _safe_torch_load(self.cache_path)
+            valid = (
+                cached.get('years') == self.years and
+                cached.get('context_window') == self.context_window and
+                cached.get('rollout_steps') == self.rollout_steps and
+                cached.get('scaler_type') == self.scaler_type and
+                cached.get('numeric_columns') == self.numeric_columns
+            )
+            if not valid:
+                logger.info("Rollout cache file did not match current configuration; ignoring cache.")
+                return False
+
+            loaded_contexts = []
+            for context in cached.get('contexts', []):
+                if context is None:
+                    loaded_contexts.append(None)
+                elif isinstance(context, torch.Tensor):
+                    loaded_contexts.append(context)
+                elif isinstance(context, np.ndarray):
+                    loaded_contexts.append(torch.from_numpy(context))
+                else:
+                    loaded_contexts.append(torch.tensor(context, dtype=torch.float32))
+
+            loaded_targets = []
+            for target in cached.get('targets', []):
+                if target is None:
+                    loaded_targets.append(None)
+                    continue
+                loaded_targets.append({
+                    'lap_time': torch.tensor(target['lap_time'], dtype=torch.float32),
+                    'is_pitlap': torch.tensor(target['is_pitlap'], dtype=torch.long),
+                    'compound': torch.tensor(target['compound'], dtype=torch.long),
+                })
+
+            self._precomputed_contexts = loaded_contexts
+            self._precomputed_targets = loaded_targets
+            self._precomputed_meta = cached.get('meta', self._precomputed_meta)
+            logger.info(f"Loaded {len(self._precomputed_contexts)} cached rollout contexts")
+            return True
+        except Exception:
+            logger.exception("Failed to load rollout cache; will recompute rollout tensors.")
+            return False
+
+    def _save_cache(self) -> None:
+        try:
+            logger.info(f"Saving rollout cache to {self.cache_path} ...")
+            contexts_np = []
+            for context in self._precomputed_contexts:
+                if context is None:
+                    contexts_np.append(None)
+                elif isinstance(context, torch.Tensor):
+                    contexts_np.append(context.cpu().numpy().tolist())
+                elif isinstance(context, np.ndarray):
+                    contexts_np.append(context.tolist())
+                else:
+                    contexts_np.append(np.array(context).tolist())
+
+            targets_primitives = []
+            for target in self._precomputed_targets:
+                if target is None:
+                    targets_primitives.append(None)
+                    continue
+                targets_primitives.append({
+                    'lap_time': target['lap_time'].cpu().numpy().tolist() if isinstance(target['lap_time'], torch.Tensor) else target['lap_time'],
+                    'is_pitlap': target['is_pitlap'].cpu().numpy().tolist() if isinstance(target['is_pitlap'], torch.Tensor) else target['is_pitlap'],
+                    'compound': target['compound'].cpu().numpy().tolist() if isinstance(target['compound'], torch.Tensor) else target['compound'],
+                })
+
+            meta_primitives = []
+            for meta in self._precomputed_meta:
+                if meta is None:
+                    meta_primitives.append(None)
+                    continue
+                meta_primitives.append({
+                    'driver': int(meta.get('driver', 0)),
+                    'year': int(meta.get('year', 0)),
+                    'circuit': int(meta.get('circuit', 0)),
+                    'context_length': int(meta.get('context_length', 0)),
+                })
+
+            torch.save({
+                'years': self.years,
+                'context_window': self.context_window,
+                'rollout_steps': self.rollout_steps,
+                'scaler_type': self.scaler_type,
+                'numeric_columns': self.numeric_columns,
+                'contexts': contexts_np,
+                'targets': targets_primitives,
+                'meta': meta_primitives,
+            }, self.cache_path)
+            logger.info(f"Rollout cache saved to {self.cache_path}")
+        except Exception:
+            logger.exception("Failed to save rollout cache")
+
+    def _load_or_precompute_cache(self) -> None:
+        if os.environ.get('SKIP_PRECOMPUTE') == '1':
+            logger.info("SKIP_PRECOMPUTE=1: skipping rollout precompute cache")
+            return
+
+        if self._load_cache():
+            return
+
+        logger.info(f"Precomputing rollout tensors for all {len(self.sequences)} sequences...")
+        for idx in tqdm(range(len(self.sequences)), desc="Precomputing rollouts", unit="seq"):
+            seq = self.sequences[idx]
+            context_laps = self.base.data.loc[seq['context_indices']].copy()
+            target_laps = self.base.data.loc[seq['target_indices']].copy()
+
+            if self.normalizer is not None:
+                context_laps = self.normalizer.transform(context_laps)
+                target_laps = self.normalizer.transform(target_laps)
+
+            context_features = []
+            for _, lap in context_laps.iterrows():
+                context_features.append(self.base._get_lap_features(lap))
+            context_array = np.array(context_features, dtype=np.float32)
+
+            if len(context_array) < self.context_window:
+                padding = np.zeros(
+                    (self.context_window - len(context_array), context_array.shape[1]),
+                    dtype=np.float32,
+                )
+                context_array = np.vstack([padding, context_array])
+
+            target_laptimes = target_laps['LapTime'].values.astype(np.float32)
+            if 'is_pitlap' in target_laps.columns:
+                target_pitlaps = target_laps['is_pitlap'].values.astype(np.int64)
+            else:
+                target_pitlaps = np.zeros(len(target_laps), dtype=np.int64)
+
+            compound_indices = []
+            for _, lap in target_laps.iterrows():
+                comp_vals = lap[self.compound_columns].values.astype(np.int32)
+                if comp_vals.sum() == 0:
+                    compound_indices.append(len(self.compound_columns) - 1)
+                else:
+                    compound_indices.append(int(np.argmax(comp_vals)))
+            compound_indices = np.array(compound_indices, dtype=np.int64)
+
+            np.nan_to_num(context_array, copy=False, nan=0.0)
+            np.nan_to_num(target_laptimes, copy=False, nan=0.0)
+
+            self._precomputed_contexts[idx] = torch.from_numpy(context_array)
+            self._precomputed_targets[idx] = {
+                'lap_time': torch.from_numpy(target_laptimes),
+                'is_pitlap': torch.from_numpy(target_pitlaps),
+                'compound': torch.from_numpy(compound_indices),
+            }
+            self._precomputed_meta[idx] = {
+                'driver': seq['driver'],
+                'year': seq['year'],
+                'circuit': seq['circuit'],
+                'context_length': len(context_features),
+            }
+
+        logger.info(f"Precomputed all {len(self.sequences)} rollout tensors in RAM")
+        self._save_cache()
 
     def _generate_sequences(self) -> List[Dict]:
         """Generate sliding-window rollout sequences from driver-race groups."""
@@ -778,6 +997,15 @@ class AutoregressiveRolloutDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx: int):
+        if idx < len(self._precomputed_contexts) and self._precomputed_contexts[idx] is not None:
+            context_tensor = self._precomputed_contexts[idx].clone().to(self.device)
+            target_dict = {
+                key: (value.clone().to(self.device) if isinstance(value, torch.Tensor) else value)
+                for key, value in self._precomputed_targets[idx].items()
+            }
+            metadata = self._precomputed_meta[idx]
+            return context_tensor, target_dict, metadata
+
         seq = self.sequences[idx]
 
         context_laps = self.base.data.loc[seq['context_indices']].copy()

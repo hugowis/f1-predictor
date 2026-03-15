@@ -19,8 +19,6 @@ Tasks:
 - [ ] Sweep `rollout_steps` in `{3, 5, 10}` with 3 seeds each.
 - [ ] Sweep `rollout_weight` in `{0.1, 0.5, 1.0, 2.0}` to find stability sweet spot.
 - [ ] Test `rollout_start_epoch` at `{0, 5, 10}` to assess warm-up vs immediate rollout.
-- [ ] Compare runs with and without rollout on long-race stints (metrics per-lap index).
-- [ ] Combine rollout with teacher-forcing schedule variants (linear, exponential, hold_then_decay).
 
 Success criteria:
 - Lower autoregressive error accumulation over long stints (reduced slope of error vs lap index) and improved late-race MAE/RMSE without destabilizing early-race predictions.

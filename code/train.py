@@ -104,6 +104,9 @@ def _run_dataset_normalizer_consistency_check(train_loader: DataLoader):
 
 def _apply_cli_overrides(config: Config, args: argparse.Namespace):
     """Apply CLI-provided configuration overrides in one place."""
+    if getattr(args, 'autoregressive', False):
+        config.training.rollout_training = True
+
     if args.device:
         config.device = args.device
 
@@ -148,9 +151,6 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         if args.teacher_forcing_hold_epochs < 0:
             raise ValueError("--teacher-forcing-hold-epochs must be >= 0")
         config.training.teacher_forcing_hold_epochs = args.teacher_forcing_hold_epochs
-    # Rollout training overrides
-    if getattr(args, 'rollout_training', False):
-        config.training.rollout_training = True
     if getattr(args, 'rollout_steps', None) is not None:
         config.training.rollout_steps = args.rollout_steps
     if getattr(args, 'rollout_weight', None) is not None:
@@ -392,7 +392,7 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
     """
     Compute teacher forcing ratio for an epoch.
     
-    Supports linear and exponential decay.
+    Supports constant, linear, exponential, and hold-then-decay schedules.
     
     Parameters
     ----------
@@ -425,7 +425,7 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
     eff_epoch = epoch - hold_epochs
     eff_total = max(1, total_epochs - hold_epochs)
 
-    if decay_type == "linear":
+    if decay_type in ("linear", "hold_then_decay"):
         # Linear decay from start to end over effective total
         ratio = start - (start - end) * (eff_epoch / eff_total)
     elif decay_type == "exponential":
@@ -466,6 +466,9 @@ def train(config: Config, output_dir: Path = None):
     if output_dir is None:
         output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if getattr(config, 'use_autoregressive', False):
+        config.training.rollout_training = True
     
     # Set random seed for full reproducibility
     _set_global_seed(config.seed)
@@ -533,9 +536,9 @@ def train(config: Config, output_dir: Path = None):
     # Training loop
     logger.info("\nStarting training...")
 
-    # Create rollout dataloader if rollout training is enabled
+    # Rollout training is always enabled in autoregressive mode.
     rollout_loader = None
-    if getattr(config.training, 'rollout_training', False) and getattr(config, 'use_autoregressive', False):
+    if getattr(config, 'use_autoregressive', False):
         rollout_steps = getattr(config.training, 'rollout_steps', 5)
         logger.info(f"Creating rollout dataset with {rollout_steps} steps...")
         rollout_train_ds = AutoregressiveRolloutDataset(
@@ -585,7 +588,7 @@ def main():
     parser.add_argument('--config', type=Path, help='Path to config JSON file')
     parser.add_argument('--device', default='cuda', help='Device to use (cuda or cpu)')
     parser.add_argument('--output', type=Path, help='Output directory for results')
-    parser.add_argument('--autoregressive', action='store_true', help='Use autoregressive lap-by-lap dataloader')
+    parser.add_argument('--autoregressive', action='store_true', help='Use autoregressive lap-by-lap dataloader and enable rollout training')
     parser.add_argument('--decoder-type', choices=['gru', 'lstm'], help='Decoder type to use (overrides config)')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
@@ -601,8 +604,6 @@ def main():
     parser.add_argument('--teacher-forcing-start', type=float, help='Start teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-end', type=float, help='End teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-hold-epochs', type=int, help='Number of epochs to hold start ratio before decaying (used with hold_then_decay)')
-    # Rollout training CLI options
-    parser.add_argument('--rollout-training', action='store_true', help='Enable multi-step rollout training (requires --autoregressive)')
     parser.add_argument('--rollout-steps', type=int, help='Number of autoregressive rollout steps per sample (default: 5)')
     parser.add_argument('--rollout-weight', type=float, help='Weight multiplier for rollout loss (default: 1.0)')
     parser.add_argument('--rollout-start-epoch', type=int, help='Epoch at which to start rollout training (default: 0)')

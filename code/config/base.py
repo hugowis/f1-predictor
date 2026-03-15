@@ -87,7 +87,7 @@ class TrainingConfig:
     # Teacher forcing schedule
     teacher_forcing_start: float = 1.0  # Start with full teacher forcing
     teacher_forcing_end: float = 0.5    # End with 50%
-    teacher_forcing_decay: str = "linear"  # "linear", "exponential"
+    teacher_forcing_decay: str = "linear"  # "linear", "exponential", "hold_then_decay", "constant"
     # Hold then decay settings: number of epochs to keep `teacher_forcing_start` before decaying
     teacher_forcing_hold_epochs: int = 0
     

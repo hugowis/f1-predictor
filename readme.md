@@ -7,7 +7,7 @@ Deep learning project to predict next-lap F1 race pace from historical lap, weat
 - Seq2Seq recurrent models (GRU/LSTM) for lap-time forecasting.
 - Two training modes:
   - Phase 1: stint-based supervised forecasting.
-  - Phase 2: autoregressive full-race forecasting with auxiliary pit/compound heads.
+  - Phase 2: autoregressive full-race forecasting with auxiliary pit/compound heads and rollout training.
 - End-to-end pipeline:
   - data download, cleaning, training, evaluation, and analysis plots/reports.
 - Built-in safeguards:

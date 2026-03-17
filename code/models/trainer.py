@@ -511,6 +511,7 @@ class Trainer:
         self,
         rollout_loader: DataLoader,
         epoch: int = 0,
+        rollout_weight: float = 1.0,
     ) -> Dict[str, float]:
         """
         Train for one epoch using multi-step autoregressive rollout.
@@ -645,7 +646,7 @@ class Trainer:
                 lap_loss
                 + float(self.pit_loss_weight) * pit_loss
                 + float(self.compound_loss_weight) * comp_loss
-            )
+            ) * rollout_weight
 
             if not torch.isfinite(loss_batch):
                 self.optimizer.zero_grad(set_to_none=True)
@@ -931,8 +932,8 @@ class Trainer:
             # Rollout training pass (multi-step autoregressive)
             rollout_loss_value = 0.0
             if rollout_loader is not None and epoch >= rollout_start_epoch:
-                rollout_stats = self.train_epoch_rollout(rollout_loader, epoch)
-                rollout_loss_value = rollout_stats.get('loss', 0.0) * rollout_weight
+                rollout_stats = self.train_epoch_rollout(rollout_loader, epoch, rollout_weight)
+                rollout_loss_value = rollout_stats.get('loss', 0.0)
             self.history['rollout_loss'].append(rollout_loss_value)
             
             # Validate

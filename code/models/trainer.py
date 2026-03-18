@@ -512,14 +512,22 @@ class Trainer:
         rollout_loader: DataLoader,
         epoch: int = 0,
         rollout_weight: float = 1.0,
+        teacher_forcing_ratio: float = 0.0,
+        current_rollout_steps: Optional[int] = None,
     ) -> Dict[str, float]:
         """
         Train for one epoch using multi-step autoregressive rollout.
 
-        For each batch the model encodes the context window and then runs the
-        decoder for ``rollout_steps`` with ``teacher_forcing=False``, feeding
-        predicted lap times back as decoder input.  Loss is computed at every
-        rollout step and backpropagated through the unrolled sequence.
+        Supports *scheduled sampling*: when ``teacher_forcing_ratio > 0`` the
+        decoder uses ground-truth lap times as input with the given probability
+        at each step, decaying towards fully autoregressive over training.  The
+        default (``teacher_forcing_ratio=0``) preserves the original fully
+        autoregressive behaviour.
+
+        Supports *curriculum rollout*: ``current_rollout_steps`` limits how
+        many future steps are unrolled this epoch.  When ``None`` the full
+        horizon stored in the dataset is used.  The caller should gradually
+        increase this from 1 to ``rollout_steps`` over the warm-up period.
 
         Parameters
         ----------
@@ -527,6 +535,15 @@ class Trainer:
             DataLoader wrapping an ``AutoregressiveRolloutDataset``.
         epoch : int
             Epoch number (for logging).
+        rollout_weight : float
+            Scalar multiplier applied to the total rollout loss before
+            backpropagation.
+        teacher_forcing_ratio : float
+            Probability (0–1) of using ground-truth decoder input at each
+            rollout step (scheduled sampling).  0.0 = fully autoregressive.
+        current_rollout_steps : int or None
+            Curriculum horizon: truncate each rollout sequence to at most this
+            many future steps.  ``None`` means use all steps in the batch.
 
         Returns
         -------
@@ -540,10 +557,14 @@ class Trainer:
         total_comp_loss = 0.0
         num_batches = 0
 
+        # Clamp scheduled-sampling ratio to valid range
+        tf_ratio = float(np.clip(teacher_forcing_ratio, 0.0, 1.0))
+        use_tf = tf_ratio > 0.0
+
         progress = tqdm(
             enumerate(rollout_loader),
             total=len(rollout_loader),
-            desc=f"Epoch {epoch + 1} [rollout]",
+            desc=f"Epoch {epoch + 1} [rollout tf={tf_ratio:.2f}]",
             leave=False,
             dynamic_ncols=True,
             disable=not self._show_progress,
@@ -569,10 +590,16 @@ class Trainer:
                 targets = targets.to(self.device)
 
             lap_t = targets['lap_time'] if isinstance(targets, dict) else targets
-            # lap_t shape: (batch, rollout_steps)
-            rollout_steps = lap_t.size(1)
+            # lap_t shape: (batch, max_rollout_steps)
+            max_steps = lap_t.size(1)
 
-            # Construct decoder_input: (batch, rollout_steps, 1)
+            # --- Curriculum: clamp to current_rollout_steps ---
+            active_steps = max_steps
+            if current_rollout_steps is not None:
+                active_steps = max(1, min(int(current_rollout_steps), max_steps))
+            lap_t = lap_t[:, :active_steps]
+
+            # Construct decoder_input: (batch, active_steps, 1)
             # Position 0 = last context LapTime (LapTime is feature index 0)
             if isinstance(encoder_input, dict):
                 last_lt = encoder_input['numeric'][:, -1, 0]
@@ -580,25 +607,29 @@ class Trainer:
                 last_lt = encoder_input[:, -1, 0]
 
             decoder_input = torch.zeros(
-                lap_t.size(0), rollout_steps, 1,
+                lap_t.size(0), active_steps, 1,
                 dtype=torch.float32, device=self.device,
             )
             decoder_input[:, 0, 0] = last_lt
-            # Fill remaining positions with ground truth (used only if TF is on)
-            if rollout_steps > 1:
+            # Fill remaining positions with ground truth — used by the model
+            # when teacher_forcing=True with the scheduled sampling ratio.
+            if active_steps > 1:
                 decoder_input[:, 1:, 0] = lap_t[:, :-1]
 
-            # Forward pass — autoregressive (no teacher forcing)
+            # Forward pass — scheduled sampling: use teacher forcing at the
+            # given ratio so the decoder gradually transitions from
+            # teacher-forced to fully autoregressive.
             with autocast(device_type='cuda', enabled=self.use_mixed_precision):
                 outputs = self.model(
                     encoder_input,
                     decoder_input,
-                    teacher_forcing=False,
+                    teacher_forcing=use_tf,
+                    teacher_forcing_ratio=tf_ratio,
                 )
 
             # --- Loss computation (same logic as train_epoch) ---
-            lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs  # (B, R, 1)
-            lap_t_rs = lap_t.unsqueeze(-1)  # (B, R, 1)
+            lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs  # (B, S, 1)
+            lap_t_rs = lap_t.unsqueeze(-1)  # (B, S, 1)
 
             with torch.no_grad():
                 mask = torch.isfinite(lap_t_rs)
@@ -621,17 +652,21 @@ class Trainer:
             pit_loss = torch.tensor(0.0, device=self.device)
             pit_t = targets.get('is_pitlap', None) if isinstance(targets, dict) else None
             if pit_t is not None and 'pit_logits' in outputs:
-                pit_pred = outputs['pit_logits']  # (B, R)
+                pit_pred = outputs['pit_logits']  # (B, S)
+                # Align pit target to active steps
+                pit_t_active = pit_t[:, :active_steps] if pit_t.dim() > 1 else pit_t
                 bce = nn.BCEWithLogitsLoss(reduction='mean')
-                pit_loss = bce(pit_pred, pit_t.float())
+                pit_loss = bce(pit_pred, pit_t_active.float())
 
             comp_loss = torch.tensor(0.0, device=self.device)
             comp_t = targets.get('compound', None) if isinstance(targets, dict) else None
             if comp_t is not None and 'compound_logits' in outputs:
-                comp_pred = outputs['compound_logits']  # (B, R, C)
+                comp_pred = outputs['compound_logits']  # (B, S, C)
                 bsz, seq_len, C = comp_pred.shape
                 comp_pred_flat = comp_pred.reshape(bsz * seq_len, C)
-                comp_t_flat = comp_t.reshape(-1)
+                # Align compound target to active steps
+                comp_t_active = comp_t[:, :active_steps] if comp_t.dim() > 1 else comp_t
+                comp_t_flat = comp_t_active.reshape(-1)
                 comp_weight = self._compound_class_weight_tensor
                 if comp_weight is not None:
                     comp_weight = comp_weight.to(device=comp_pred_flat.device, dtype=torch.float32)
@@ -698,13 +733,15 @@ class Trainer:
         avg_comp = total_comp_loss / num_batches if num_batches > 0 else 0.0
         logger.info(
             f"Epoch {epoch} - Rollout Loss: {avg_loss:.6f} "
-            f"(lap={avg_lap:.6f}, pit={avg_pit:.6f}, compound={avg_comp:.6f})"
+            f"(lap={avg_lap:.6f}, pit={avg_pit:.6f}, compound={avg_comp:.6f}, "
+            f"tf={tf_ratio:.2f}, steps={active_steps})"
         )
         return {
             'loss': avg_loss,
             'lap_loss': avg_lap,
             'pit_loss': avg_pit,
             'compound_loss': avg_comp,
+            'active_steps': active_steps,
         }
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
@@ -852,6 +889,8 @@ class Trainer:
         rollout_loader: Optional[DataLoader] = None,
         rollout_weight: float = 1.0,
         rollout_start_epoch: int = 0,
+        rollout_teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
+        rollout_curriculum_steps_schedule: Optional[Callable[[int], int]] = None,
     ) -> Dict[str, Any]:
         """
         Train model for multiple epochs.
@@ -872,7 +911,7 @@ class Trainer:
             triggering early stopping before training has stabilised.
         teacher_forcing_schedule : callable, optional
             Function that takes epoch number and returns teacher_forcing_ratio
-            If None, uses constant 1.0
+            for the *single-step* training pass.  If None, uses constant 1.0.
         rollout_loader : DataLoader, optional
             DataLoader wrapping an ``AutoregressiveRolloutDataset`` for
             multi-step rollout training.  When provided, an additional
@@ -885,6 +924,16 @@ class Trainer:
         rollout_start_epoch : int
             First epoch at which rollout training is activated.  This lets
             the model warm up with single-step training first.
+        rollout_teacher_forcing_schedule : callable, optional
+            Function ``epoch -> float`` returning the teacher-forcing ratio to
+            use *inside* the rollout decoder (scheduled sampling).  A value
+            of 1.0 means fully teacher-forced; 0.0 means fully autoregressive.
+            When ``None`` defaults to 0.0 (backward-compatible).
+        rollout_curriculum_steps_schedule : callable, optional
+            Function ``epoch -> int`` returning the active rollout horizon for
+            this epoch (curriculum learning).  Allows starting with a short
+            horizon (e.g. 1 step) and gradually increasing to ``rollout_steps``.
+            When ``None`` the full horizon stored in the dataset is always used.
         
         Returns
         -------
@@ -893,10 +942,18 @@ class Trainer:
         """
         if teacher_forcing_schedule is None:
             teacher_forcing_schedule = lambda epoch: 1.0
+        if rollout_teacher_forcing_schedule is None:
+            rollout_teacher_forcing_schedule = lambda epoch: 0.0
+        if rollout_curriculum_steps_schedule is None:
+            rollout_curriculum_steps_schedule = lambda epoch: None
 
         # Extend history keys for rollout tracking
         if 'rollout_loss' not in self.history:
             self.history['rollout_loss'] = []
+        if 'rollout_teacher_forcing' not in self.history:
+            self.history['rollout_teacher_forcing'] = []
+        if 'rollout_curriculum_steps' not in self.history:
+            self.history['rollout_curriculum_steps'] = []
         
         logger.info(f"Starting training for {num_epochs} epochs")
         logger.info(f"Model: {self.model.model_info()}")
@@ -904,7 +961,8 @@ class Trainer:
         if rollout_loader is not None:
             logger.info(
                 f"Rollout training enabled: weight={rollout_weight}, "
-                f"start_epoch={rollout_start_epoch}"
+                f"start_epoch={rollout_start_epoch}, "
+                f"scheduled_sampling=True, curriculum=True"
             )
         if self.early_stopping_use_ema:
             logger.info(f"Early stopping monitor: EMA(val_loss), alpha={self.early_stopping_ema_alpha:.2f}")
@@ -929,12 +987,26 @@ class Trainer:
             self.history['train_pit_loss'].append(float(train_stats.get('pit_loss', 0.0)))
             self.history['train_compound_loss'].append(float(train_stats.get('compound_loss', 0.0)))
 
-            # Rollout training pass (multi-step autoregressive)
+            # Rollout training pass (multi-step autoregressive with scheduled sampling)
             rollout_loss_value = 0.0
+            rollout_tf_value = 0.0
+            rollout_steps_value = 0
             if rollout_loader is not None and epoch >= rollout_start_epoch:
-                rollout_stats = self.train_epoch_rollout(rollout_loader, epoch, rollout_weight)
+                rollout_tf = rollout_teacher_forcing_schedule(epoch)
+                cur_steps = rollout_curriculum_steps_schedule(epoch)
+                rollout_stats = self.train_epoch_rollout(
+                    rollout_loader,
+                    epoch,
+                    rollout_weight,
+                    teacher_forcing_ratio=rollout_tf,
+                    current_rollout_steps=cur_steps,
+                )
                 rollout_loss_value = rollout_stats.get('loss', 0.0)
+                rollout_tf_value = rollout_tf
+                rollout_steps_value = rollout_stats.get('active_steps', cur_steps if cur_steps is not None else 0)
             self.history['rollout_loss'].append(rollout_loss_value)
+            self.history['rollout_teacher_forcing'].append(rollout_tf_value)
+            self.history['rollout_curriculum_steps'].append(rollout_steps_value)
             
             # Validate
             if val_loader is not None:
@@ -975,10 +1047,12 @@ class Trainer:
 
                 elapsed = time.perf_counter() - epoch_start
                 logger.info(
-                    "Epoch %d/%d | tf=%.3f | lr=%.2e | train=%.6f | val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
+                    "Epoch %d/%d | tf=%.3f | r_tf=%.3f | r_steps=%s | lr=%.2e | train=%.6f | val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
                     epoch + 1,
                     num_epochs,
                     tf_ratio,
+                    rollout_tf_value,
+                    str(rollout_steps_value) if rollout_steps_value else "-",
                     current_lr,
                     train_stats.get('loss', float('nan')),
                     val_loss,
@@ -989,10 +1063,12 @@ class Trainer:
             else:
                 elapsed = time.perf_counter() - epoch_start
                 logger.info(
-                    "Epoch %d/%d | tf=%.3f | lr=%.2e | train=%.6f | time=%.1fs",
+                    "Epoch %d/%d | tf=%.3f | r_tf=%.3f | r_steps=%s | lr=%.2e | train=%.6f | time=%.1fs",
                     epoch + 1,
                     num_epochs,
                     tf_ratio,
+                    rollout_tf_value,
+                    str(rollout_steps_value) if rollout_steps_value else "-",
                     current_lr,
                     train_stats.get('loss', float('nan')),
                     elapsed,

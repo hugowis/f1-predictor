@@ -157,6 +157,21 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.rollout_weight = args.rollout_weight
     if getattr(args, 'rollout_start_epoch', None) is not None:
         config.training.rollout_start_epoch = args.rollout_start_epoch
+    # Rollout scheduled sampling / curriculum overrides
+    if getattr(args, 'rollout_tf_start', None) is not None:
+        if not (0.0 <= args.rollout_tf_start <= 1.0):
+            raise ValueError("--rollout-tf-start must be between 0.0 and 1.0")
+        config.training.rollout_teacher_forcing_start = args.rollout_tf_start
+    if getattr(args, 'rollout_tf_end', None) is not None:
+        if not (0.0 <= args.rollout_tf_end <= 1.0):
+            raise ValueError("--rollout-tf-end must be between 0.0 and 1.0")
+        config.training.rollout_teacher_forcing_end = args.rollout_tf_end
+    if getattr(args, 'rollout_warmup_epochs', None) is not None:
+        if args.rollout_warmup_epochs < 0:
+            raise ValueError("--rollout-warmup-epochs must be >= 0")
+        config.training.rollout_warmup_epochs = args.rollout_warmup_epochs
+    if getattr(args, 'no_rollout_curriculum', False):
+        config.training.rollout_curriculum = False
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
@@ -447,6 +462,92 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
     return ratio
 
 
+def rollout_teacher_forcing_schedule(epoch: int, config: Config) -> float:
+    """
+    Compute the teacher-forcing ratio applied *inside* the rollout decoder
+    (scheduled sampling) for a given epoch.
+
+    At epoch ``rollout_start_epoch`` the ratio equals
+    ``rollout_teacher_forcing_start`` (default 1.0 = fully teacher-forced).
+    It then decays linearly to ``rollout_teacher_forcing_end`` (default 0.0 =
+    fully autoregressive) over ``rollout_warmup_epochs`` epochs.  After the
+    warm-up period the end value is held constant.
+
+    If rollout has not started yet (epoch < rollout_start_epoch), 0.0 is
+    returned (not used because rollout is inactive).
+
+    Parameters
+    ----------
+    epoch : int
+        Current epoch.
+    config : Config
+        Training configuration.
+
+    Returns
+    -------
+    float
+        Teacher-forcing ratio for rollout at this epoch (0.0–1.0).
+    """
+    start_epoch = getattr(config.training, 'rollout_start_epoch', 0)
+    tf_start = float(getattr(config.training, 'rollout_teacher_forcing_start', 1.0))
+    tf_end = float(getattr(config.training, 'rollout_teacher_forcing_end', 0.0))
+    warmup = int(getattr(config.training, 'rollout_warmup_epochs', 20))
+
+    if epoch < start_epoch:
+        return 0.0
+
+    eff_epoch = epoch - start_epoch
+    if warmup <= 0 or eff_epoch >= warmup:
+        return tf_end
+
+    # Linear decay from tf_start to tf_end over warmup epochs
+    ratio = tf_start - (tf_start - tf_end) * (eff_epoch / warmup)
+    return float(np.clip(ratio, min(tf_start, tf_end), max(tf_start, tf_end)))
+
+
+def rollout_curriculum_steps(epoch: int, config: Config) -> int:
+    """
+    Compute the active rollout horizon (number of future steps to unroll) for a
+    given epoch, implementing curriculum learning.
+
+    The horizon starts at 1 step at ``rollout_start_epoch`` and grows linearly
+    to ``rollout_steps`` over ``rollout_warmup_epochs`` epochs.  If
+    ``rollout_curriculum`` is ``False`` the full ``rollout_steps`` is always
+    returned.
+
+    Parameters
+    ----------
+    epoch : int
+        Current epoch.
+    config : Config
+        Training configuration.
+
+    Returns
+    -------
+    int
+        Number of rollout steps to use this epoch.
+    """
+    use_curriculum = bool(getattr(config.training, 'rollout_curriculum', True))
+    max_steps = int(getattr(config.training, 'rollout_steps', 5))
+
+    if not use_curriculum:
+        return max_steps
+
+    start_epoch = getattr(config.training, 'rollout_start_epoch', 0)
+    warmup = int(getattr(config.training, 'rollout_warmup_epochs', 20))
+
+    if epoch < start_epoch:
+        return 1
+
+    eff_epoch = epoch - start_epoch
+    if warmup <= 0 or eff_epoch >= warmup:
+        return max_steps
+
+    # Linearly grow from 1 to max_steps over warmup epochs
+    steps = 1 + (max_steps - 1) * (eff_epoch / warmup)
+    return max(1, min(max_steps, int(np.ceil(steps))))
+
+
 def train(config: Config, output_dir: Path = None):
     """
     Run training pipeline.
@@ -563,6 +664,8 @@ def train(config: Config, output_dir: Path = None):
         rollout_loader=rollout_loader,
         rollout_weight=getattr(config.training, 'rollout_weight', 1.0),
         rollout_start_epoch=getattr(config.training, 'rollout_start_epoch', 0),
+        rollout_teacher_forcing_schedule=lambda epoch: rollout_teacher_forcing_schedule(epoch, config),
+        rollout_curriculum_steps_schedule=lambda epoch: rollout_curriculum_steps(epoch, config),
     )
     
     # Save config and history
@@ -607,6 +710,25 @@ def main():
     parser.add_argument('--rollout-steps', type=int, help='Number of autoregressive rollout steps per sample (default: 5)')
     parser.add_argument('--rollout-weight', type=float, help='Weight multiplier for rollout loss (default: 1.0)')
     parser.add_argument('--rollout-start-epoch', type=int, help='Epoch at which to start rollout training (default: 0)')
+    # Rollout scheduled sampling / curriculum options
+    parser.add_argument(
+        '--rollout-tf-start', type=float,
+        help='Initial teacher-forcing ratio inside rollout decoder (scheduled sampling start). '
+             'Default: 1.0 (fully teacher-forced at rollout start, smoothly bridges to autoregressive).',
+    )
+    parser.add_argument(
+        '--rollout-tf-end', type=float,
+        help='Final teacher-forcing ratio inside rollout decoder. Default: 0.0 (fully autoregressive).',
+    )
+    parser.add_argument(
+        '--rollout-warmup-epochs', type=int,
+        help='Number of epochs (measured from rollout_start_epoch) over which the rollout '
+             'teacher-forcing ratio decays and the curriculum horizon grows. Default: 20.',
+    )
+    parser.add_argument(
+        '--no-rollout-curriculum', action='store_true',
+        help='Disable curriculum rollout (always use full rollout_steps from the first rollout epoch).',
+    )
     
     args = parser.parse_args()
     

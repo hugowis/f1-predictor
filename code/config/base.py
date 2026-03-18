@@ -112,6 +112,22 @@ class TrainingConfig:
     rollout_steps: int = 5
     rollout_weight: float = 1.0
     rollout_start_epoch: int = 0
+
+    # Rollout scheduled sampling: teacher forcing ratio applied *inside* the
+    # rollout decoder, decaying from `rollout_teacher_forcing_start` at the
+    # first rollout epoch down to `rollout_teacher_forcing_end` over
+    # `rollout_warmup_epochs` epochs.  Starting with high teacher-forcing
+    # prevents the loss explosion that occurs when the model suddenly has to
+    # consume its own imperfect outputs after single-step pre-training.
+    rollout_teacher_forcing_start: float = 1.0   # Fully teacher-forced at rollout start
+    rollout_teacher_forcing_end: float = 0.0     # Fully autoregressive after warm-up
+    rollout_warmup_epochs: int = 20              # Epochs to decay rollout TF to end value
+
+    # Curriculum rollout: start with a short rollout horizon and grow to the
+    # target `rollout_steps` over `rollout_warmup_epochs` epochs.  Combined
+    # with scheduled sampling this gives the smoothest transition from
+    # single-step training to full autoregressive rollout.
+    rollout_curriculum: bool = True
     
     # Data
     train_years: list = None

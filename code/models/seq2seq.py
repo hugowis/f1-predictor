@@ -105,6 +105,8 @@ class Seq2Seq(BaseModel):
         decoder_output_size: Optional[int] = None,
         embedding_dims: Optional[Dict[str, int]] = None,
         vocab_sizes: Optional[Dict[str, int]] = None,
+        decoder_future_features: int = 0,
+        use_attention: bool = False,
         device: str = 'cpu',
         **kwargs
     ):
@@ -119,6 +121,8 @@ class Seq2Seq(BaseModel):
             'decoder_output_size': decoder_output_size or output_size,
             'embedding_dims': embedding_dims or {},
             'vocab_sizes': vocab_sizes or {},
+            'decoder_future_features': decoder_future_features,
+            'use_attention': use_attention,
             'device': device,
         }
         super().__init__(config)
@@ -143,6 +147,8 @@ class Seq2Seq(BaseModel):
         # Keep legacy attributes for compatibility
         self.decoder_type = self.rnn_type
         self.encoder_type = self.rnn_type
+        self.decoder_future_features = int(decoder_future_features)
+        self.use_attention = bool(use_attention)
         
         # Embeddings for categorical features
         self.embeddings = nn.ModuleDict()
@@ -188,11 +194,10 @@ class Seq2Seq(BaseModel):
         # Encoder output projection (optional, for decoder initialization)
         self.fc_encoder_to_hidden = nn.Linear(hidden_size, hidden_size)
         
-        # DECODER: GRU that generates future laps
-        # Decoder input will be the previous lap time (autoregressive scalar).
-        # If you later want to include embeddings or extra context per step,
-        # adjust `decoder_input_size` and ensure `current_input` includes them.
-        decoder_input_size = output_size
+        # DECODER: GRU that generates future laps.
+        # Decoder input = previous predicted lap time (1 scalar) + any known
+        # future features (e.g. TyreLife, fuel_proxy, compound, pit flags).
+        decoder_input_size = output_size + self.decoder_future_features
         # Decoder can be GRU or LSTM based on `decoder_type`.
         if self.rnn_type == 'gru':
             self.decoder = nn.GRU(
@@ -214,13 +219,22 @@ class Seq2Seq(BaseModel):
                 bidirectional=False,
             )
         
-        # Decoder output projection to lap time prediction
-        self.fc_decoder_output = nn.Linear(hidden_size, output_size)
-        # Pit stop head (binary logit)
-        self.fc_pit = nn.Linear(hidden_size, 1)
-        # Compound prediction head (logits over compound classes)
-        self.fc_compound = nn.Linear(hidden_size, self.compound_classes)
-        
+        # Bahdanau (additive) attention over encoder outputs.
+        # When enabled the decoder output is concatenated with an attention
+        # context vector before projection, doubling the projection input size.
+        if self.use_attention:
+            self.attn_query = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.attn_key   = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.attn_v     = nn.Linear(hidden_size, 1, bias=False)
+            proj_input_size = hidden_size * 2
+        else:
+            proj_input_size = hidden_size
+
+        # Output heads
+        self.fc_decoder_output = nn.Linear(proj_input_size, output_size)
+        self.fc_pit            = nn.Linear(proj_input_size, 1)
+        self.fc_compound       = nn.Linear(proj_input_size, self.compound_classes)
+
         self.to(device)
         self._init_weights()
     
@@ -252,14 +266,18 @@ class Seq2Seq(BaseModel):
                         n = param.size(0)
                         param.data[n // 4: n // 2].fill_(1.0)
 
-        for fc in [
+        linear_layers = [
             self.fc_encoder_to_hidden,
             self.fc_decoder_output,
             self.fc_pit,
             self.fc_compound,
-        ]:
+        ]
+        if self.use_attention:
+            linear_layers += [self.attn_query, self.attn_key, self.attn_v]
+        for fc in linear_layers:
             nn.init.xavier_uniform_(fc.weight)
-            nn.init.zeros_(fc.bias)
+            if fc.bias is not None:
+                nn.init.zeros_(fc.bias)
 
         for emb in self.embeddings.values():
             nn.init.normal_(emb.weight, mean=0.0, std=0.1)
@@ -411,18 +429,35 @@ class Seq2Seq(BaseModel):
             c0 = torch.zeros_like(expanded)
             decoder_hidden = (expanded, c0)
         
-        # DECODER: generate output sequence
-        # Fast path: when using full teacher forcing (deterministic), run the
-        # decoder in a single vectorized call to avoid Python-level timestep
-        # loop and many small kernel launches which drastically reduce GPU
-        # utilization.
+        # DECODER: generate output sequence.
+        #
+        # Fast path: full teacher forcing with no scheduled sampling.
+        # Runs the entire decoder sequence in one vectorized RNN call for GPU
+        # efficiency.  When attention is enabled we still batch the attention
+        # computation over all time steps at once.
         if teacher_forcing and teacher_forcing_ratio >= 0.999:
-            # decoder_input shape: (batch, seq_len, output_size)
-            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+            # decoder_input: (batch, seq_len, output_size + decoder_future_features)
+            decoder_output, _ = self.decoder(decoder_input, decoder_hidden)
             # decoder_output: (batch, seq_len, hidden_size)
-            lap_out = self.fc_decoder_output(decoder_output)  # (batch, seq_len, output_size)
-            pit_out = self.fc_pit(decoder_output).squeeze(-1)  # (batch, seq_len)
-            comp_out = self.fc_compound(decoder_output)  # (batch, seq_len, C)
+
+            if self.use_attention:
+                # Batched Bahdanau attention over all decoder steps at once.
+                # query: (B, T, H), key: (B, S, H)
+                query_proj = self.attn_query(decoder_output)          # (B, T, H)
+                key_proj   = self.attn_key(encoder_output)            # (B, S, H)
+                # energy: (B, T, S) via broadcast (B,T,1,H) + (B,1,S,H)
+                energy = self.attn_v(
+                    torch.tanh(query_proj.unsqueeze(2) + key_proj.unsqueeze(1))
+                ).squeeze(-1)                                          # (B, T, S)
+                attn_weights = torch.softmax(energy, dim=-1)          # (B, T, S)
+                context = torch.bmm(attn_weights, encoder_output)     # (B, T, H)
+                proj_input = torch.cat([decoder_output, context], dim=-1)  # (B, T, 2H)
+            else:
+                proj_input = decoder_output                            # (B, T, H)
+
+            lap_out  = self.fc_decoder_output(proj_input)             # (B, T, 1)
+            pit_out  = self.fc_pit(proj_input).squeeze(-1)            # (B, T)
+            comp_out = self.fc_compound(proj_input)                   # (B, T, C)
 
             return {
                 'lap': lap_out,
@@ -430,45 +465,73 @@ class Seq2Seq(BaseModel):
                 'compound_logits': comp_out,
             }
 
+        # Slow path: step-by-step loop required for scheduled sampling.
+        # Also handles per-sample teacher-forcing decisions and attention.
         outputs_lap = []
         outputs_pit = []
         outputs_compound = []
-        current_input = decoder_input[:, 0:1, :]  # Start with first ground truth (lap time)
+        # Start with the seed input: last context lap time + optional future features
+        current_input = decoder_input[:, 0:1, :]  # (B, 1, 1 + n_fut)
 
         for t in range(decoder_seq_len):
-            # Decoder step: single time step
-            decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
-            # Ensure decoder_hidden is contiguous for next iteration (GPU requirement)
+            # Single decoder step
+            decoder_output_t, decoder_hidden = self.decoder(current_input, decoder_hidden)
             if isinstance(decoder_hidden, tuple):
                 h, c = decoder_hidden
                 decoder_hidden = (h.contiguous(), c.contiguous())
             else:
                 decoder_hidden = decoder_hidden.contiguous()
-            # decoder_output: (batch, 1, hidden_size)
+            # decoder_output_t: (B, 1, H)
 
-            # Project hidden state to output
-            step_output = self.fc_decoder_output(decoder_output)  # (batch, 1, output_size)
-            step_pit_logit = self.fc_pit(decoder_output)  # (batch, 1, 1)
-            step_comp_logits = self.fc_compound(decoder_output)  # (batch, 1, C)
+            if self.use_attention:
+                # Step-wise Bahdanau attention
+                query_proj = self.attn_query(decoder_output_t)   # (B, 1, H)
+                key_proj   = self.attn_key(encoder_output)        # (B, S, H)
+                # (B, 1, H) + (B, S, H) → broadcast → (B, S, H)
+                energy = self.attn_v(
+                    torch.tanh(query_proj + key_proj)
+                ).squeeze(-1)                                      # (B, S)
+                attn_weights = torch.softmax(energy, dim=-1)      # (B, S)
+                context = torch.bmm(
+                    attn_weights.unsqueeze(1), encoder_output
+                )                                                  # (B, 1, H)
+                proj_input = torch.cat([decoder_output_t, context], dim=-1)  # (B, 1, 2H)
+            else:
+                proj_input = decoder_output_t                      # (B, 1, H)
+
+            step_output    = self.fc_decoder_output(proj_input)   # (B, 1, output_size)
+            step_pit_logit = self.fc_pit(proj_input)              # (B, 1, 1)
+            step_comp      = self.fc_compound(proj_input)         # (B, 1, C)
 
             outputs_lap.append(step_output)
             outputs_pit.append(step_pit_logit.squeeze(-1))
-            outputs_compound.append(step_comp_logits)
+            outputs_compound.append(step_comp)
 
-            # Decide whether to use teacher forcing or own prediction
-            use_teacher = teacher_forcing and (torch.rand(1).item() < teacher_forcing_ratio)
+            # Build next input (per-sample teacher forcing decision).
+            # The FUTURE FEATURES component is ALWAYS taken from decoder_input
+            # (it is known from race strategy regardless of TF/AR).  Only the
+            # lap-time scalar switches between ground truth and own prediction.
+            if t < decoder_seq_len - 1:
+                n_fut = self.decoder_future_features
+                if teacher_forcing:
+                    tf_mask = (
+                        torch.rand(batch_size, device=step_output.device) < teacher_forcing_ratio
+                    ).view(batch_size, 1, 1)  # (B, 1, 1)
+                    gt_lap  = decoder_input[:, t+1:t+2, 0:1]   # ground truth lap time
+                    lap_next = torch.where(tf_mask, gt_lap, step_output)
+                else:
+                    lap_next = step_output
 
-            if use_teacher and t < decoder_seq_len - 1:
-                # Use ground truth from decoder_input (lap time only)
-                current_input = decoder_input[:, t+1:t+2, :]
-            else:
-                # Use model's prediction (autoregressive)
-                current_input = step_output
-        
-        # Concatenate all outputs
-        lap_out = torch.cat(outputs_lap, dim=1)  # (batch, decoder_seq_len, output_size)
-        pit_out = torch.cat(outputs_pit, dim=1)  # (batch, decoder_seq_len)
-        comp_out = torch.cat(outputs_compound, dim=1)  # (batch, decoder_seq_len, C)
+                if n_fut > 0:
+                    fut_next = decoder_input[:, t+1:t+2, 1:]    # always from data
+                    current_input = torch.cat([lap_next, fut_next], dim=-1)
+                else:
+                    current_input = lap_next
+
+        # Concatenate all step outputs
+        lap_out  = torch.cat(outputs_lap, dim=1)       # (B, T, output_size)
+        pit_out  = torch.cat(outputs_pit, dim=1)       # (B, T)
+        comp_out = torch.cat(outputs_compound, dim=1)  # (B, T, C)
 
         return {
             'lap': lap_out,

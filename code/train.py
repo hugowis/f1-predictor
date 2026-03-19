@@ -384,6 +384,8 @@ def create_model(config: Config, device: str = 'cpu'):
         'vocab_sizes': config.model.vocab_sizes,
         'decoder_type': getattr(config.model, 'decoder_type', 'gru'),
         'encoder_type': getattr(config.model, 'encoder', 'gru'),
+        'decoder_future_features': getattr(config.model, 'decoder_future_features', 0),
+        'use_attention': getattr(config.model, 'use_attention', False),
         'device': device,
     }
     
@@ -469,8 +471,10 @@ def rollout_teacher_forcing_schedule(epoch: int, config: Config) -> float:
 
     At epoch ``rollout_start_epoch`` the ratio equals
     ``rollout_teacher_forcing_start`` (default 1.0 = fully teacher-forced).
-    It then decays linearly to ``rollout_teacher_forcing_end`` (default 0.0 =
-    fully autoregressive) over ``rollout_warmup_epochs`` epochs.  After the
+    It then decays via a cosine schedule to ``rollout_teacher_forcing_end``
+    (default 0.0 = fully autoregressive) over ``rollout_warmup_epochs`` epochs.
+    The cosine schedule stays near ``tf_start`` longer and drops steeply only
+    toward the end, giving the model more time to adapt at low TF ratios.  After the
     warm-up period the end value is held constant.
 
     If rollout has not started yet (epoch < rollout_start_epoch), 0.0 is
@@ -500,8 +504,11 @@ def rollout_teacher_forcing_schedule(epoch: int, config: Config) -> float:
     if warmup <= 0 or eff_epoch >= warmup:
         return tf_end
 
-    # Linear decay from tf_start to tf_end over warmup epochs
-    ratio = tf_start - (tf_start - tf_end) * (eff_epoch / warmup)
+    # Cosine decay from tf_start to tf_end over warmup epochs.
+    # Stays near tf_start longer and drops steeply only at the end,
+    # giving the model more time to adapt at low teacher-forcing ratios.
+    cosine_factor = 0.5 * (1.0 + np.cos(np.pi * eff_epoch / warmup))
+    ratio = tf_end + (tf_start - tf_end) * cosine_factor
     return float(np.clip(ratio, min(tf_start, tf_end), max(tf_start, tf_end)))
 
 
@@ -639,6 +646,7 @@ def train(config: Config, output_dir: Path = None):
 
     # Rollout training is always enabled in autoregressive mode.
     rollout_loader = None
+    rollout_val_loader = None
     if getattr(config, 'use_autoregressive', False):
         rollout_steps = getattr(config.training, 'rollout_steps', 5)
         logger.info(f"Creating rollout dataset with {rollout_steps} steps...")
@@ -654,6 +662,25 @@ def train(config: Config, output_dir: Path = None):
             pin_memory=True,
         )
 
+        # Rollout validation dataset (uses val split, no shuffle)
+        if val_loader is not None:
+            rollout_val_ds = AutoregressiveRolloutDataset(
+                base_dataset=val_loader.dataset,
+                rollout_steps=rollout_steps,
+            )
+            if len(rollout_val_ds) > 0:
+                rollout_val_loader = DataLoader(
+                    rollout_val_ds,
+                    batch_size=config.training.batch_size,
+                    shuffle=False,
+                    num_workers=config.data.num_workers,
+                    pin_memory=True,
+                )
+                logger.info(f"Rollout val dataset: {len(rollout_val_ds)} sequences")
+            else:
+                logger.warning("Rollout val dataset is empty — rollout validation skipped")
+
+    _rollout_warmup = int(getattr(config.training, 'rollout_warmup_epochs', 40))
     history = trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -662,10 +689,14 @@ def train(config: Config, output_dir: Path = None):
         early_stopping_min_epochs=getattr(config.training, 'early_stopping_min_epochs', 0),
         teacher_forcing_schedule=lambda epoch: teacher_forcing_schedule(epoch, config),
         rollout_loader=rollout_loader,
+        rollout_val_loader=rollout_val_loader,
         rollout_weight=getattr(config.training, 'rollout_weight', 1.0),
         rollout_start_epoch=getattr(config.training, 'rollout_start_epoch', 0),
         rollout_teacher_forcing_schedule=lambda epoch: rollout_teacher_forcing_schedule(epoch, config),
         rollout_curriculum_steps_schedule=lambda epoch: rollout_curriculum_steps(epoch, config),
+        early_stopping_metric=getattr(config.training, 'early_stopping_metric', 'val_loss'),
+        disable_single_step_after_warmup=getattr(config.training, 'disable_single_step_after_warmup', False),
+        rollout_warmup_epochs=_rollout_warmup,
     )
     
     # Save config and history

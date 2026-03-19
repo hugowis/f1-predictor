@@ -718,6 +718,27 @@ class AutoregressiveLapDataloader(Dataset):
         return context_tensor, target_tensor, metadata
 
 
+# Columns extracted from future target laps and fed to the decoder at each
+# rollout step as additional "known future" context.  These are features that
+# are determined by race strategy / race schedule and are therefore available
+# at inference time even though we haven't predicted them yet.
+ROLLOUT_DECODER_FEATURE_COLS: List[str] = [
+    # Normalized numeric (strategy-determined)
+    'TyreLife',
+    'fuel_proxy',
+    # Boolean flags (strategy-determined)
+    'FreshTyre',
+    'is_outlap',
+    'is_inlap',
+    'is_pitlap',
+    # Tire compound one-hot (strategy-determined)
+    'compound_soft',
+    'compound_medium',
+    'compound_hard',
+    'compound_unknown',
+]
+
+
 class AutoregressiveRolloutDataset(Dataset):
     """
     Dataset that provides multi-step rollout sequences for training.
@@ -726,6 +747,12 @@ class AutoregressiveRolloutDataset(Dataset):
     (context, future_targets) pairs where the context has ``context_window``
     laps and future_targets contain ``rollout_steps`` consecutive ground-truth
     lap targets for computing loss over an unrolled autoregressive sequence.
+
+    The targets dict now also contains ``future_features``, a tensor of shape
+    ``(rollout_steps, n_decoder_features)`` with the known-future features for
+    each rollout step (TyreLife, fuel_proxy, compound, pit flags, etc.).  These
+    are fed as additional decoder inputs so the model knows the race context
+    without having to predict it.
 
     Parameters
     ----------
@@ -746,6 +773,10 @@ class AutoregressiveRolloutDataset(Dataset):
         self.years = list(getattr(base_dataset, 'years', []))
         self.data_path = getattr(base_dataset, 'data_path', Path('./data'))
         self.scaler_type = getattr(base_dataset, 'scaler_type', 'standard')
+        # Determine which future-feature columns are available in this dataset
+        available_cols = set(base_dataset.data.columns) if base_dataset.data is not None else set()
+        self.decoder_feature_cols = [c for c in ROLLOUT_DECODER_FEATURE_COLS if c in available_cols]
+        self.n_decoder_features = len(self.decoder_feature_cols)
         self.sequences = self._generate_sequences()
         self.cache_path = self._build_cache_path()
         self._precomputed_contexts = [None] * len(self.sequences)
@@ -754,7 +785,8 @@ class AutoregressiveRolloutDataset(Dataset):
         self._load_or_precompute_cache()
         logger.info(
             f"AutoregressiveRolloutDataset: {len(self.sequences)} sequences "
-            f"(context_window={self.context_window}, rollout_steps={rollout_steps})"
+            f"(context_window={self.context_window}, rollout_steps={rollout_steps}, "
+            f"decoder_features={self.n_decoder_features})"
         )
 
     def _build_cache_path(self) -> Path:
@@ -815,7 +847,8 @@ class AutoregressiveRolloutDataset(Dataset):
                 cached.get('context_window') == self.context_window and
                 cached.get('rollout_steps') == self.rollout_steps and
                 cached.get('scaler_type') == self.scaler_type and
-                cached.get('numeric_columns') == self.numeric_columns
+                cached.get('numeric_columns') == self.numeric_columns and
+                cached.get('decoder_feature_cols') == self.decoder_feature_cols
             )
             if not valid:
                 logger.info("Rollout cache file did not match current configuration; ignoring cache.")
@@ -837,11 +870,14 @@ class AutoregressiveRolloutDataset(Dataset):
                 if target is None:
                     loaded_targets.append(None)
                     continue
-                loaded_targets.append({
+                t_dict = {
                     'lap_time': torch.tensor(target['lap_time'], dtype=torch.float32),
                     'is_pitlap': torch.tensor(target['is_pitlap'], dtype=torch.long),
                     'compound': torch.tensor(target['compound'], dtype=torch.long),
-                })
+                }
+                if 'future_features' in target and target['future_features'] is not None:
+                    t_dict['future_features'] = torch.tensor(target['future_features'], dtype=torch.float32)
+                loaded_targets.append(t_dict)
 
             self._precomputed_contexts = loaded_contexts
             self._precomputed_targets = loaded_targets
@@ -871,11 +907,18 @@ class AutoregressiveRolloutDataset(Dataset):
                 if target is None:
                     targets_primitives.append(None)
                     continue
-                targets_primitives.append({
-                    'lap_time': target['lap_time'].cpu().numpy().tolist() if isinstance(target['lap_time'], torch.Tensor) else target['lap_time'],
-                    'is_pitlap': target['is_pitlap'].cpu().numpy().tolist() if isinstance(target['is_pitlap'], torch.Tensor) else target['is_pitlap'],
-                    'compound': target['compound'].cpu().numpy().tolist() if isinstance(target['compound'], torch.Tensor) else target['compound'],
-                })
+                def _to_list(v):
+                    if isinstance(v, torch.Tensor):
+                        return v.cpu().numpy().tolist()
+                    return v
+                t_prim = {
+                    'lap_time': _to_list(target['lap_time']),
+                    'is_pitlap': _to_list(target['is_pitlap']),
+                    'compound': _to_list(target['compound']),
+                }
+                if 'future_features' in target and target['future_features'] is not None:
+                    t_prim['future_features'] = _to_list(target['future_features'])
+                targets_primitives.append(t_prim)
 
             meta_primitives = []
             for meta in self._precomputed_meta:
@@ -895,6 +938,7 @@ class AutoregressiveRolloutDataset(Dataset):
                 'rollout_steps': self.rollout_steps,
                 'scaler_type': self.scaler_type,
                 'numeric_columns': self.numeric_columns,
+                'decoder_feature_cols': self.decoder_feature_cols,
                 'contexts': contexts_np,
                 'targets': targets_primitives,
                 'meta': meta_primitives,
@@ -951,12 +995,24 @@ class AutoregressiveRolloutDataset(Dataset):
             np.nan_to_num(context_array, copy=False, nan=0.0)
             np.nan_to_num(target_laptimes, copy=False, nan=0.0)
 
+            # Extract known-future decoder features from target laps
+            future_feat_tensor = None
+            if self.decoder_feature_cols:
+                avail = [c for c in self.decoder_feature_cols if c in target_laps.columns]
+                if avail:
+                    future_feat_arr = target_laps[avail].values.astype(np.float32)
+                    np.nan_to_num(future_feat_arr, copy=False, nan=0.0)
+                    future_feat_tensor = torch.from_numpy(future_feat_arr)
+
             self._precomputed_contexts[idx] = torch.from_numpy(context_array)
-            self._precomputed_targets[idx] = {
+            t_dict = {
                 'lap_time': torch.from_numpy(target_laptimes),
                 'is_pitlap': torch.from_numpy(target_pitlaps),
                 'compound': torch.from_numpy(compound_indices),
             }
+            if future_feat_tensor is not None:
+                t_dict['future_features'] = future_feat_tensor
+            self._precomputed_targets[idx] = t_dict
             self._precomputed_meta[idx] = {
                 'driver': seq['driver'],
                 'year': seq['year'],
@@ -1057,6 +1113,14 @@ class AutoregressiveRolloutDataset(Dataset):
             'is_pitlap': torch.from_numpy(target_pitlaps).to(self.device),
             'compound': torch.from_numpy(compound_indices).to(self.device),
         }
+
+        # Extract known-future decoder features
+        if self.decoder_feature_cols:
+            avail = [c for c in self.decoder_feature_cols if c in target_laps.columns]
+            if avail:
+                future_feat_arr = target_laps[avail].values.astype(np.float32)
+                np.nan_to_num(future_feat_arr, copy=False, nan=0.0)
+                target_dict['future_features'] = torch.from_numpy(future_feat_arr).to(self.device)
 
         metadata = {
             'driver': seq['driver'],

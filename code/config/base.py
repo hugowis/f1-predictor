@@ -25,6 +25,12 @@ class ModelConfig:
     encoder: str = 'gru'
     embedding_dims: Optional[Dict[str, int]] = None
     vocab_sizes: Optional[Dict[str, int]] = None
+    # Additional known-future features concatenated to the decoder input at
+    # each rollout step (TyreLife, fuel_proxy, compound flags, pit flags).
+    # Set to 0 to disable; set to len(ROLLOUT_DECODER_FEATURE_COLS) = 10 to enable.
+    decoder_future_features: int = 10
+    # Bahdanau (additive) attention over encoder outputs at each decoder step.
+    use_attention: bool = False
     
     def __post_init__(self):
         if self.embedding_dims is None:
@@ -121,14 +127,24 @@ class TrainingConfig:
     # consume its own imperfect outputs after single-step pre-training.
     rollout_teacher_forcing_start: float = 1.0   # Fully teacher-forced at rollout start
     rollout_teacher_forcing_end: float = 0.0     # Fully autoregressive after warm-up
-    rollout_warmup_epochs: int = 20              # Epochs to decay rollout TF to end value
+    rollout_warmup_epochs: int = 40              # Epochs to decay rollout TF to end value (cosine)
 
     # Curriculum rollout: start with a short rollout horizon and grow to the
     # target `rollout_steps` over `rollout_warmup_epochs` epochs.  Combined
     # with scheduled sampling this gives the smoothest transition from
     # single-step training to full autoregressive rollout.
     rollout_curriculum: bool = True
-    
+
+    # Early stopping metric: 'val_loss' (single-step, default) or
+    # 'rollout_val_loss' (fully-autoregressive rollout validation).
+    # Use 'rollout_val_loss' when rollout quality is the primary objective.
+    early_stopping_metric: str = 'val_loss'
+
+    # When True, skip the single-step train_epoch() pass once the rollout
+    # warmup period has completed (epoch >= rollout_start_epoch + rollout_warmup_epochs).
+    # Removes conflicting training signals once the model is fully autoregressive.
+    disable_single_step_after_warmup: bool = False
+
     # Data
     train_years: list = None
     val_years: list = None

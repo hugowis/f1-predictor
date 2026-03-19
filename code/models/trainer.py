@@ -599,22 +599,33 @@ class Trainer:
                 active_steps = max(1, min(int(current_rollout_steps), max_steps))
             lap_t = lap_t[:, :active_steps]
 
-            # Construct decoder_input: (batch, active_steps, 1)
-            # Position 0 = last context LapTime (LapTime is feature index 0)
+            # Known future decoder features: (B, active_steps, n_fut) or None
+            future_feat = None
+            if isinstance(targets, dict) and 'future_features' in targets:
+                ff = targets['future_features']
+                if isinstance(ff, torch.Tensor) and ff.numel() > 0:
+                    future_feat = ff[:, :active_steps, :]  # (B, active_steps, n_fut)
+
+            n_fut = future_feat.size(-1) if future_feat is not None else 0
+
+            # Construct decoder_input: (batch, active_steps, 1 + n_fut)
+            # Col 0 = lap time (seed/TF); cols 1: = known future features
             if isinstance(encoder_input, dict):
                 last_lt = encoder_input['numeric'][:, -1, 0]
             else:
                 last_lt = encoder_input[:, -1, 0]
 
             decoder_input = torch.zeros(
-                lap_t.size(0), active_steps, 1,
+                lap_t.size(0), active_steps, 1 + n_fut,
                 dtype=torch.float32, device=self.device,
             )
             decoder_input[:, 0, 0] = last_lt
-            # Fill remaining positions with ground truth — used by the model
-            # when teacher_forcing=True with the scheduled sampling ratio.
+            # Fill lap-time positions with ground truth for scheduled sampling
             if active_steps > 1:
                 decoder_input[:, 1:, 0] = lap_t[:, :-1]
+            # Fill future feature positions (always from data — never AR)
+            if future_feat is not None:
+                decoder_input[:, :, 1:] = future_feat
 
             # Forward pass — scheduled sampling: use teacher forcing at the
             # given ratio so the decoder gradually transitions from
@@ -877,7 +888,157 @@ class Trainer:
         )
         
         return avg_loss, metrics
-    
+
+    def validate_rollout(self, rollout_val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
+        """
+        Validate multi-step autoregressive rollout performance on a held-out set.
+
+        Runs the decoder in fully autoregressive mode (teacher_forcing=False) over
+        all rollout steps, computing overall loss and per-step MAE so that error
+        compounding can be diagnosed across the horizon.
+
+        Parameters
+        ----------
+        rollout_val_loader : DataLoader
+            DataLoader wrapping an ``AutoregressiveRolloutDataset`` (same format
+            as used in ``train_epoch_rollout``).
+
+        Returns
+        -------
+        tuple of (float, dict)
+            (avg_loss, metrics_dict) where metrics_dict contains:
+            - 'loss': same as avg_loss
+            - 'mae': overall MAE across all steps
+            - 'step_mae': list of per-step MAE values (index 0 = step 1, etc.)
+        """
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        all_preds: list = []   # list of (B, steps) arrays
+        all_targets: list = []  # list of (B, steps) arrays
+
+        progress = tqdm(
+            rollout_val_loader,
+            total=len(rollout_val_loader),
+            desc="Rollout Validation",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not self._show_progress,
+        )
+
+        with torch.no_grad():
+            for batch in progress:
+                encoder_input, targets, metadata = batch[0], batch[1], batch[2]
+
+                if isinstance(encoder_input, dict):
+                    for k, v in encoder_input.items():
+                        if isinstance(v, torch.Tensor):
+                            encoder_input[k] = v.to(self.device)
+                else:
+                    encoder_input = encoder_input.to(self.device)
+
+                if isinstance(targets, dict):
+                    for k, v in list(targets.items()):
+                        if isinstance(v, torch.Tensor):
+                            targets[k] = v.to(self.device)
+                else:
+                    targets = targets.to(self.device)
+
+                lap_t = targets['lap_time'] if isinstance(targets, dict) else targets
+                # lap_t: (B, rollout_steps)
+                active_steps = lap_t.size(1)
+
+                # Known future decoder features
+                future_feat = None
+                if isinstance(targets, dict) and 'future_features' in targets:
+                    ff = targets['future_features']
+                    if isinstance(ff, torch.Tensor) and ff.numel() > 0:
+                        future_feat = ff
+
+                n_fut = future_feat.size(-1) if future_feat is not None else 0
+
+                # Build decoder_input: seed with last context lap time + future features
+                if isinstance(encoder_input, dict):
+                    last_lt = encoder_input['numeric'][:, -1, 0]
+                else:
+                    last_lt = encoder_input[:, -1, 0]
+
+                decoder_input = torch.zeros(
+                    lap_t.size(0), active_steps, 1 + n_fut,
+                    dtype=torch.float32, device=self.device,
+                )
+                decoder_input[:, 0, 0] = last_lt
+                if future_feat is not None:
+                    decoder_input[:, :, 1:] = future_feat
+                # Lap-time positions beyond 0 stay zero — overwritten by AR predictions
+
+                with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+                    outputs = self.model(
+                        encoder_input,
+                        decoder_input,
+                        teacher_forcing=False,
+                    )
+
+                lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs
+                # lap_pred: (B, active_steps, 1)
+                lap_t_rs = lap_t.unsqueeze(-1)  # (B, steps, 1)
+
+                mask = torch.isfinite(lap_t_rs)
+                if mask.sum() == 0 or not torch.isfinite(lap_pred).all():
+                    continue
+
+                denom = mask.float().sum()
+                se = (lap_pred - lap_t_rs) ** 2
+                loss_val = ((se * mask.float()).sum() / denom).item()
+                total_loss += loss_val
+                num_batches += 1
+
+                # Store for per-step MAE
+                all_preds.append(lap_pred.squeeze(-1).cpu().numpy())    # (B, steps)
+                all_targets.append(lap_t.cpu().numpy())                  # (B, steps)
+
+                if num_batches > 0:
+                    progress.set_postfix({'rollout_val_loss': f"{total_loss / num_batches:.4f}"})
+
+        progress.close()
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('nan')
+
+        metrics: Dict[str, Any] = {'loss': avg_loss}
+        if all_preds and all_targets:
+            preds_arr = np.concatenate(all_preds, axis=0)    # (N, steps)
+            targs_arr = np.concatenate(all_targets, axis=0)  # (N, steps)
+            valid = np.isfinite(targs_arr) & np.isfinite(preds_arr)
+
+            # Overall MAE
+            if valid.any():
+                metrics['mae'] = float(np.abs(preds_arr[valid] - targs_arr[valid]).mean())
+            else:
+                metrics['mae'] = float('nan')
+
+            # Per-step MAE
+            step_mae = []
+            for s in range(preds_arr.shape[1]):
+                v = valid[:, s]
+                if v.any():
+                    step_mae.append(float(np.abs(preds_arr[v, s] - targs_arr[v, s]).mean()))
+                else:
+                    step_mae.append(float('nan'))
+            metrics['step_mae'] = step_mae
+        else:
+            metrics['mae'] = float('nan')
+            metrics['step_mae'] = []
+
+        step_mae_str = ', '.join(f'{m:.4f}' for m in metrics.get('step_mae', []))
+        logger.info(
+            "Rollout validation: loss=%.6f, mae=%.4f, per-step MAE=[%s]",
+            avg_loss,
+            metrics.get('mae', float('nan')),
+            step_mae_str,
+        )
+
+        return avg_loss, metrics
+
     def fit(
         self,
         train_loader: DataLoader,
@@ -887,10 +1048,14 @@ class Trainer:
         early_stopping_min_epochs: int = 0,
         teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
         rollout_loader: Optional[DataLoader] = None,
+        rollout_val_loader: Optional[DataLoader] = None,
         rollout_weight: float = 1.0,
         rollout_start_epoch: int = 0,
         rollout_teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
         rollout_curriculum_steps_schedule: Optional[Callable[[int], int]] = None,
+        early_stopping_metric: str = 'val_loss',
+        disable_single_step_after_warmup: bool = False,
+        rollout_warmup_epochs: int = 0,
     ) -> Dict[str, Any]:
         """
         Train model for multiple epochs.
@@ -934,7 +1099,24 @@ class Trainer:
             this epoch (curriculum learning).  Allows starting with a short
             horizon (e.g. 1 step) and gradually increasing to ``rollout_steps``.
             When ``None`` the full horizon stored in the dataset is always used.
-        
+        rollout_val_loader : DataLoader, optional
+            Separate validation DataLoader for rollout evaluation.  When
+            provided, ``validate_rollout()`` is called each epoch to track
+            fully-autoregressive multi-step validation loss and per-step MAE.
+        early_stopping_metric : str
+            Which metric to monitor for early stopping and checkpoint saving.
+            ``'val_loss'`` (default) uses the standard single-step validation
+            loss.  ``'rollout_val_loss'`` uses the rollout validation loss
+            (requires ``rollout_val_loader``).
+        disable_single_step_after_warmup : bool
+            When ``True``, skip the single-step ``train_epoch()`` pass once the
+            rollout warmup period has completed (epoch >= rollout_start_epoch +
+            rollout_warmup_epochs).  Removes conflicting training objectives
+            once the model is fully autoregressive.
+        rollout_warmup_epochs : int
+            Number of warm-up epochs used by the rollout schedules; passed here
+            so ``disable_single_step_after_warmup`` knows when to activate.
+
         Returns
         -------
         dict
@@ -954,7 +1136,18 @@ class Trainer:
             self.history['rollout_teacher_forcing'] = []
         if 'rollout_curriculum_steps' not in self.history:
             self.history['rollout_curriculum_steps'] = []
-        
+        if 'rollout_val_loss' not in self.history:
+            self.history['rollout_val_loss'] = []
+        if 'single_step_skipped' not in self.history:
+            self.history['single_step_skipped'] = []
+
+        # Validate early_stopping_metric
+        valid_metrics = {'val_loss', 'rollout_val_loss'}
+        if early_stopping_metric not in valid_metrics:
+            raise ValueError(f"early_stopping_metric must be one of {valid_metrics}, got '{early_stopping_metric}'")
+        if early_stopping_metric == 'rollout_val_loss' and rollout_val_loader is None:
+            raise ValueError("early_stopping_metric='rollout_val_loss' requires rollout_val_loader to be provided")
+
         logger.info(f"Starting training for {num_epochs} epochs")
         logger.info(f"Model: {self.model.model_info()}")
         logger.info(f"Device: {self.device}")
@@ -964,12 +1157,18 @@ class Trainer:
                 f"start_epoch={rollout_start_epoch}, "
                 f"scheduled_sampling=True, curriculum=True"
             )
+        if rollout_val_loader is not None:
+            logger.info("Rollout validation enabled (fully autoregressive, per-step MAE tracked)")
+        logger.info(f"Early stopping metric: {early_stopping_metric}")
         if self.early_stopping_use_ema:
-            logger.info(f"Early stopping monitor: EMA(val_loss), alpha={self.early_stopping_ema_alpha:.2f}")
+            logger.info(f"Early stopping monitor: EMA({early_stopping_metric}), alpha={self.early_stopping_ema_alpha:.2f}")
         else:
-            logger.info("Early stopping monitor: val_loss")
+            logger.info(f"Early stopping monitor: {early_stopping_metric}")
         if early_stopping_min_epochs > 0:
             logger.info(f"Early stopping grace period: {early_stopping_min_epochs} epochs")
+        if disable_single_step_after_warmup:
+            cutoff = rollout_start_epoch + rollout_warmup_epochs
+            logger.info(f"Single-step training will be disabled after epoch {cutoff} (rollout warmup complete)")
         
         for epoch in range(num_epochs):
             epoch_start = time.perf_counter()
@@ -979,13 +1178,24 @@ class Trainer:
             
             # Get teacher forcing ratio for this epoch
             tf_ratio = teacher_forcing_schedule(epoch)
-            
-            # Train (single-step)
-            train_stats = self.train_epoch(train_loader, epoch, tf_ratio)
-            self.history['train_loss'].append(float(train_stats.get('loss', 0.0)))
-            self.history['train_lap_loss'].append(float(train_stats.get('lap_loss', train_stats.get('loss', 0.0))))
+
+            # Optionally skip single-step training after rollout warmup is done
+            warmup_done = (
+                disable_single_step_after_warmup
+                and rollout_loader is not None
+                and rollout_warmup_epochs > 0
+                and epoch >= rollout_start_epoch + rollout_warmup_epochs
+            )
+            if warmup_done:
+                train_stats = {'loss': float('nan'), 'lap_loss': float('nan'), 'pit_loss': 0.0, 'compound_loss': 0.0}
+                logger.debug(f"Epoch {epoch + 1}: skipping single-step training (rollout warmup complete)")
+            else:
+                train_stats = self.train_epoch(train_loader, epoch, tf_ratio)
+            self.history['train_loss'].append(float(train_stats.get('loss', float('nan'))))
+            self.history['train_lap_loss'].append(float(train_stats.get('lap_loss', train_stats.get('loss', float('nan')))))
             self.history['train_pit_loss'].append(float(train_stats.get('pit_loss', 0.0)))
             self.history['train_compound_loss'].append(float(train_stats.get('compound_loss', 0.0)))
+            self.history['single_step_skipped'].append(warmup_done)
 
             # Rollout training pass (multi-step autoregressive with scheduled sampling)
             rollout_loss_value = 0.0
@@ -1007,36 +1217,51 @@ class Trainer:
             self.history['rollout_loss'].append(rollout_loss_value)
             self.history['rollout_teacher_forcing'].append(rollout_tf_value)
             self.history['rollout_curriculum_steps'].append(rollout_steps_value)
-            
-            # Validate
+
+            # Rollout validation (fully autoregressive, all steps)
+            rollout_val_loss_value = float('nan')
+            rollout_val_metrics: Dict[str, Any] = {}
+            if rollout_val_loader is not None and epoch >= rollout_start_epoch:
+                rollout_val_loss_value, rollout_val_metrics = self.validate_rollout(rollout_val_loader)
+            self.history['rollout_val_loss'].append(rollout_val_loss_value)
+
+            # Validate (single-step)
             if val_loader is not None:
                 val_loss, val_metrics = self.validate(val_loader)
                 self.history['val_loss'].append(val_loss)
 
-                # Monitor either raw val loss or EMA-smoothed val loss
+                # Choose which loss to monitor for early stopping / checkpointing
+                if early_stopping_metric == 'rollout_val_loss' and not np.isnan(rollout_val_loss_value):
+                    primary_loss = rollout_val_loss_value
+                    primary_metrics = rollout_val_metrics
+                else:
+                    primary_loss = val_loss
+                    primary_metrics = val_metrics
+
+                # Monitor either raw or EMA-smoothed primary loss
                 if self.early_stopping_use_ema:
                     if self.val_ema is None:
-                        self.val_ema = float(val_loss)
+                        self.val_ema = float(primary_loss)
                     else:
                         alpha = self.early_stopping_ema_alpha
-                        self.val_ema = alpha * float(val_loss) + (1.0 - alpha) * self.val_ema
+                        self.val_ema = alpha * float(primary_loss) + (1.0 - alpha) * self.val_ema
                     monitored_val = self.val_ema
                 else:
-                    monitored_val = float(val_loss)
+                    monitored_val = float(primary_loss)
 
-                self.history['val_loss_ema'].append(float(self.val_ema) if self.val_ema is not None else float(val_loss))
+                self.history['val_loss_ema'].append(float(self.val_ema) if self.val_ema is not None else float(primary_loss))
                 self.history['val_loss_monitored'].append(float(monitored_val))
-                logger.info(f"Monitored Validation Loss: {monitored_val:.6f}")
-                
+                logger.info(f"Monitored ({early_stopping_metric}): {monitored_val:.6f}")
+
                 # Check for improvement
                 if monitored_val < self.best_monitored_val:
-                    self.best_val_loss = val_loss
+                    self.best_val_loss = primary_loss
                     self.best_monitored_val = monitored_val
                     self.epochs_without_improvement = 0
-                    self._save_checkpoint(epoch, val_loss, val_metrics)
+                    self._save_checkpoint(epoch, primary_loss, primary_metrics)
                 else:
                     self.epochs_without_improvement += 1
-                
+
                 # Early stopping (only after grace period)
                 if epoch >= early_stopping_min_epochs and self.epochs_without_improvement >= early_stopping_patience:
                     logger.info(
@@ -1047,7 +1272,7 @@ class Trainer:
 
                 elapsed = time.perf_counter() - epoch_start
                 logger.info(
-                    "Epoch %d/%d | tf=%.3f | r_tf=%.3f | r_steps=%s | lr=%.2e | train=%.6f | val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
+                    "Epoch %d/%d | tf=%.3f | r_tf=%.3f | r_steps=%s | lr=%.2e | train=%.6f | val=%.6f | r_val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
                     epoch + 1,
                     num_epochs,
                     tf_ratio,
@@ -1056,6 +1281,7 @@ class Trainer:
                     current_lr,
                     train_stats.get('loss', float('nan')),
                     val_loss,
+                    rollout_val_loss_value,
                     monitored_val,
                     self.best_monitored_val,
                     elapsed,
@@ -1063,7 +1289,7 @@ class Trainer:
             else:
                 elapsed = time.perf_counter() - epoch_start
                 logger.info(
-                    "Epoch %d/%d | tf=%.3f | r_tf=%.3f | r_steps=%s | lr=%.2e | train=%.6f | time=%.1fs",
+                    "Epoch %d/%d | tf=%.3f | r_tf=%.3f | r_steps=%s | lr=%.2e | train=%.6f | r_val=%.6f | time=%.1fs",
                     epoch + 1,
                     num_epochs,
                     tf_ratio,
@@ -1071,6 +1297,7 @@ class Trainer:
                     str(rollout_steps_value) if rollout_steps_value else "-",
                     current_lr,
                     train_stats.get('loss', float('nan')),
+                    rollout_val_loss_value,
                     elapsed,
                 )
             

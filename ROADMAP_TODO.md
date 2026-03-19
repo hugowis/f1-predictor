@@ -7,18 +7,19 @@ This file tracks the next experimentation steps and development axes beyond the 
 
 ### P1.1 Rollout training (multi-step rollout loss)
 
-Status:
-- Rollout training is now implemented in the training pipeline and is activated automatically when running with `--autoregressive`.
-- This is now the top active Priority 1 experiment axis because the implementation exists and the remaining work is empirical tuning.
-
 Hypothesis:
 - Multi-step rollout training (explicit rollout loss on predicted sequences) reduces compounding error and drift during long stints compared to single-step teacher-forced training.
 
 Tasks:
 - [x] Implement `AutoregressiveRolloutDataset` usage across runs and validate batching.
+- [x] Implement scheduled sampling (cosine rollout TF decay) and curriculum rollout (growing horizon).
+- [x] Validate full pipeline end-to-end with `--autoregressive` flag.
 - [ ] Sweep `rollout_steps` in `{3, 5, 10}` with 3 seeds each.
 - [ ] Sweep `rollout_weight` in `{0.1, 0.5, 1.0, 2.0}` to find stability sweet spot.
+- [ ] Sweep `rollout_warmup_epochs` in `{10, 20, 40}` to tune curriculum speed.
 - [ ] Test `rollout_start_epoch` at `{0, 5, 10}` to assess warm-up vs immediate rollout.
+- [ ] Compare `rollout_teacher_forcing_end` at `{0.0, 0.1, 0.3}` — fully vs partially autoregressive after warm-up.
+- [ ] Test `disable_single_step_after_warmup=True` to check if dropping the single-step loss after warmup helps or hurts.
 
 Success criteria:
 - Lower autoregressive error accumulation over long stints (reduced slope of error vs lap index) and improved late-race MAE/RMSE without destabilizing early-race predictions.

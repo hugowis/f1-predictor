@@ -247,3 +247,4 @@ data/vocabs/Team.json
 data/vocabs/Year.json
 .vscode/settings.json
 .gitignore
+*.json

@@ -354,6 +354,9 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
         encoder_type=model_config.get('encoder', model_config.get('encoder_type', 'gru')),
         embedding_dims=model_config.get('embedding_dims', {}),
         vocab_sizes=model_config.get('vocab_sizes', {}),
+        decoder_future_features=model_config.get('decoder_future_features', 0),
+        use_attention=model_config.get('use_attention', False),
+        compound_classes=model_config.get('compound_classes', 4),
         device=device,
     )
     

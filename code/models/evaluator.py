@@ -171,7 +171,17 @@ class Evaluator:
                             targets[k] = v.to(self.device)
                 else:
                     targets = targets.to(self.device)
-                
+
+                # If model uses decoder future features, pad decoder_input with zeros
+                # when future features are not provided by the dataloader.
+                n_fut = getattr(self.model, 'decoder_future_features', 0)
+                if n_fut > 0 and decoder_input.size(-1) < 1 + n_fut:
+                    pad = torch.zeros(
+                        *decoder_input.shape[:-1], n_fut,
+                        dtype=decoder_input.dtype, device=decoder_input.device,
+                    )
+                    decoder_input = torch.cat([decoder_input, pad], dim=-1)
+
                 # Forward pass with autocast for faster inference
                 with autocast(device_type='cuda', enabled=self.device == 'cuda'):
                     outputs = self.model(encoder_input, decoder_input, teacher_forcing=False)

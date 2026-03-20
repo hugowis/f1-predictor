@@ -1186,6 +1186,10 @@ class Trainer:
             logger.info(f"Early stopping monitor: {early_stopping_metric}")
         if early_stopping_min_epochs > 0:
             logger.info(f"Early stopping grace period: {early_stopping_min_epochs} epochs")
+        if rollout_loader is not None and rollout_warmup_epochs > 0:
+            logger.info(
+                f"Early stopping patience will reset after rollout warmup (epoch {rollout_start_epoch + rollout_warmup_epochs})"
+            )
         if disable_single_step_after_warmup:
             cutoff = rollout_start_epoch + rollout_warmup_epochs
             logger.info(f"Single-step training will be disabled after epoch {cutoff} (rollout warmup complete)")
@@ -1281,6 +1285,15 @@ class Trainer:
                     self._save_checkpoint(epoch, primary_loss, primary_metrics)
                 else:
                     self.epochs_without_improvement += 1
+
+                # Reset patience counter at the end of rollout warmup so early
+                # stopping doesn't fire during the warmup degradation dip.
+                warmup_end = rollout_start_epoch + rollout_warmup_epochs
+                if rollout_loader is not None and epoch == warmup_end:
+                    logger.info(
+                        f"Rollout warmup complete at epoch {epoch + 1} — resetting patience counter."
+                    )
+                    self.epochs_without_improvement = 0
 
                 # Early stopping (only after grace period)
                 if epoch >= early_stopping_min_epochs and self.epochs_without_improvement >= early_stopping_patience:

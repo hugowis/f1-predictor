@@ -86,9 +86,13 @@ class Trainer:
         compound_class_weights: Optional[List[float]] = None,
         lap_loss_kind: str = 'mse',
         lap_huber_delta: float = 0.1,
+        rollout_optimizer: Optional[Optimizer] = None,
+        rollout_scheduler: Optional[Any] = None,
     ):
         self.model = model
         self.optimizer = optimizer
+        self.rollout_optimizer = rollout_optimizer  # Separate optimizer for rollout training (lower LR)
+        self.rollout_scheduler = rollout_scheduler
         self.criterion = criterion
         self.device = device
         self.scheduler = scheduler
@@ -97,6 +101,7 @@ class Trainer:
         self.pit_loss_weight = pit_loss_weight
         self.compound_loss_weight = compound_loss_weight
         self.use_mixed_precision = use_mixed_precision and device == 'cuda'
+        self.rollout_scaler = GradScaler() if (self.use_mixed_precision and rollout_optimizer is not None) else None
         self.early_stopping_use_ema = early_stopping_use_ema
         self.early_stopping_ema_alpha = float(early_stopping_ema_alpha)
         self.dynamic_aux_balance = bool(dynamic_aux_balance)
@@ -567,6 +572,10 @@ class Trainer:
         total_comp_loss = 0.0
         num_batches = 0
 
+        # Use separate rollout optimizer and scaler when available (lower LR to prevent destabilisation)
+        opt = self.rollout_optimizer if self.rollout_optimizer is not None else self.optimizer
+        scaler = self.rollout_scaler if self.rollout_scaler is not None else self.scaler
+
         # Clamp scheduled-sampling ratio to valid range
         tf_ratio = float(np.clip(teacher_forcing_ratio, 0.0, 1.0))
         use_tf = tf_ratio > 0.0
@@ -705,34 +714,34 @@ class Trainer:
             ) * rollout_weight
 
             if not torch.isfinite(loss_batch):
-                self.optimizer.zero_grad(set_to_none=True)
+                opt.zero_grad(set_to_none=True)
                 continue
 
             loss_value = float(loss_batch.detach().item())
             if loss_value > 1e3:
                 logger.debug(f"Skipping pathological rollout batch at epoch {epoch}, batch {batch_idx}: loss={loss_value:.6f}")
-                self.optimizer.zero_grad(set_to_none=True)
+                opt.zero_grad(set_to_none=True)
                 continue
 
             loss = loss_batch / self.accumulation_steps
 
             if self.use_mixed_precision:
-                self.scaler.scale(loss).backward()
+                scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             if (batch_idx + 1) % self.accumulation_steps == 0:
                 if self.use_mixed_precision:
                     if self.gradient_clip is not None:
-                        self.scaler.unscale_(self.optimizer)
+                        scaler.unscale_(opt)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    scaler.step(opt)
+                    scaler.update()
                 else:
                     if self.gradient_clip is not None:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
-                    self.optimizer.step()
-                self.optimizer.zero_grad()
+                    opt.step()
+                opt.zero_grad()
 
             total_loss += loss_value
             total_lap_loss += float(lap_loss.detach().item())
@@ -1337,6 +1346,8 @@ class Trainer:
             # Scheduler step
             if self.scheduler is not None:
                 self.scheduler.step()
+            if self.rollout_scheduler is not None:
+                self.rollout_scheduler.step()
         
         logger.info("Training completed")
         return self.history
@@ -1425,7 +1436,9 @@ class Trainer:
             'model_config': self.model.get_config() if hasattr(self.model, 'get_config') else {},
             'timestamp': datetime.now().isoformat(),
         }
-        
+        if self.rollout_optimizer is not None:
+            checkpoint['rollout_optimizer_state_dict'] = self.rollout_optimizer.state_dict()
+
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Saved checkpoint to {checkpoint_path}")
         # Also save metrics to JSON (convert numpy types to Python native types)
@@ -1451,6 +1464,9 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if self.rollout_optimizer is not None and 'rollout_optimizer_state_dict' in checkpoint:
+            self.rollout_optimizer.load_state_dict(checkpoint['rollout_optimizer_state_dict'])
+            logger.info("Restored rollout optimizer state from checkpoint")
         logger.info(f"Loaded checkpoint from {checkpoint_path}")
         return checkpoint
 

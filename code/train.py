@@ -155,6 +155,10 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.rollout_steps = args.rollout_steps
     if getattr(args, 'rollout_weight', None) is not None:
         config.training.rollout_weight = args.rollout_weight
+    if getattr(args, 'rollout_lr', None) is not None:
+        config.training.rollout_learning_rate = args.rollout_lr
+    if getattr(args, 'early_stopping_metric', None) is not None:
+        config.training.early_stopping_metric = args.early_stopping_metric
     if getattr(args, 'rollout_start_epoch', None) is not None:
         config.training.rollout_start_epoch = args.rollout_start_epoch
     # Rollout scheduled sampling / curriculum overrides
@@ -620,6 +624,25 @@ def train(config: Config, output_dir: Path = None):
     # Loss function
     criterion = nn.MSELoss()
     
+    # Create separate rollout optimizer with lower LR (prevents destabilising single-step weights)
+    rollout_optimizer = None
+    rollout_scheduler = None
+    if getattr(config, 'use_autoregressive', False):
+        rollout_lr = getattr(config.training, 'rollout_learning_rate', None)
+        if rollout_lr is None:
+            rollout_lr = config.training.learning_rate * 0.1
+        rollout_optimizer = Adam(
+            model.parameters(),
+            lr=rollout_lr,
+            weight_decay=config.training.weight_decay,
+        )
+        rollout_scheduler = create_scheduler(rollout_optimizer, {
+            'scheduler_type': config.training.scheduler_type,
+            'warm_up_epochs': config.training.warm_up_epochs,
+            'total_epochs': config.training.num_epochs,
+        })
+        logger.info(f"Rollout optimizer: Adam(lr={rollout_lr:.2e}), scheduler={config.training.scheduler_type}")
+
     # Create trainer
     trainer = Trainer(
         model=model,
@@ -639,6 +662,8 @@ def train(config: Config, output_dir: Path = None):
         dynamic_aux_ema_alpha=getattr(config.training, 'dynamic_aux_ema_alpha', 0.05),
         dynamic_aux_min_scale=getattr(config.training, 'dynamic_aux_min_scale', 0.001),
         dynamic_aux_max_scale=getattr(config.training, 'dynamic_aux_max_scale', 20.0),
+        rollout_optimizer=rollout_optimizer,
+        rollout_scheduler=rollout_scheduler,
     )
     
     # Training loop
@@ -681,6 +706,13 @@ def train(config: Config, output_dir: Path = None):
                 logger.warning("Rollout val dataset is empty — rollout validation skipped")
 
     _rollout_warmup = int(getattr(config.training, 'rollout_warmup_epochs', 40))
+
+    # Fall back to val_loss when rollout_val_loss is requested but no rollout validation is available
+    _es_metric = getattr(config.training, 'early_stopping_metric', 'val_loss')
+    if _es_metric == 'rollout_val_loss' and rollout_val_loader is None:
+        logger.warning("early_stopping_metric='rollout_val_loss' but no rollout validation available; falling back to 'val_loss'")
+        _es_metric = 'val_loss'
+
     history = trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -694,7 +726,7 @@ def train(config: Config, output_dir: Path = None):
         rollout_start_epoch=getattr(config.training, 'rollout_start_epoch', 0),
         rollout_teacher_forcing_schedule=lambda epoch: rollout_teacher_forcing_schedule(epoch, config),
         rollout_curriculum_steps_schedule=lambda epoch: rollout_curriculum_steps(epoch, config),
-        early_stopping_metric=getattr(config.training, 'early_stopping_metric', 'val_loss'),
+        early_stopping_metric=_es_metric,
         disable_single_step_after_warmup=getattr(config.training, 'disable_single_step_after_warmup', False),
         rollout_warmup_epochs=_rollout_warmup,
     )
@@ -739,8 +771,10 @@ def main():
     parser.add_argument('--teacher-forcing-end', type=float, help='End teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-hold-epochs', type=int, help='Number of epochs to hold start ratio before decaying (used with hold_then_decay)')
     parser.add_argument('--rollout-steps', type=int, help='Number of autoregressive rollout steps per sample (default: 5)')
-    parser.add_argument('--rollout-weight', type=float, help='Weight multiplier for rollout loss (default: 1.0)')
+    parser.add_argument('--rollout-weight', type=float, help='Weight multiplier for rollout loss (default: 0.3)')
+    parser.add_argument('--rollout-lr', type=float, help='Separate learning rate for rollout optimizer (default: learning_rate * 0.1)')
     parser.add_argument('--rollout-start-epoch', type=int, help='Epoch at which to start rollout training (default: 0)')
+    parser.add_argument('--early-stopping-metric', choices=['val_loss', 'rollout_val_loss'], help='Metric for early stopping and checkpoint selection (default: rollout_val_loss)')
     # Rollout scheduled sampling / curriculum options
     parser.add_argument(
         '--rollout-tf-start', type=float,

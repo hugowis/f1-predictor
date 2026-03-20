@@ -311,6 +311,8 @@ def _run_rollout_evaluation(
     )
     print("\n" + report)
 
+    return rollout_denorm
+
 
 def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
     """
@@ -513,8 +515,9 @@ def evaluate(
     print("\n" + report)
     
     # --- Autoregressive rollout evaluation ---
+    rollout_ms = None
     try:
-        _run_rollout_evaluation(
+        rollout_ms = _run_rollout_evaluation(
             model=model,
             test_years=test_years,
             config_path=config_path,
@@ -524,6 +527,20 @@ def evaluate(
         )
     except Exception as exc:
         logger.warning(f"Rollout evaluation failed (non-fatal): {exc}")
+
+    # Merge rollout metrics into the main evaluation results JSON so the
+    # leaderboard can pick them up without reading a separate file.
+    if rollout_ms is not None:
+        results_path = output_dir / "evaluation_results.json"
+        try:
+            with open(results_path, 'r') as f:
+                results_data = json.load(f)
+            results_data['rollout_metrics_ms'] = rollout_ms
+            with open(results_path, 'w') as f:
+                json.dump(results_data, f, indent=2)
+            logger.info("Rollout metrics merged into evaluation_results.json")
+        except Exception as exc:
+            logger.warning(f"Failed to merge rollout metrics into evaluation_results.json: {exc}")
 
     return metrics
 

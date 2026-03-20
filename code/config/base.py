@@ -116,7 +116,8 @@ class TrainingConfig:
     # Rollout training (multi-step autoregressive)
     rollout_training: bool = False
     rollout_steps: int = 5
-    rollout_weight: float = 1.0
+    rollout_weight: float = 0.3
+    rollout_learning_rate: Optional[float] = None  # Separate LR for rollout optimizer; defaults to learning_rate * 0.1
     rollout_start_epoch: int = 0
 
     # Rollout scheduled sampling: teacher forcing ratio applied *inside* the
@@ -135,10 +136,10 @@ class TrainingConfig:
     # single-step training to full autoregressive rollout.
     rollout_curriculum: bool = True
 
-    # Early stopping metric: 'val_loss' (single-step, default) or
-    # 'rollout_val_loss' (fully-autoregressive rollout validation).
-    # Use 'rollout_val_loss' when rollout quality is the primary objective.
-    early_stopping_metric: str = 'val_loss'
+    # Early stopping metric: 'val_loss' (single-step) or
+    # 'rollout_val_loss' (fully-autoregressive rollout validation, default).
+    # 'rollout_val_loss' ensures checkpoint selection reflects autoregressive quality.
+    early_stopping_metric: str = 'rollout_val_loss'
 
     # When True, skip the single-step train_epoch() pass once the rollout
     # warmup period has completed (epoch >= rollout_start_epoch + rollout_warmup_epochs).

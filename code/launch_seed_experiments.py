@@ -38,6 +38,8 @@ class RunResult:
     median_ae_ms: float | None = None
     error_lt_50ms_pct: float | None = None
     best_val_loss: float | None = None
+    rollout_mae_ms: float | None = None
+    rollout_rmse_ms: float | None = None
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -185,6 +187,8 @@ def _read_metrics(output_dir: Path) -> dict[str, float | None]:
             "rmse_ms": None,
             "median_ae_ms": None,
             "error_lt_50ms_pct": None,
+            "rollout_mae_ms": None,
+            "rollout_rmse_ms": None,
         }
 
     with open(results_path, "r", encoding="utf-8") as handle:
@@ -196,11 +200,27 @@ def _read_metrics(output_dir: Path) -> dict[str, float | None]:
     if "error_0_10ms" in error_breakdown and "error_10_50ms" in error_breakdown:
         error_lt_50ms_pct = float(error_breakdown["error_0_10ms"] + error_breakdown["error_10_50ms"])
 
+    # Rollout (autoregressive) metrics from the merged evaluation results
+    rollout_ms = results.get("rollout_metrics_ms", {})
+    rollout_mae_ms = None
+    rollout_rmse_ms = None
+    # Compute mean over all horizon steps for a single summary number
+    horizon_mae = rollout_ms.get("horizon_mae", {})
+    horizon_rmse = rollout_ms.get("horizon_rmse", {})
+    if horizon_mae:
+        vals = [v for v in horizon_mae.values() if v is not None]
+        rollout_mae_ms = sum(vals) / len(vals) if vals else None
+    if horizon_rmse:
+        vals = [v for v in horizon_rmse.values() if v is not None]
+        rollout_rmse_ms = sum(vals) / len(vals) if vals else None
+
     return {
         "mae_ms": _maybe_float(metrics_ms.get("mae_ms")),
         "rmse_ms": _maybe_float(metrics_ms.get("rmse_ms")),
         "median_ae_ms": _maybe_float(metrics_ms.get("median_ae_ms")),
         "error_lt_50ms_pct": error_lt_50ms_pct,
+        "rollout_mae_ms": _maybe_float(rollout_mae_ms),
+        "rollout_rmse_ms": _maybe_float(rollout_rmse_ms),
     }
 
 
@@ -297,11 +317,17 @@ def _print_results(results: Sequence[RunResult], output_root: Path) -> None:
     print("\nRun summary")
     print("=" * 80)
     for result in sorted(results, key=lambda item: item.seed):
-        metric_text = (
+        ss_text = (
             f"mae_ms={result.mae_ms:.2f}, rmse_ms={result.rmse_ms:.2f}"
             if result.mae_ms is not None and result.rmse_ms is not None
-            else "metrics unavailable"
+            else "single-step metrics unavailable"
         )
+        ro_text = (
+            f"rollout_mae={result.rollout_mae_ms:.2f}, rollout_rmse={result.rollout_rmse_ms:.2f}"
+            if result.rollout_mae_ms is not None and result.rollout_rmse_ms is not None
+            else ""
+        )
+        metric_text = f"{ss_text}  {ro_text}".strip()
         print(
             f"seed={result.seed} status={result.status} exit_code={result.exit_code} "
             f"duration={result.duration_seconds:.1f}s {metric_text}"

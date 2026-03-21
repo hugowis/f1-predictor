@@ -146,6 +146,12 @@ class TrainingConfig:
     # Removes conflicting training signals once the model is fully autoregressive.
     disable_single_step_after_warmup: bool = False
 
+    # L2 anchor regularisation: at rollout_start_epoch the current weights are
+    # snapshotted and an L2 penalty lambda*mean((p-p0)^2) is added to BOTH the
+    # single-step and rollout losses.  This prevents either optimizer from
+    # drifting far from the pre-rollout weights, tackling catastrophic forgetting.
+    l2_anchor_lambda: float = 0.1
+
     # Data
     train_years: list = None
     val_years: list = None

@@ -176,12 +176,19 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.rollout_warmup_epochs = args.rollout_warmup_epochs
     if getattr(args, 'no_rollout_curriculum', False):
         config.training.rollout_curriculum = False
+    if getattr(args, 'l2_anchor_lambda', None) is not None:
+        config.training.l2_anchor_lambda = args.l2_anchor_lambda
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
     """Run evaluation and analysis after training finishes."""
+    checkpoints_dir = output_dir / "checkpoints"
+    # Evaluate single-step best checkpoint (best_model_ss.pt) when available,
+    # otherwise fall back to best_model.pt (rollout-optimized).
+    ss_path = checkpoints_dir / "best_model_ss.pt"
+    rollout_path = checkpoints_dir / "best_model.pt"
+    checkpoint_path = ss_path if ss_path.exists() else rollout_path
     try:
-        checkpoint_path = output_dir / "checkpoints" / "best_model.pt"
         if checkpoint_path.exists():
             logger.info(f"Running evaluation on checkpoint: {checkpoint_path}")
             run_evaluation(
@@ -664,6 +671,7 @@ def train(config: Config, output_dir: Path = None):
         dynamic_aux_max_scale=getattr(config.training, 'dynamic_aux_max_scale', 20.0),
         rollout_optimizer=rollout_optimizer,
         rollout_scheduler=rollout_scheduler,
+        l2_anchor_lambda=getattr(config.training, 'l2_anchor_lambda', 0.0),
     )
     
     # Training loop
@@ -793,6 +801,11 @@ def main():
     parser.add_argument(
         '--no-rollout-curriculum', action='store_true',
         help='Disable curriculum rollout (always use full rollout_steps from the first rollout epoch).',
+    )
+    parser.add_argument(
+        '--l2-anchor-lambda', type=float,
+        help='L2 anchor regularisation strength (default: 0.1). Snapshots pre-rollout weights and '
+             'penalises both optimizers for deviating from them, preventing catastrophic forgetting.',
     )
     
     args = parser.parse_args()

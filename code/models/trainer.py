@@ -88,10 +88,13 @@ class Trainer:
         lap_huber_delta: float = 0.1,
         rollout_optimizer: Optional[Optimizer] = None,
         rollout_scheduler: Optional[Any] = None,
+        l2_anchor_lambda: float = 0.0,
     ):
         self.model = model
         self.optimizer = optimizer
         self.rollout_optimizer = rollout_optimizer  # Separate optimizer for rollout training (lower LR)
+        self.l2_anchor_lambda = float(l2_anchor_lambda)
+        self._anchor_weights: Optional[Dict[str, torch.Tensor]] = None
         self.rollout_scheduler = rollout_scheduler
         self.criterion = criterion
         self.device = device
@@ -164,6 +167,32 @@ class Trainer:
             return float(value)
         alpha = self.dynamic_aux_ema_alpha
         return alpha * float(value) + (1.0 - alpha) * float(current_ema)
+
+    def register_anchor(self) -> None:
+        """Snapshot current model weights as L2 anchor for anti-forgetting regularisation."""
+        self._anchor_weights = {
+            name: param.detach().clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+        n_params = sum(p.numel() for p in self._anchor_weights.values())
+        logger.info(
+            f"L2 anchor registered: {n_params:,} parameters snapshotted "
+            f"(lambda={self.l2_anchor_lambda})"
+        )
+
+    def _anchor_penalty(self) -> torch.Tensor:
+        """L2 penalty w.r.t. snapshotted anchor weights (mean over all parameters)."""
+        if self._anchor_weights is None or self.l2_anchor_lambda == 0.0:
+            return torch.tensor(0.0, device=self.device)
+        total = torch.tensor(0.0, device=self.device)
+        n = 0
+        for name, param in self.model.named_parameters():
+            if name in self._anchor_weights:
+                anchor = self._anchor_weights[name]
+                total = total + ((param - anchor) ** 2).sum()
+                n += param.numel()
+        return self.l2_anchor_lambda * total / max(n, 1)
 
     def _maybe_initialize_compound_class_weights(self, dataset: Optional[Any]) -> None:
         if self._compound_class_weight_tensor is not None or dataset is None:
@@ -426,6 +455,9 @@ class Trainer:
                 lap_loss_value = float(loss_batch.detach().item())
                 pit_loss_value = 0.0
                 comp_loss_value = 0.0
+
+            # Add L2 anchor penalty to prevent catastrophic forgetting during rollout phase
+            loss_batch = loss_batch + self._anchor_penalty()
 
             # Skip pathological batches that would dominate epoch loss and destabilize training
             if not torch.isfinite(loss_batch):
@@ -712,6 +744,9 @@ class Trainer:
                 + float(self.pit_loss_weight) * pit_loss
                 + float(self.compound_loss_weight) * comp_loss
             ) * rollout_weight
+
+            # Add L2 anchor penalty to prevent catastrophic forgetting of single-step weights
+            loss_batch = loss_batch + self._anchor_penalty()
 
             if not torch.isfinite(loss_batch):
                 opt.zero_grad(set_to_none=True)
@@ -1230,6 +1265,16 @@ class Trainer:
             self.history['train_compound_loss'].append(float(train_stats.get('compound_loss', 0.0)))
             self.history['single_step_skipped'].append(warmup_done)
 
+            # Register L2 anchor at the start of the first rollout epoch so both
+            # optimizers are penalised for deviating from the pre-rollout weights.
+            if (
+                rollout_loader is not None
+                and epoch == rollout_start_epoch
+                and self.l2_anchor_lambda > 0.0
+                and self._anchor_weights is None
+            ):
+                self.register_anchor()
+
             # Rollout training pass (multi-step autoregressive with scheduled sampling)
             rollout_loss_value = 0.0
             rollout_tf_value = 0.0
@@ -1286,7 +1331,19 @@ class Trainer:
                 self.history['val_loss_monitored'].append(float(monitored_val))
                 logger.info(f"Monitored ({early_stopping_metric}): {monitored_val:.6f}")
 
-                # Check for improvement
+                # Always track the best single-step checkpoint separately.
+                # When early_stopping_metric='rollout_val_loss', the primary
+                # checkpoint optimises for rollout quality (and single-step val
+                # will regress).  best_model_ss.pt preserves the single-step
+                # best so evaluation can compare both.
+                if val_loss < getattr(self, '_best_ss_val_loss', float('inf')):
+                    self._best_ss_val_loss = val_loss
+                    self._save_checkpoint_path(
+                        epoch, val_loss, val_metrics,
+                        filename='best_model_ss.pt',
+                    )
+
+                # Check for improvement on the monitored metric
                 if monitored_val < self.best_monitored_val:
                     self.best_val_loss = primary_loss
                     self.best_monitored_val = monitored_val
@@ -1295,7 +1352,28 @@ class Trainer:
                 else:
                     self.epochs_without_improvement += 1
 
-                # Reset patience counter at the end of rollout warmup so early
+                # Reset patience and best-tracked value when rollout starts,
+                # because the monitored metric switches from single-step val_loss
+                # (~1e-4 scale) to rollout_val_loss (~0.1 scale).  Without this
+                # reset, early stopping fires before the model has any chance to
+                # improve on the rollout metric.
+                if (
+                    rollout_loader is not None
+                    and early_stopping_metric == 'rollout_val_loss'
+                    and epoch == rollout_start_epoch
+                    and not np.isnan(rollout_val_loss_value)
+                ):
+                    logger.info(
+                        f"Rollout training started at epoch {epoch + 1} — "
+                        f"resetting patience counter and best monitored value "
+                        f"(was {self.best_monitored_val:.6f}, now {monitored_val:.6f})."
+                    )
+                    self.best_monitored_val = monitored_val
+                    self.best_val_loss = primary_loss
+                    self.epochs_without_improvement = 0
+                    self._save_checkpoint(epoch, primary_loss, primary_metrics)
+
+                # Also reset patience at the end of rollout warmup so early
                 # stopping doesn't fire during the warmup degradation dip.
                 warmup_end = rollout_start_epoch + rollout_warmup_epochs
                 if rollout_loader is not None and epoch == warmup_end:
@@ -1423,6 +1501,21 @@ class Trainer:
             'mape': metrics['mape'],
         }
     
+    def _save_checkpoint_path(self, epoch: int, val_loss: float, metrics: Dict[str, float], filename: str):
+        """Save checkpoint to a specific filename."""
+        checkpoint_path = self.checkpoint_dir / filename
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'val_loss': val_loss,
+            'metrics': metrics,
+            'model_config': self.model.get_config() if hasattr(self.model, 'get_config') else {},
+            'timestamp': datetime.now().isoformat(),
+        }
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Saved single-step checkpoint to {checkpoint_path} (val_loss={val_loss:.6f})")
+
     def _save_checkpoint(self, epoch: int, val_loss: float, metrics: Dict[str, float]):
         """Save model checkpoint."""
         checkpoint_path = self.checkpoint_dir / f"best_model.pt"

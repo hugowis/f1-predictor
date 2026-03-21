@@ -123,9 +123,22 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
         if train_losses and val_losses:
             best_idx = int(np.argmin(val_losses))
+            # Try to read the actual epoch from the saved checkpoint (reflects true monitored metric,
+            # e.g. rollout_val_loss), falling back to argmin(val_loss) if unavailable.
+            ckpt_path = results_dir / "checkpoints" / "best_model.pt"
+            checkpoint_epoch = None
+            if ckpt_path.exists():
+                try:
+                    import torch as _torch
+                    _ckpt = _torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                    checkpoint_epoch = int(_ckpt.get('epoch', -1)) + 1  # stored 0-indexed
+                except Exception:
+                    pass
+            reported_best_epoch = checkpoint_epoch if checkpoint_epoch is not None and checkpoint_epoch > 0 else int(best_idx + 1)
             diagnostics['training_dynamics'] = {
                 'epochs_trained': int(len(val_losses)),
-                'best_epoch': int(best_idx + 1),
+                'best_epoch': reported_best_epoch,
+                'best_epoch_by_val_loss': int(best_idx + 1),
                 'best_val_loss': float(val_losses[best_idx]),
                 'last_val_loss': float(val_losses[-1]),
                 'last_train_loss': float(train_losses[-1]),

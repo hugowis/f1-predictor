@@ -15,7 +15,7 @@ Metrics computed:
 import logging
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import json
 import numpy as np
@@ -23,6 +23,18 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+# Imported lazily to avoid circular imports; mirrors
+# dataloaders.autoregressive_dataloader.ROLLOUT_DECODER_FEATURE_COLS
+_ROLLOUT_DECODER_FEATURE_COLS: Optional[List[str]] = None
+
+
+def _get_decoder_feature_cols() -> List[str]:
+    global _ROLLOUT_DECODER_FEATURE_COLS
+    if _ROLLOUT_DECODER_FEATURE_COLS is None:
+        from dataloaders.autoregressive_dataloader import ROLLOUT_DECODER_FEATURE_COLS
+        _ROLLOUT_DECODER_FEATURE_COLS = ROLLOUT_DECODER_FEATURE_COLS
+    return _ROLLOUT_DECODER_FEATURE_COLS
 
 
 def evaluate_autoregressive_rollout(
@@ -63,6 +75,10 @@ def evaluate_autoregressive_rollout(
     numeric_columns = test_dataset.numeric_columns
     lap_time_feat_idx = numeric_columns.index('LapTime')  # index inside feature vector
 
+    # Decoder future-feature dimensionality (0 if model was trained without them)
+    n_fut = getattr(model, 'decoder_future_features', 0)
+    decoder_feat_cols = _get_decoder_feature_cols()[:n_fut] if n_fut > 0 else []
+
     # Work with normal laps only (matching training/pair-generation filter)
     data = test_dataset.data.copy()
     data = data[data['is_normal_lap'] == 1].copy()
@@ -86,6 +102,8 @@ def evaluate_autoregressive_rollout(
             else:
                 group_norm = group_data
 
+            group_norm = group_norm.reset_index(drop=True)
+
             # Extract per-lap feature vectors and lap times
             all_features = []
             all_laptimes = []
@@ -96,6 +114,21 @@ def evaluate_autoregressive_rollout(
 
             all_features = np.array(all_features, dtype=np.float32)
             all_laptimes = np.array(all_laptimes, dtype=np.float32)
+
+            # Pre-extract decoder future features for all laps (known-future strategy cols).
+            # Build a (n_laps, n_fut) array aligned to decoder_feat_cols; columns absent
+            # from the normalised dataframe are zero-filled so the decoder input is
+            # always the full (1 + n_fut) size the model expects.
+            if decoder_feat_cols:
+                n_laps_grp = len(group_norm)
+                all_dec_feats = np.zeros((n_laps_grp, len(decoder_feat_cols)), dtype=np.float32)
+                for col_idx, col in enumerate(decoder_feat_cols):
+                    if col in group_norm.columns:
+                        vals = group_norm[col].values.astype(np.float32)
+                        np.nan_to_num(vals, copy=False, nan=0.0)
+                        all_dec_feats[:, col_idx] = vals
+            else:
+                all_dec_feats = None
 
             # Replace NaN in features (e.g. delta_to_car_ahead for lead car,
             # missing weather data) with 0.0 to prevent NaN propagation.
@@ -120,11 +153,15 @@ def evaluate_autoregressive_rollout(
                 # Build encoder input tensor
                 context_tensor = torch.from_numpy(context).unsqueeze(0).to(device)
 
-                # Decoder input: last context lap time
-                last_laptime = float(context[-1, lap_time_feat_idx])
-                decoder_input = torch.tensor(
-                    [[[last_laptime]]], dtype=torch.float32, device=device,
-                )
+                # Decoder input: shape (1, 1, 1 + n_fut)
+                # Col 0 = last LapTime in context (model's own last prediction after step 0)
+                # Cols 1+ = known-future strategy features at the target lap (from ground truth)
+                last_laptime = context[-1, lap_time_feat_idx]
+                dec_vec = np.array([last_laptime], dtype=np.float32)
+                if all_dec_feats is not None:
+                    dec_vec = np.concatenate([dec_vec, all_dec_feats[target_idx]])
+                decoder_input = torch.from_numpy(dec_vec).float().to(device)
+                decoder_input = decoder_input.unsqueeze(0).unsqueeze(0)  # (1, 1, 1+n_fut)
 
                 # Single-step forward pass (no teacher forcing)
                 outputs = model(context_tensor, decoder_input, teacher_forcing=False)

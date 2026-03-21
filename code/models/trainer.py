@@ -89,11 +89,15 @@ class Trainer:
         rollout_optimizer: Optional[Optimizer] = None,
         rollout_scheduler: Optional[Any] = None,
         l2_anchor_lambda: float = 0.0,
+        rollout_step_discount: float = 0.85,
+        rollout_gradient_clip: Optional[float] = 0.5,
     ):
         self.model = model
         self.optimizer = optimizer
         self.rollout_optimizer = rollout_optimizer  # Separate optimizer for rollout training (lower LR)
         self.l2_anchor_lambda = float(l2_anchor_lambda)
+        self.rollout_step_discount = float(rollout_step_discount)
+        self.rollout_gradient_clip = rollout_gradient_clip
         self._anchor_weights: Optional[Dict[str, torch.Tensor]] = None
         self.rollout_scheduler = rollout_scheduler
         self.criterion = criterion
@@ -689,7 +693,10 @@ class Trainer:
                     teacher_forcing_ratio=tf_ratio,
                 )
 
-            # --- Loss computation (same logic as train_epoch) ---
+            # --- Loss computation with per-step exponential discounting ---
+            # Later rollout steps accumulate more autoregressive error; weighting
+            # them equally causes gradients from noisy late steps to dominate and
+            # explode.  Discount factor gamma^t down-weights later steps.
             lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs  # (B, S, 1)
             lap_t_rs = lap_t.unsqueeze(-1)  # (B, S, 1)
 
@@ -700,49 +707,79 @@ class Trainer:
             if not torch.isfinite(lap_pred).all():
                 continue
 
-            denom = mask.float().sum()
+            # Build per-step discount weights: gamma^0, gamma^1, ..., gamma^(S-1)
+            gamma = self.rollout_step_discount
+            step_weights = torch.tensor(
+                [gamma ** t for t in range(active_steps)],
+                dtype=torch.float32, device=self.device,
+            ).view(1, active_steps, 1)  # (1, S, 1)
+
             if self.lap_loss_kind == 'huber':
                 diff = lap_pred - lap_t_rs
                 ad = diff.abs()
                 delta = self.lap_huber_delta
                 huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
-                lap_loss = (huber * mask.float()).sum() / denom
+                weighted = huber * mask.float() * step_weights
+                denom = (mask.float() * step_weights).sum()
+                lap_loss = weighted.sum() / denom.clamp(min=1e-8)
             else:
                 se = (lap_pred - lap_t_rs) ** 2
-                lap_loss = (se * mask.float()).sum() / denom
+                weighted = se * mask.float() * step_weights
+                denom = (mask.float() * step_weights).sum()
+                lap_loss = weighted.sum() / denom.clamp(min=1e-8)
 
             pit_loss = torch.tensor(0.0, device=self.device)
             pit_t = targets.get('is_pitlap', None) if isinstance(targets, dict) else None
             if pit_t is not None and 'pit_logits' in outputs:
                 pit_pred = outputs['pit_logits']  # (B, S)
-                # Align pit target to active steps
                 pit_t_active = pit_t[:, :active_steps] if pit_t.dim() > 1 else pit_t
-                bce = nn.BCEWithLogitsLoss(reduction='mean')
-                pit_loss = bce(pit_pred, pit_t_active.float())
+                bce = nn.BCEWithLogitsLoss(reduction='none')
+                pit_raw = bce(pit_pred, pit_t_active.float())  # (B, S)
+                # Apply step discount to pit loss too
+                step_w_2d = step_weights.squeeze(-1)  # (1, S)
+                pit_loss = (pit_raw * step_w_2d).sum() / (step_w_2d.expand_as(pit_raw).sum().clamp(min=1e-8))
 
             comp_loss = torch.tensor(0.0, device=self.device)
             comp_t = targets.get('compound', None) if isinstance(targets, dict) else None
             if comp_t is not None and 'compound_logits' in outputs:
                 comp_pred = outputs['compound_logits']  # (B, S, C)
                 bsz, seq_len, C = comp_pred.shape
-                comp_pred_flat = comp_pred.reshape(bsz * seq_len, C)
-                # Align compound target to active steps
                 comp_t_active = comp_t[:, :active_steps] if comp_t.dim() > 1 else comp_t
-                comp_t_flat = comp_t_active.reshape(-1)
                 comp_weight = self._compound_class_weight_tensor
                 if comp_weight is not None:
-                    comp_weight = comp_weight.to(device=comp_pred_flat.device, dtype=torch.float32)
+                    comp_weight = comp_weight.to(device=comp_pred.device, dtype=torch.float32)
                 try:
-                    ce = nn.CrossEntropyLoss(weight=comp_weight, label_smoothing=self.compound_label_smoothing)
+                    ce = nn.CrossEntropyLoss(weight=comp_weight, label_smoothing=self.compound_label_smoothing, reduction='none')
                 except TypeError:
-                    ce = nn.CrossEntropyLoss(weight=comp_weight)
+                    ce = nn.CrossEntropyLoss(weight=comp_weight, reduction='none')
                 with autocast(device_type='cuda', enabled=False):
-                    comp_loss = ce(comp_pred_flat.float(), comp_t_flat.long())
+                    comp_raw = ce(comp_pred.reshape(bsz * seq_len, C).float(), comp_t_active.reshape(-1).long())
+                    comp_raw = comp_raw.view(bsz, seq_len)  # (B, S)
+                step_w_2d = step_weights.squeeze(-1)  # (1, S)
+                comp_loss = (comp_raw * step_w_2d).sum() / (step_w_2d.expand_as(comp_raw).sum().clamp(min=1e-8))
+
+            # Dynamic auxiliary scaling (match single-step behaviour)
+            pit_scale = 1.0
+            comp_scale = 1.0
+            if self.dynamic_aux_balance:
+                self._lap_loss_ema = self._update_loss_ema(self._lap_loss_ema, float(lap_loss.detach().item()))
+                self._pit_loss_ema = self._update_loss_ema(self._pit_loss_ema, float(pit_loss.detach().item()))
+                self._compound_loss_ema = self._update_loss_ema(self._compound_loss_ema, float(comp_loss.detach().item()))
+                if self._pit_loss_ema is not None and self._pit_loss_ema > 0:
+                    pit_scale = float(np.clip(
+                        self._lap_loss_ema / (self._pit_loss_ema + 1e-8),
+                        self.dynamic_aux_min_scale, self.dynamic_aux_max_scale,
+                    ))
+                if self._compound_loss_ema is not None and self._compound_loss_ema > 0:
+                    comp_scale = float(np.clip(
+                        self._lap_loss_ema / (self._compound_loss_ema + 1e-8),
+                        self.dynamic_aux_min_scale, self.dynamic_aux_max_scale,
+                    ))
 
             loss_batch = (
                 lap_loss
-                + float(self.pit_loss_weight) * pit_loss
-                + float(self.compound_loss_weight) * comp_loss
+                + float(self.pit_loss_weight) * pit_scale * pit_loss
+                + float(self.compound_loss_weight) * comp_scale * comp_loss
             ) * rollout_weight
 
             # Add L2 anchor penalty to prevent catastrophic forgetting of single-step weights
@@ -766,16 +803,26 @@ class Trainer:
                 loss.backward()
 
             if (batch_idx + 1) % self.accumulation_steps == 0:
+                # Use tighter rollout-specific gradient clip to prevent explosion
+                clip_val = self.rollout_gradient_clip if self.rollout_gradient_clip is not None else self.gradient_clip
                 if self.use_mixed_precision:
-                    if self.gradient_clip is not None:
+                    if clip_val is not None:
                         scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_val)
                     scaler.step(opt)
                     scaler.update()
                 else:
-                    if self.gradient_clip is not None:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
-                    opt.step()
+                    if clip_val is not None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_val)
+                    # Check for non-finite gradients before stepping
+                    skip_step = False
+                    for name, p in self.model.named_parameters():
+                        if p.grad is not None and not torch.isfinite(p.grad).all():
+                            logger.warning(f"Non-finite rollout gradient for {name} at batch {batch_idx}, skipping")
+                            skip_step = True
+                            break
+                    if not skip_step:
+                        opt.step()
                 opt.zero_grad()
 
             total_loss += loss_value
@@ -1282,13 +1329,37 @@ class Trainer:
             if rollout_loader is not None and epoch >= rollout_start_epoch:
                 rollout_tf = rollout_teacher_forcing_schedule(epoch)
                 cur_steps = rollout_curriculum_steps_schedule(epoch)
+
+                # Rollout weight warmup: ramp from 10% to full weight over warmup
+                # period to prevent sudden loss magnitude shock.
+                eff_epoch = epoch - rollout_start_epoch
+                if rollout_warmup_epochs > 0 and eff_epoch < rollout_warmup_epochs:
+                    warmup_frac = 0.1 + 0.9 * (eff_epoch / rollout_warmup_epochs)
+                    effective_rollout_weight = rollout_weight * warmup_frac
+                else:
+                    effective_rollout_weight = rollout_weight
+
+                # Freeze encoder during early rollout epochs to protect learned
+                # feature representations from noisy autoregressive gradients.
+                freeze_epochs = getattr(self, '_rollout_freeze_encoder_epochs', 0)
+                encoder_frozen = False
+                if freeze_epochs > 0 and eff_epoch < freeze_epochs:
+                    encoder_frozen = True
+                    for p in self.model.encoder.parameters():
+                        p.requires_grad_(False)
+
                 rollout_stats = self.train_epoch_rollout(
                     rollout_loader,
                     epoch,
-                    rollout_weight,
+                    effective_rollout_weight,
                     teacher_forcing_ratio=rollout_tf,
                     current_rollout_steps=cur_steps,
                 )
+
+                # Unfreeze encoder after rollout epoch
+                if encoder_frozen:
+                    for p in self.model.encoder.parameters():
+                        p.requires_grad_(True)
                 rollout_loss_value = rollout_stats.get('loss', 0.0)
                 rollout_tf_value = rollout_tf
                 rollout_steps_value = rollout_stats.get('active_steps', cur_steps if cur_steps is not None else 0)

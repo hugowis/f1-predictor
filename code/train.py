@@ -178,6 +178,12 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.rollout_curriculum = False
     if getattr(args, 'l2_anchor_lambda', None) is not None:
         config.training.l2_anchor_lambda = args.l2_anchor_lambda
+    if getattr(args, 'rollout_step_discount', None) is not None:
+        config.training.rollout_step_discount = args.rollout_step_discount
+    if getattr(args, 'rollout_gradient_clip', None) is not None:
+        config.training.rollout_gradient_clip = args.rollout_gradient_clip
+    if getattr(args, 'rollout_freeze_encoder_epochs', None) is not None:
+        config.training.rollout_freeze_encoder_epochs = args.rollout_freeze_encoder_epochs
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
@@ -672,8 +678,13 @@ def train(config: Config, output_dir: Path = None):
         rollout_optimizer=rollout_optimizer,
         rollout_scheduler=rollout_scheduler,
         l2_anchor_lambda=getattr(config.training, 'l2_anchor_lambda', 0.0),
+        rollout_step_discount=getattr(config.training, 'rollout_step_discount', 0.85),
+        rollout_gradient_clip=getattr(config.training, 'rollout_gradient_clip', 0.5),
     )
     
+    # Set encoder freeze duration for rollout warmup
+    trainer._rollout_freeze_encoder_epochs = getattr(config.training, 'rollout_freeze_encoder_epochs', 0)
+
     # Training loop
     logger.info("\nStarting training...")
 
@@ -806,6 +817,21 @@ def main():
         '--l2-anchor-lambda', type=float,
         help='L2 anchor regularisation strength (default: 0.1). Snapshots pre-rollout weights and '
              'penalises both optimizers for deviating from them, preventing catastrophic forgetting.',
+    )
+    parser.add_argument(
+        '--rollout-step-discount', type=float,
+        help='Per-step exponential discount for rollout loss (default: 0.85). '
+             'Loss at step t is multiplied by gamma^t to prevent later steps from dominating.',
+    )
+    parser.add_argument(
+        '--rollout-gradient-clip', type=float,
+        help='Separate gradient clip norm for rollout optimizer (default: 0.5). '
+             'Tighter than single-step clip to prevent rollout gradient explosion.',
+    )
+    parser.add_argument(
+        '--rollout-freeze-encoder-epochs', type=int,
+        help='Freeze encoder for N epochs after rollout starts (default: 10). '
+             'Protects learned representations from noisy autoregressive gradients.',
     )
     
     args = parser.parse_args()

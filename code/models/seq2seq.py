@@ -522,6 +522,12 @@ class Seq2Seq(BaseModel):
                 else:
                     lap_next = step_output
 
+                # Clamp autoregressive predictions fed back as input to prevent
+                # runaway values that cause cascading loss explosion.  The range
+                # [-5, 5] covers ~5 standard deviations of normalised lap times.
+                if not teacher_forcing or teacher_forcing_ratio < 0.999:
+                    lap_next = lap_next.clamp(-5.0, 5.0)
+
                 if n_fut > 0:
                     fut_next = decoder_input[:, t+1:t+2, 1:]    # always from data
                     current_input = torch.cat([lap_next, fut_next], dim=-1)

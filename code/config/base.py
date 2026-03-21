@@ -152,6 +152,20 @@ class TrainingConfig:
     # drifting far from the pre-rollout weights, tackling catastrophic forgetting.
     l2_anchor_lambda: float = 0.1
 
+    # Per-step exponential discount for rollout loss: loss at step t is
+    # multiplied by gamma^t.  Prevents later steps (with compounded AR error)
+    # from dominating gradients and causing loss explosion.
+    rollout_step_discount: float = 0.85
+
+    # Rollout gradient clip: separate (tighter) clip norm for the rollout
+    # optimizer.  None means use the same gradient_clip as single-step.
+    rollout_gradient_clip: Optional[float] = 0.5
+
+    # Freeze encoder parameters during the first N epochs of rollout warmup
+    # to protect learned representations from being corrupted by noisy
+    # autoregressive gradients.  0 = no freezing.
+    rollout_freeze_encoder_epochs: int = 10
+
     # Data
     train_years: list = None
     val_years: list = None

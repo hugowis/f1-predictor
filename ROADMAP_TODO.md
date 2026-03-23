@@ -1,131 +1,238 @@
-# F1 Predictor Roadmap and Detailed TODO
+# F1 Predictor — Experiment Roadmap
 
-This file tracks the next experimentation steps and development axes beyond the current README summary. It is meant to provide a more detailed and structured plan for improving the model and repository over time. All experiments are run using the `code/launch_seed_experiments.py` launcher, and results are tracked in `leaderboard.md` for easy comparison. The roadmap is organized by priority and axis of improvement, with specific hypotheses, tasks, and success criteria for each experiment.
+This file tracks the next experimentation steps ordered by priority. All experiments are run using `code/launch_seed_experiments.py` or `code/grid_search_experiment.py`, with 3 seeds per configuration for statistical significance. Results are stored in `results/` directories.
 
-## Priority 1: High-Impact Modeling Experiments
+**Current best model**: Seq2Seq GRU (256 hidden, 3 layers, 35 features)
+- Next-lap MAE: **25.08ms** (phase2_ar, seed 42, 150 epochs)
+- Rollout stint MAE: **~75,100ms** (scheduled sampling, seed 111)
+- Stability ratio: ~1.94
 
-### P1.1 Loss weighting and auxiliary task balancing
+---
 
-Hypothesis:
-- Better balancing of lap/pit/compound losses can reduce large-error tails.
+## High Priority
 
-Tasks:
-- [x] Grid search `compound_loss_weight` in `{0.005, 0.01, 0.02, 0.05}`.
-- [x] Grid search `pit_loss_weight` in `{0.0, 1e-4, 5e-4, 1e-3}`.
-- [x] Compare dynamic aux scaling on vs off.
-- [x] Evaluate Huber lap loss with deltas `{0.05, 0.1, 0.2}`.
+### E1. Rollout Grid Search
 
-Compound-loss Result:
-- Best setting remains `compound_loss_weight=0.01` (best-seed metrics: MAE `25.08` ms, RMSE `49.43` ms, Median AE `13.00` ms, Error < 50 ms `89.25%`).
-- Higher weights (`0.02`, `0.05`) degraded performance; `0.005` underperformed and showed higher seed variance.
-
-Pit-loss sweep Result:
-- Best setting from the pit-weight grid search: `pit_loss_weight=1e-3` (best-seed metrics: MAE `21.66` ms, RMSE `41.24` ms, Median AE `12.11` ms, Error < 50 ms `91.14%`).
-- `5e-4` showed high seed variance (one good seed, two poor); `1e-4` underperformed relative to baseline `0.0`.
-
-Dynamic aux scaling Result:
-- Dynamic aux scaling ON performed best (best-seed metrics: MAE 21.66 ms, RMSE 41.24 ms, Median AE 12.11 ms, %<50ms 91.14%).
-- Dynamic aux scaling OFF showed high seed variance and unstable runs (best seed MAE 26.70 ms but two seeds had very large errors / poor validation), indicating the automatic balancing helps stability for this setup.
-
-Huber-loss Result:
-- Tested Huber lap loss with delta=0.05 (three seeds). Best seed (seed 456) produced MAE 37.31 ms, RMSE 69.64 ms, Median AE 18.91 ms, %<50ms 86.63 — substantially worse than the MSE baseline (MAE ~25.08 ms). Based on these runs, we will keep MSE as the primary lap loss.
-
-### P1.2 Scheduled sampling and teacher forcing schedule
+Systematic grid over rollout-related hyperparameters to find the configuration that minimizes multi-step error accumulation.
 
 Hypothesis:
-- Better schedule can improve autoregressive stability and reduce drift.
+- The rollout evaluator shows systematic drift at h>10. A joint sweep of rollout training parameters (steps, weight, start epoch) may find a sweet spot that current single-axis experiments missed.
 
 Tasks:
-
-- [x] Add a metric for autoregressive error accumulation on long stints/races.
-- [ ] Compare linear vs exponential teacher forcing decay.
-- [ ] Sweep end TF ratios and decay duration. 
-- [ ] Add a "hold then decay" schedule option.  epochs
-- [ ] Test several epochs numbers.
+- [ ] Define grid: `rollout_steps` x `rollout_weight` x `rollout_start_epoch`
+- [ ] Run via `grid_search_experiment.py` with 3 seeds per combo
+- [ ] Evaluate on stint MAE, stability ratio, and next-lap MAE (must not regress)
+- [ ] Build on best config (scheduled sampling + tire degradation features)
 
 Success criteria:
-- Lower autoregressive error accumulation on long stints/races.
+- Stint total time MAE < 70,000ms
+- No regression on next-lap MAE (must stay < 40ms)
 
+---
 
-### P1.3 Context window and sequence strategy
+### E2. Scheduled Sampling Hyperparameter Sweep
+
+P0.2 validated the approach with a single config (p=0.5, std=0.02, start=10). A proper sweep may find a significantly better operating point.
 
 Hypothesis:
-- Context window too short misses race state; too long adds noise.
+- Higher noise or earlier start could further reduce exposure bias.
+- Lower noise might preserve next-lap accuracy while still helping rollout.
 
 Tasks:
-- [ ] Evaluate `context_window` in `{5, 10, 15, 20}`.
-- [ ] Compare full-race mode vs bounded horizon mode.
-- [ ] Add analysis by lap index to detect where performance drops.
+- [ ] Grid search `ss-max-prob` in {0.3, 0.5, 0.7, 1.0}
+- [ ] Grid search `ss-noise-std` in {0.01, 0.02, 0.05}
+- [ ] Grid search `ss-start-epoch` in {5, 10, 20}
+- [ ] Run via `grid_search_experiment.py`, 3 seeds per combo
+- [ ] Analyze interaction between noise intensity and rollout stability
 
 Success criteria:
-- Improved late-race MAE/RMSE without worsening early-race accuracy.
+- Find config with stint MAE < 73,000ms
+- All 3 seeds converge (no catastrophic failures)
 
-## Priority 2: Data and Feature Engineering Axis
+---
 
-### P2.1 Feature ablation study
+### E3. Teacher Forcing Schedule Sweep
 
-- [ ] Run systematic ablation sets:
-  - weather off
-  - compound features off
-  - position/track status off
-  - driver/team embeddings off
-- [ ] Document feature importance by delta in MAE/RMSE.
+Teacher forcing decay controls how quickly the model transitions from seeing ground-truth to its own predictions during decoder training.
 
-Success criteria:
-- Clear signal of highest-value features and removable noise features.
+Hypothesis:
+- Current exponential decay to 0.3 may not be optimal. A hold-then-decay schedule could let the model learn basics before exposure to autoregressive noise.
 
-### P2.2 Augmentation policy refinement
-
-- [ ] Sweep `augment_prob` in `{0.0, 0.05, 0.1, 0.2, 0.3}` with 3 seeds each.
-- [ ] Track if augmentation helps robustness or only hurts clean-data MAE.
-- [ ] Introduce feature-specific augmentation (not uniform noise).
-
-### P2.3 Pretraining data expansion
-
-- [ ] Add pretraining experiments on FP sessions, qualifying sessions, and sprint races.
-- [ ] Evaluate whether pretraining improves race-session generalization.
-- [ ] Explicitly test whether pretraining helps auxiliary pit-head learning.
+Tasks:
+- [ ] Grid search `teacher-forcing-decay` in {linear, exponential, hold_then_decay, constant}
+- [ ] Grid search `teacher-forcing-end` in {0.0, 0.1, 0.3, 0.5}
+- [ ] Grid search `teacher-forcing-hold-epochs` in {0, 10, 20, 30} (for hold_then_decay)
+- [ ] Test interaction with scheduled sampling (on vs off)
+- [ ] Test with different epoch counts {100, 150, 200}
 
 Success criteria:
-- Consistent gain on held-out race sessions without harming calibration or stability.
+- Lower rollout error accumulation on long stints
+- Identify best TF schedule to combine with scheduled sampling
 
-## Priority 3: Architecture Axis
+---
 
+## Medium Priority
 
-### P3.1 Transformer prototype (controlled scope)
+### E4. Context Window & Sequence Strategy
 
-- [ ] Build minimal transformer encoder baseline for lap regression.
-- [ ] Keep same input pipeline and metrics for fair comparison.
-- [ ] Start with small model size to validate training stability. And increase size if stable.
+The model currently uses a context window of 10 past laps. This may be too short to capture race dynamics or too long, adding noise.
+
+Hypothesis:
+- Larger context windows capture more race state (tire degradation trends, weather changes).
+- Smaller windows reduce noise and may improve early-race predictions.
+
+Tasks:
+- [ ] Evaluate `context_window` in {5, 10, 15, 20}
+- [ ] Compare full-race mode vs bounded horizon mode
+- [ ] Analyze performance by lap index to detect where performance degrades
+- [ ] Check if larger context helps rollout stability specifically
+
+Success criteria:
+- Improved late-race MAE/RMSE without worsening early-race accuracy
+
+---
+
+### E5. Feature Ablation Study
+
+The model uses 35 features across 4 types (numeric, categorical embeddings, boolean, one-hot). Not all may contribute positively.
+
+Hypothesis:
+- Some feature groups add noise rather than signal. Removing them could improve generalization.
+
+Tasks:
+- [ ] Ablation groups to test (remove one at a time):
+  - Weather features (AirTemp, TrackTemp, Humidity, Pressure, WindSpeed, WindDirection)
+  - Compound features (compound_soft/medium/hard/unknown)
+  - Position & track status (Position, track_clear, yellow_flag, safety_car, red_flag, vsc, vsc_ending)
+  - Driver/Team embeddings
+  - Tire degradation features (stint_lap, cumulative_stint_time, TyreLife, fuel_proxy)
+- [ ] Measure delta MAE/RMSE for each group removed
+- [ ] Document feature importance ranking
+- [ ] Identify and remove noise features from default config
+
+Success criteria:
+- Clear signal of highest-value features
+- Identify any features that hurt performance when included
+
+---
+
+### E6. Augmentation Policy Refinement
+
+Data augmentation adds noise to training inputs to improve robustness. Current default is 0.2 probability with uniform noise.
+
+Tasks:
+- [ ] Sweep `augment_prob` in {0.0, 0.05, 0.1, 0.2, 0.3}, 3 seeds each
+- [ ] Track if augmentation helps robustness (seed variance) or only hurts clean-data MAE
+- [ ] Design feature-specific augmentation (e.g., higher noise on weather, lower on lap time)
+- [ ] Test interaction with scheduled sampling (both add noise — may be redundant)
+
+Success criteria:
+- Determine optimal augmentation level
+- Decide if feature-specific augmentation is worth the complexity
+
+---
+
+## Low Priority
+
+### E7. Pretraining Data Expansion
+
+Currently training only on Race sessions. Practice, qualifying, and sprint data is available but unused.
+
+Hypothesis:
+- Pretraining on non-race sessions could improve feature representations and auxiliary head performance, even if the data distribution differs.
+
+Tasks:
+- [ ] Pretrain on FP1/FP2/FP3 sessions, fine-tune on Race
+- [ ] Pretrain on Qualifying sessions, fine-tune on Race
+- [ ] Pretrain on Sprint sessions, fine-tune on Race
+- [ ] Test if pretraining helps auxiliary heads (pit prediction, compound classification)
+- [ ] Evaluate whether pretraining improves or hurts race-session generalization
+
+Success criteria:
+- Consistent gain on held-out race sessions without harming calibration or rollout stability
+
+---
+
+### E8. Transformer Architecture
+
+Replace or augment the GRU encoder-decoder with a transformer.
+
+Hypothesis:
+- Attention mechanisms may better capture long-range dependencies in race sequences, especially for late-stint predictions where the GRU drifts.
+
+Tasks:
+- [ ] Build minimal transformer encoder baseline for lap time regression
+- [ ] Keep same input pipeline, features, and metrics for fair comparison
+- [ ] Start with small model (2-4 layers, 128-256 dim) to validate training stability
+- [ ] Experiment with context window size (transformers may handle longer sequences better)
+- [ ] Scale up if stable and promising
+- [ ] Compare attention patterns to understand what the model learns
 
 Risks:
-- Overfitting and higher compute cost.
+- Overfitting on small dataset (only ~120k lap pairs)
+- Higher compute cost per epoch
 
 Success criteria:
-- Must beat current RNN baseline on RMSE or q95/q99, not just MAE.
+- Must beat GRU baseline on RMSE or q95/q99, not just MAE
+- Must maintain rollout stability (stability ratio < 2.0)
 
-### P3.2 Uncertainty prediction
+---
 
-- [ ] Add probabilistic head (mean + variance).
-- [ ] Use uncertainty for "confidence-aware" strategy outputs.
+### E9. Uncertainty Prediction
 
-## Priority 4: Evaluation and Analysis Axis
+Add probabilistic output to quantify prediction confidence.
 
-### P4.1 Hard-case diagnostics
+Hypothesis:
+- A model that knows when it's uncertain is more useful for strategy decisions than a point estimate.
 
-- [ ] Add dedicated report for top 5% largest errors.
+Tasks:
+- [ ] Add probabilistic head: predict mean + variance (Gaussian NLL loss)
+- [ ] Evaluate calibration: actual coverage at 90%, 95% confidence intervals
+- [ ] Use uncertainty for "confidence-aware" strategy outputs
+- [ ] Analyze if uncertainty correlates with actual error (are uncertain predictions actually worse?)
+- [ ] Test if uncertainty grows appropriately during rollout (later horizons should be more uncertain)
+
+Success criteria:
+- Well-calibrated uncertainty (90% CI covers ~90% of actual values)
+- Uncertainty grows with rollout horizon
+
+---
+
+## Analysis & Product
+
+### E10. Hard-case Diagnostics
+
+Understand where and why the model fails badly to guide future improvements.
+
+Tasks:
+- [ ] Build dedicated report for top 5% largest errors
 - [ ] Slice errors by:
-  - circuit
-  - driver
-  - compound
-  - pit-adjacent laps
-  - weather regime
-- [ ] Track signed bias by slice.
+  - Circuit (some tracks may be systematically harder)
+  - Driver (skill variance)
+  - Compound (soft vs hard degradation curves)
+  - Pit-adjacent laps (in-laps, out-laps)
+  - Weather regime (dry vs wet vs changing)
+  - Stint phase (early vs late stint)
+- [ ] Track signed bias by slice (does the model consistently over/under-predict for specific conditions?)
+- [ ] Identify if hard cases are fixable with features/data or are inherent noise
 
-## Priority 5: Product Axis
-### P5.1 Product-oriented experiments
+Success criteria:
+- Actionable insights that directly inform which experiments to prioritize
 
-- [ ] Build a lightweight web dashboard
-- [ ] Prototype a real-time prediction pipeline for race-like streaming inference.
-- [ ] Add scenario-based prediction tooling (for example, "What if I pit on lap 10?").
+---
 
+### E11. Product — Web Dashboard & Live Prediction
+
+Build user-facing tools for visualizing predictions and running real-time inference.
+
+Tasks:
+- [ ] Build a lightweight web dashboard for model results and experiment comparison
+- [ ] Prototype real-time prediction pipeline for live race streaming inference
+- [ ] Add scenario-based prediction tooling ("What if driver X pits on lap 10?")
+- [ ] Visualize rollout predictions vs actual during a race
+- [ ] Add stint strategy optimizer (optimal pit window prediction)
+
+Success criteria:
+- Functional dashboard accessible via browser
+- Sub-second inference latency for real-time use
+- Scenario predictions that help inform strategy decisions

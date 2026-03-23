@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ModelConfig:
     """Model architecture configuration."""
     name: str = "seq2seq"
-    input_size: int = 33  # From dataloaders
+    input_size: int = 35  # From dataloaders (13 numeric + 2 tire deg + 4 cat + 12 bool + 4 compound)
     output_size: int = 1  # Predict single lap time
     hidden_size: int = 128
     num_layers: int = 2
@@ -90,6 +90,19 @@ class TrainingConfig:
     teacher_forcing_decay: str = "linear"  # "linear", "exponential"
     # Hold then decay settings: number of epochs to keep `teacher_forcing_start` before decaying
     teacher_forcing_hold_epochs: int = 0
+
+    # Multi-step autoregressive training
+    multistep_horizon: int = 1  # Max prediction horizon (1 = single-step, default)
+    multistep_curriculum: str = 'none'  # 'none' (always max H), 'linear' (H grows over epochs)
+    multistep_curriculum_start_epoch: int = 0  # Epoch to start increasing H
+    multistep_curriculum_end_epoch: int = -1  # Epoch to reach max H (-1 = num_epochs)
+
+    # Scheduled sampling — encoder context noise injection (exposure bias correction)
+    scheduled_sampling_enabled: bool = False
+    scheduled_sampling_start_epoch: int = 10      # Epoch to begin injecting noise
+    scheduled_sampling_end_epoch: int = -1        # Epoch to reach max noise (-1 = num_epochs)
+    scheduled_sampling_max_prob: float = 0.5      # Max probability of corrupting each context lap's LapTime
+    scheduled_sampling_noise_std: float = 0.02    # Noise std in normalized space (~0.02 ~ 300ms)
     
     # Early stopping
     early_stopping_patience: int = 50

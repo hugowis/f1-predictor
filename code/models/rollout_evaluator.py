@@ -19,6 +19,7 @@ from typing import Dict, Optional
 
 import json
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -62,6 +63,10 @@ def evaluate_autoregressive_rollout(
     context_window = test_dataset.context_window
     numeric_columns = test_dataset.numeric_columns
     lap_time_feat_idx = numeric_columns.index('LapTime')  # index inside feature vector
+    cum_stint_time_feat_idx = (numeric_columns.index('cumulative_stint_time')
+                               if 'cumulative_stint_time' in numeric_columns else None)
+    stint_lap_feat_idx = (numeric_columns.index('stint_lap')
+                          if 'stint_lap' in numeric_columns else None)
 
     # Work with normal laps only (matching training/pair-generation filter)
     data = test_dataset.data.copy()
@@ -110,6 +115,10 @@ def evaluate_autoregressive_rollout(
             # Initial context from ground truth
             context = all_features[:context_window].copy()
 
+            # Accumulator for cumulative_stint_time feedback
+            raw_cum_stint_time = 0.0
+            normalizer = test_dataset.normalizer
+
             errors = []        # |pred - target| per step
             signed_errors = [] # pred - target per step
 
@@ -147,6 +156,22 @@ def evaluate_autoregressive_rollout(
                 # the model only feeds back its own LapTime prediction.
                 new_row = all_features[target_idx].copy()
                 new_row[lap_time_feat_idx] = pred_laptime
+
+                # Feed back predicted cumulative_stint_time so the model
+                # sees its own accumulated stint duration during rollout.
+                if cum_stint_time_feat_idx is not None and normalizer is not None:
+                    raw_pred = float(normalizer._inverse_transform_column_values(
+                        pd.Series([pred_laptime]), lap_time_feat_idx).iloc[0])
+                    raw_stint_lap = float(normalizer._inverse_transform_column_values(
+                        pd.Series([new_row[stint_lap_feat_idx]]), stint_lap_feat_idx).iloc[0])
+                    if raw_stint_lap <= 1.0:
+                        raw_cum_stint_time = raw_pred
+                    else:
+                        raw_cum_stint_time += raw_pred
+                    norm_cum = float(normalizer._transform_column_values(
+                        pd.Series([raw_cum_stint_time]), cum_stint_time_feat_idx).iloc[0])
+                    new_row[cum_stint_time_feat_idx] = norm_cum
+
                 context = np.vstack([context[1:], new_row[np.newaxis, :]])
 
             # Only include sequences that produced at least one valid step

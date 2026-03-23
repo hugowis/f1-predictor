@@ -86,6 +86,7 @@ class DataPreparation:
             self._add_fuel_proxy,
             self._to_categorical,
             self._add_stint_length,
+            self._add_cumulative_stint_time,
             self._drop_useless_columns,
         ]
 
@@ -264,6 +265,16 @@ class DataPreparation:
         )
         df["stint_lap"] = df["stint_lap"].fillna(-1)
         return df
+
+    def _add_cumulative_stint_time(self, df, **_):
+        """Cumulative sum of LapTime within each driver-stint."""
+        df = df.sort_values(["Driver", "LapNumber"])
+        df["cumulative_stint_time"] = (
+            df.groupby(["Driver", "stint_id"])["LapTime"].cumsum()
+        )
+        df["cumulative_stint_time"] = df["cumulative_stint_time"].fillna(0.0)
+        return df
+
     # ---------------------------------------------------------------------
     # Orchestration
     # ---------------------------------------------------------------------

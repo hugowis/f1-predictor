@@ -77,6 +77,9 @@ def _run_dataset_normalizer_consistency_check(train_loader: DataLoader):
                 try:
                     _, tgt, _ = dataset.__getitem__(i)
                     lap_val = tgt['lap_time']
+                    # Multi-step targets return (H,) tensor; check first element only
+                    if hasattr(lap_val, 'dim') and lap_val.dim() >= 1:
+                        lap_val = lap_val[0]
                     returned = float(lap_val.cpu().numpy()) if hasattr(lap_val, 'cpu') else float(lap_val)
                 except Exception:
                     returned = float('nan')
@@ -148,6 +151,30 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         if args.teacher_forcing_hold_epochs < 0:
             raise ValueError("--teacher-forcing-hold-epochs must be >= 0")
         config.training.teacher_forcing_hold_epochs = args.teacher_forcing_hold_epochs
+
+    # Multi-step autoregressive training overrides
+    if getattr(args, 'multistep_horizon', None) is not None:
+        if args.multistep_horizon < 1:
+            raise ValueError("--multistep-horizon must be >= 1")
+        config.training.multistep_horizon = args.multistep_horizon
+    if getattr(args, 'multistep_curriculum', None):
+        config.training.multistep_curriculum = args.multistep_curriculum
+    if getattr(args, 'multistep_curriculum_start_epoch', None) is not None:
+        config.training.multistep_curriculum_start_epoch = args.multistep_curriculum_start_epoch
+    if getattr(args, 'multistep_curriculum_end_epoch', None) is not None:
+        config.training.multistep_curriculum_end_epoch = args.multistep_curriculum_end_epoch
+
+    # Scheduled sampling overrides
+    if getattr(args, 'scheduled_sampling', False):
+        config.training.scheduled_sampling_enabled = True
+    if getattr(args, 'ss_max_prob', None) is not None:
+        config.training.scheduled_sampling_max_prob = args.ss_max_prob
+    if getattr(args, 'ss_noise_std', None) is not None:
+        config.training.scheduled_sampling_noise_std = args.ss_noise_std
+    if getattr(args, 'ss_start_epoch', None) is not None:
+        config.training.scheduled_sampling_start_epoch = args.ss_start_epoch
+    if getattr(args, 'ss_end_epoch', None) is not None:
+        config.training.scheduled_sampling_end_epoch = args.ss_end_epoch
 
 
 def _run_post_training_steps(config: Config, output_dir: Path):
@@ -260,9 +287,11 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
     """
     logger.info("Creating autoregressive dataloaders...")
 
+    ms_horizon = getattr(config.training, 'multistep_horizon', 1)
     train_ds = AutoregressiveLapDataloader(
         year=config.training.train_years,
         context_window=config.data.context_window,
+        multistep_horizon=ms_horizon,
         augment_prob=config.data.augment_prob,
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
@@ -279,6 +308,7 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
     val_ds = AutoregressiveLapDataloader(
         year=config.training.val_years,
         context_window=config.data.context_window,
+        multistep_horizon=ms_horizon,
         augment_prob=0.0,
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
@@ -297,6 +327,7 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
     test_ds = AutoregressiveLapDataloader(
         year=config.training.test_years,
         context_window=config.data.context_window,
+        multistep_horizon=ms_horizon,
         augment_prob=0.0,
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
@@ -438,6 +469,89 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
     return ratio
 
 
+def multistep_horizon_schedule(epoch: int, config: Config) -> int:
+    """
+    Compute the multi-step prediction horizon H for an epoch.
+
+    Supports:
+    - 'none': always use max horizon from config
+    - 'linear': H grows linearly from 1 to max over the curriculum window
+
+    Parameters
+    ----------
+    epoch : int
+        Current epoch
+    config : Config
+        Configuration with multistep settings
+
+    Returns
+    -------
+    int
+        Prediction horizon H for this epoch (>= 1)
+    """
+    max_h = getattr(config.training, 'multistep_horizon', 1)
+    if max_h <= 1:
+        return 1
+
+    curriculum = getattr(config.training, 'multistep_curriculum', 'none')
+    if curriculum == 'none':
+        return max_h
+
+    start_epoch = getattr(config.training, 'multistep_curriculum_start_epoch', 0)
+    end_epoch = getattr(config.training, 'multistep_curriculum_end_epoch', -1)
+    if end_epoch < 0:
+        end_epoch = config.training.num_epochs
+
+    if epoch < start_epoch:
+        return 1
+
+    if curriculum == 'linear':
+        progress = min(1.0, (epoch - start_epoch) / max(1, end_epoch - start_epoch))
+        return max(1, int(1 + (max_h - 1) * progress))
+
+    # Unknown curriculum type: fall back to max
+    return max_h
+
+
+def scheduled_sampling_schedule(epoch: int, config: Config) -> float:
+    """
+    Compute the scheduled sampling probability for an epoch.
+
+    Returns the probability of corrupting each context lap's LapTime with
+    Gaussian noise during training. Linearly ramps from 0 to max_prob
+    between start_epoch and end_epoch.
+
+    Parameters
+    ----------
+    epoch : int
+        Current epoch
+    config : Config
+        Configuration with scheduled_sampling settings
+
+    Returns
+    -------
+    float
+        Corruption probability for this epoch (0.0 to max_prob)
+    """
+    if not getattr(config.training, 'scheduled_sampling_enabled', False):
+        return 0.0
+
+    max_prob = getattr(config.training, 'scheduled_sampling_max_prob', 0.5)
+    start_epoch = getattr(config.training, 'scheduled_sampling_start_epoch', 10)
+    end_epoch = getattr(config.training, 'scheduled_sampling_end_epoch', -1)
+    if end_epoch < 0:
+        end_epoch = config.training.num_epochs
+
+    if epoch < start_epoch:
+        return 0.0
+
+    if epoch >= end_epoch:
+        return max_prob
+
+    progress = (epoch - start_epoch) / max(1, end_epoch - start_epoch)
+    return max_prob * progress
+
+
 def train(config: Config, output_dir: Path = None):
     """
     Run training pipeline.
@@ -523,6 +637,13 @@ def train(config: Config, output_dir: Path = None):
     
     # Training loop
     logger.info("\nStarting training...")
+    # Log scheduled sampling settings
+    ss_enabled = getattr(config.training, 'scheduled_sampling_enabled', False)
+    if ss_enabled:
+        logger.info(f"Scheduled sampling ENABLED: max_prob={config.training.scheduled_sampling_max_prob}, "
+                     f"noise_std={config.training.scheduled_sampling_noise_std}, "
+                     f"start_epoch={config.training.scheduled_sampling_start_epoch}")
+
     history = trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -530,6 +651,9 @@ def train(config: Config, output_dir: Path = None):
         early_stopping_patience=config.training.early_stopping_patience,
         early_stopping_min_epochs=getattr(config.training, 'early_stopping_min_epochs', 0),
         teacher_forcing_schedule=lambda epoch: teacher_forcing_schedule(epoch, config),
+        multistep_horizon_schedule=lambda epoch: multistep_horizon_schedule(epoch, config),
+        scheduled_sampling_schedule=lambda epoch: scheduled_sampling_schedule(epoch, config),
+        scheduled_sampling_noise_std=getattr(config.training, 'scheduled_sampling_noise_std', 0.02),
     )
     
     # Save config and history
@@ -571,7 +695,18 @@ def main():
     parser.add_argument('--teacher-forcing-start', type=float, help='Start teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-end', type=float, help='End teacher forcing ratio (0.0-1.0)')
     parser.add_argument('--teacher-forcing-hold-epochs', type=int, help='Number of epochs to hold start ratio before decaying (used with hold_then_decay)')
-    
+    # Multi-step autoregressive training
+    parser.add_argument('--multistep-horizon', type=int, help='Max prediction horizon H for multi-step training (1=single-step default)')
+    parser.add_argument('--multistep-curriculum', choices=['none', 'linear'], help='Curriculum for increasing H over training epochs')
+    parser.add_argument('--multistep-curriculum-start-epoch', type=int, help='Epoch to start increasing H (default: 0)')
+    parser.add_argument('--multistep-curriculum-end-epoch', type=int, help='Epoch to reach max H (default: num_epochs)')
+    # Scheduled sampling (exposure bias correction)
+    parser.add_argument('--scheduled-sampling', action='store_true', help='Enable scheduled sampling (encoder context noise injection)')
+    parser.add_argument('--ss-max-prob', type=float, help='Max probability of corrupting each context lap LapTime (default: 0.5)')
+    parser.add_argument('--ss-noise-std', type=float, help='Noise std in normalized space (default: 0.02, ~300ms)')
+    parser.add_argument('--ss-start-epoch', type=int, help='Epoch to start scheduled sampling (default: 10)')
+    parser.add_argument('--ss-end-epoch', type=int, help='Epoch to reach max noise (default: num_epochs)')
+
     args = parser.parse_args()
     
     # Load or create config

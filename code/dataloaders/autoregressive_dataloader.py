@@ -113,6 +113,7 @@ class AutoregressiveLapDataloader(Dataset):
         self,
         year: Union[int, List[int]],
         context_window: int = 5,
+        multistep_horizon: int = 1,
         augment_prob: float = 0.0,
         normalize: bool = True,
         scaler_type: str = "standard",
@@ -124,6 +125,7 @@ class AutoregressiveLapDataloader(Dataset):
     ):
         self.years = normalize_year_input(year)
         self.context_window = context_window
+        self.multistep_horizon = max(1, multistep_horizon)
         self.augment_prob = augment_prob
         self.device = device
         self.data_path = data_path or Path("./data")
@@ -204,7 +206,7 @@ class AutoregressiveLapDataloader(Dataset):
                 cache_dir = Path(self.data_path) / "precomputed"
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 years_key = "_".join(map(str, sorted(self.years)))
-                cache_fname = f"ar_cache_{years_key}_cw{self.context_window}_{scaler_type}.pt"
+                cache_fname = f"ar_cache_{years_key}_cw{self.context_window}_h{self.multistep_horizon}_{scaler_type}.pt"
                 self.cache_path = cache_dir / cache_fname
 
             if self.cache_path.exists():
@@ -256,6 +258,7 @@ class AutoregressiveLapDataloader(Dataset):
                     valid = (
                         cached.get('years') == self.years and
                         cached.get('context_window') == self.context_window and
+                        cached.get('multistep_horizon', 1) == self.multistep_horizon and
                         cached.get('scaler_type') == scaler_type and
                         cached.get('numeric_columns') == self.numeric_columns
                     )
@@ -289,9 +292,10 @@ class AutoregressiveLapDataloader(Dataset):
                                 loaded_targets.append(None)
                                 continue
                             lt = torch.tensor(tp['lap_time'], dtype=torch.float32)
-                            is_pit = torch.tensor(int(tp.get('is_pitlap', 0)), dtype=torch.long)
-                            comp = torch.tensor(int(tp.get('compound', 0)), dtype=torch.long)
-                            loaded_targets.append({'lap_time': lt, 'is_pitlap': is_pit, 'compound': comp})
+                            is_pit = torch.tensor(tp.get('is_pitlap', 0), dtype=torch.long)
+                            comp = torch.tensor(tp.get('compound', 0), dtype=torch.long)
+                            tmask = torch.tensor(tp['target_mask'], dtype=torch.float32) if 'target_mask' in tp else torch.ones_like(lt)
+                            loaded_targets.append({'lap_time': lt, 'is_pitlap': is_pit, 'compound': comp, 'target_mask': tmask})
                         self._precomputed_targets = loaded_targets
                         self._precomputed_meta = cached['meta']
                         cache_loaded = True
@@ -312,21 +316,21 @@ class AutoregressiveLapDataloader(Dataset):
                 self._precomputed_meta = [None] * len(self.lap_pairs)
 
             if not cache_loaded:
+                H = self.multistep_horizon
                 for i in tqdm(range(len(self.lap_pairs)), desc="Precomputing contexts", unit="pairs"):
                     pair = self.lap_pairs[i]
                     context_indices = pair['context_indices']
-                    target_index = pair['target_index']
+                    target_indices = pair.get('target_indices', [pair['target_index']])
 
                     context_laps = self.data.loc[context_indices].copy()
-                    target_lap = self.data.loc[target_index].copy()
+                    target_laps = self.data.loc[target_indices].copy()
 
                     # NOTE: precompute without augmentation (augmentation per-sample
                     # would re-introduce CPU work). If augment_prob > 0, augmentation
                     # will be skipped for precomputed path to maximize throughput.
                     if self.normalizer is not None:
                         context_laps = self.normalizer.transform(context_laps)
-                        target_lap_norm = self.normalizer.transform(target_lap.to_frame().T)
-                        target_lap = target_lap_norm.iloc[0]
+                        target_laps = self.normalizer.transform(target_laps)
 
                     # Extract features for context
                     context_features = []
@@ -346,21 +350,30 @@ class AutoregressiveLapDataloader(Dataset):
                         padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
                         context_array = np.vstack([padding, context_array])
 
-                    # Target values
-                    target_laptime = float(target_lap['LapTime'])
-                    pit_flag = int(target_lap.get('is_pitlap', 0))
-                    comp_vals = target_lap[self.compound_columns].values.astype(np.int32)
-                    if comp_vals.sum() == 0:
-                        compound_idx = len(self.compound_columns) - 1
-                    else:
-                        compound_idx = int(np.argmax(comp_vals))
+                    # Multi-step target values (pad to H with mask)
+                    target_laptimes = torch.zeros(H, dtype=torch.float32)
+                    target_pitflags = torch.zeros(H, dtype=torch.long)
+                    target_compounds = torch.zeros(H, dtype=torch.long)
+                    target_mask = torch.zeros(H, dtype=torch.float32)
+
+                    for h in range(min(len(target_laps), H)):
+                        t_lap = target_laps.iloc[h]
+                        target_laptimes[h] = float(t_lap['LapTime'])
+                        target_pitflags[h] = int(t_lap.get('is_pitlap', 0))
+                        comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
+                        if comp_vals.sum() == 0:
+                            target_compounds[h] = len(self.compound_columns) - 1
+                        else:
+                            target_compounds[h] = int(np.argmax(comp_vals))
+                        target_mask[h] = 1.0
 
                     # Convert to tensors and store
                     context_tensor = torch.from_numpy(context_array)
                     target_tensor = {
-                        'lap_time': torch.tensor(target_laptime, dtype=torch.float32),
-                        'is_pitlap': torch.tensor(pit_flag, dtype=torch.long),
-                        'compound': torch.tensor(compound_idx, dtype=torch.long),
+                        'lap_time': target_laptimes,
+                        'is_pitlap': target_pitflags,
+                        'compound': target_compounds,
+                        'target_mask': target_mask,
                     }
 
                     metadata = {
@@ -426,6 +439,7 @@ class AutoregressiveLapDataloader(Dataset):
                     torch.save({
                         'years': self.years,
                         'context_window': self.context_window,
+                        'multistep_horizon': self.multistep_horizon,
                         'scaler_type': scaler_type,
                         'numeric_columns': self.numeric_columns,
                         'contexts': contexts_np,
@@ -476,10 +490,15 @@ class AutoregressiveLapDataloader(Dataset):
                 context_start = max(0, i - self.context_window)
                 context_indices = original_indices[context_start:i]
                 target_index = original_indices[i]
-                
+
+                # Collect up to multistep_horizon consecutive target indices
+                target_end = min(i + self.multistep_horizon, len(normal_laps))
+                target_indices = original_indices[i:target_end]
+
                 pairs.append({
                     'context_indices': context_indices,
                     'target_index': target_index,
+                    'target_indices': target_indices,
                     'driver': int(driver),
                     'year': int(year),
                     'circuit': int(circuit),
@@ -659,20 +678,22 @@ class AutoregressiveLapDataloader(Dataset):
         # Fallback: compute on the fly for indices not precomputed
         pair = self.lap_pairs[idx]
         context_indices = pair['context_indices']
-        target_index = pair['target_index']
+        target_indices = pair.get('target_indices', [pair['target_index']])
+        H = self.multistep_horizon
 
         context_laps = self.data.loc[context_indices].copy()
-        target_lap = self.data.loc[target_index].copy()
+        target_laps = self.data.loc[target_indices].copy()
 
-        # Apply augmentation if enabled
-        if np.random.random() < self.augment_prob:
-            context_laps, target_lap = self._apply_augmentation(context_laps, target_lap)
+        # Apply augmentation if enabled (only on first target for backward compat)
+        if np.random.random() < self.augment_prob and len(target_laps) > 0:
+            first_target = target_laps.iloc[0].copy()
+            context_laps, first_target = self._apply_augmentation(context_laps, first_target)
+            target_laps.iloc[0] = first_target
 
         # Normalize numeric features
         if self.normalizer is not None:
             context_laps = self.normalizer.transform(context_laps)
-            target_lap_normalized = self.normalizer.transform(target_lap.to_frame().T)
-            target_lap = target_lap_normalized.iloc[0]
+            target_laps = self.normalizer.transform(target_laps)
 
         # Extract features
         context_features = []
@@ -691,19 +712,29 @@ class AutoregressiveLapDataloader(Dataset):
             padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
             context_array = np.vstack([padding, context_array])
 
-        target_laptime = float(target_lap['LapTime'])
-        pit_flag = int(target_lap.get('is_pitlap', 0))
-        comp_vals = target_lap[self.compound_columns].values.astype(np.int32)
-        if comp_vals.sum() == 0:
-            compound_idx = len(self.compound_columns) - 1
-        else:
-            compound_idx = int(np.argmax(comp_vals))
+        # Multi-step target values
+        target_laptimes = torch.zeros(H, dtype=torch.float32)
+        target_pitflags = torch.zeros(H, dtype=torch.long)
+        target_compounds = torch.zeros(H, dtype=torch.long)
+        target_mask = torch.zeros(H, dtype=torch.float32)
+
+        for h in range(min(len(target_laps), H)):
+            t_lap = target_laps.iloc[h]
+            target_laptimes[h] = float(t_lap['LapTime'])
+            target_pitflags[h] = int(t_lap.get('is_pitlap', 0))
+            comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
+            if comp_vals.sum() == 0:
+                target_compounds[h] = len(self.compound_columns) - 1
+            else:
+                target_compounds[h] = int(np.argmax(comp_vals))
+            target_mask[h] = 1.0
 
         context_tensor = torch.from_numpy(context_array).to(self.device)
         target_tensor = {
-            'lap_time': torch.tensor(target_laptime, dtype=torch.float32, device=self.device),
-            'is_pitlap': torch.tensor(pit_flag, dtype=torch.long, device=self.device),
-            'compound': torch.tensor(compound_idx, dtype=torch.long, device=self.device),
+            'lap_time': target_laptimes.to(self.device),
+            'is_pitlap': target_pitflags.to(self.device),
+            'compound': target_compounds.to(self.device),
+            'target_mask': target_mask.to(self.device),
         }
 
         metadata = {

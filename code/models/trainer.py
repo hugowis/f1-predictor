@@ -194,15 +194,59 @@ class Trainer:
             logger.exception("Failed to infer compound class weights from dataset")
             self._compound_class_weight_tensor = None
     
+    @staticmethod
+    def _apply_scheduled_sampling(
+        encoder_input: torch.Tensor,
+        prob: float,
+        noise_std: float,
+        lap_time_idx: int = 0,
+    ) -> torch.Tensor:
+        """Corrupt encoder context LapTime with Gaussian noise to simulate rollout errors.
+
+        Parameters
+        ----------
+        encoder_input : torch.Tensor
+            Shape (batch, context_window, num_features)
+        prob : float
+            Probability of corrupting each context lap's LapTime (0-1)
+        noise_std : float
+            Standard deviation of Gaussian noise in normalized space
+        lap_time_idx : int
+            Index of LapTime feature in the feature dimension
+
+        Returns
+        -------
+        torch.Tensor
+            Modified encoder_input (in-place on clone)
+        """
+        if prob <= 0.0 or noise_std <= 0.0:
+            return encoder_input
+
+        # Clone to avoid modifying original data
+        encoder_input = encoder_input.clone()
+        batch_size, seq_len, _ = encoder_input.shape
+
+        # Binary mask: which (batch, timestep) entries to corrupt
+        mask = torch.rand(batch_size, seq_len, device=encoder_input.device) < prob
+        # Gaussian noise
+        noise = torch.randn(batch_size, seq_len, device=encoder_input.device) * noise_std
+        # Apply noise only where mask is True
+        encoder_input[:, :, lap_time_idx] += mask.float() * noise
+
+        return encoder_input
+
     def train_epoch(
         self,
         train_loader: DataLoader,
         epoch: int = 0,
         teacher_forcing_ratio: float = 1.0,
+        multistep_horizon: int = 1,
+        scheduled_sampling_prob: float = 0.0,
+        scheduled_sampling_noise_std: float = 0.02,
     ) -> Dict[str, float]:
         """
         Train for one epoch.
-        
+
         Parameters
         ----------
         train_loader : DataLoader
@@ -211,7 +255,10 @@ class Trainer:
             Epoch number (for logging)
         teacher_forcing_ratio : float, optional
             Probability of using teacher forcing. Default is 1.0.
-        
+        multistep_horizon : int, optional
+            Number of decoder steps to predict and backprop through.
+            1 = single-step (default, backward compatible). >1 = multi-step.
+
         Returns
         -------
         dict
@@ -253,7 +300,25 @@ class Trainer:
                         targets[k] = v.to(self.device)
             else:
                 targets = targets.to(self.device)
-            
+
+            # Truncate to current multistep horizon (curriculum may use < max H)
+            current_h = max(1, multistep_horizon)
+            if decoder_input.dim() == 3 and decoder_input.size(1) > current_h:
+                decoder_input = decoder_input[:, :current_h, :]
+                if isinstance(targets, dict):
+                    for k, v in list(targets.items()):
+                        if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(-1) >= current_h:
+                            targets[k] = v[:, :current_h] if v.dim() == 2 else v
+                        elif isinstance(v, torch.Tensor) and v.dim() == 2:
+                            targets[k] = v[:, :current_h]
+
+            # Scheduled sampling: corrupt encoder LapTime with noise
+            if scheduled_sampling_prob > 0.0 and not isinstance(encoder_input, dict):
+                encoder_input = self._apply_scheduled_sampling(
+                    encoder_input, scheduled_sampling_prob, scheduled_sampling_noise_std,
+                    lap_time_idx=0,  # LapTime is first numeric feature
+                )
+
             # Forward pass with optional mixed precision
             with autocast(device_type='cuda', enabled=self.use_mixed_precision):
                 outputs = self.model(
@@ -268,7 +333,9 @@ class Trainer:
                 # Lap time target
                 lap_t = targets['lap_time']
                 if lap_t.dim() == 1:
-                    lap_t_rs = lap_t.unsqueeze(-1).unsqueeze(-1)
+                    lap_t_rs = lap_t.unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
+                elif lap_t.dim() == 2:
+                    lap_t_rs = lap_t.unsqueeze(-1)  # (batch, H, 1)
                 else:
                     lap_t_rs = lap_t
 
@@ -276,8 +343,19 @@ class Trainer:
                 pit_t = targets.get('is_pitlap', None)
                 comp_t = targets.get('compound', None)
 
+                # Build combined mask: finite values AND valid target positions
                 with torch.no_grad():
                     mask = torch.isfinite(lap_t_rs)
+                    # Apply target_mask for multi-step padded positions
+                    tmask = targets.get('target_mask', None)
+                    if tmask is not None:
+                        if tmask.dim() == 1:
+                            tmask_rs = tmask.unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
+                        elif tmask.dim() == 2:
+                            tmask_rs = tmask.unsqueeze(-1)  # (batch, H, 1)
+                        else:
+                            tmask_rs = tmask
+                        mask = mask & (tmask_rs > 0.5)
                 if mask.sum() == 0:
                     continue
 
@@ -299,6 +377,13 @@ class Trainer:
                     masked_se = se * mask.float()
                     lap_loss = masked_se.sum() / denom
 
+                # Build 2D mask for auxiliary losses (batch, seq_len)
+                aux_mask_2d = None
+                if tmask is not None and tmask.dim() == 2:
+                    aux_mask_2d = tmask  # (batch, H)
+                elif tmask is not None and tmask.dim() == 1:
+                    aux_mask_2d = tmask.unsqueeze(-1)  # (batch, 1)
+
                 # Pit loss (BCEWithLogits)
                 pit_loss = torch.tensor(0.0, device=self.device)
                 if pit_t is not None and 'pit_logits' in outputs:
@@ -310,7 +395,11 @@ class Trainer:
                         pit_t_rs = pit_t
                     bce = nn.BCEWithLogitsLoss(reduction='none')
                     pit_raw_loss = bce(pit_pred, pit_t_rs.float())
-                    pit_loss = pit_raw_loss.mean()
+                    if aux_mask_2d is not None:
+                        pit_raw_loss = pit_raw_loss * aux_mask_2d
+                        pit_loss = pit_raw_loss.sum() / aux_mask_2d.sum().clamp(min=1)
+                    else:
+                        pit_loss = pit_raw_loss.mean()
 
                 # Compound loss (CrossEntropy)
                 comp_loss = torch.tensor(0.0, device=self.device)
@@ -340,7 +429,12 @@ class Trainer:
                         )
                     with autocast(device_type='cuda', enabled=False):
                         comp_raw = ce(comp_pred_flat.float(), comp_t_rs.long())
-                    comp_loss = comp_raw.mean()
+                    if aux_mask_2d is not None:
+                        comp_mask_flat = aux_mask_2d.reshape(-1)
+                        comp_raw = comp_raw * comp_mask_flat
+                        comp_loss = comp_raw.sum() / comp_mask_flat.sum().clamp(min=1)
+                    else:
+                        comp_loss = comp_raw.mean()
 
                 pit_scale = 1.0
                 comp_scale = 1.0
@@ -551,19 +645,27 @@ class Trainer:
                 else:
                     targets = targets.to(self.device)
 
+                # For validation, only evaluate on first prediction step (H=1)
+                # to keep val metrics comparable regardless of multistep_horizon.
+                # Truncate decoder_input to 1 step for single-step validation.
+                val_decoder = decoder_input[:, :1, :] if decoder_input.dim() == 3 and decoder_input.size(1) > 1 else decoder_input
+
                 # Forward pass with optional mixed precision (no teacher forcing for validation)
                 with autocast(device_type='cuda', enabled=self.use_mixed_precision):
                     outputs = self.model(
                         encoder_input,
-                        decoder_input,
+                        val_decoder,
                         teacher_forcing=False,
                     )
 
-                # If targets is dict (multi-task), focus validation on lap_time
+                # If targets is dict (multi-task), focus validation on lap_time (first step only)
                 if isinstance(targets, dict):
                     lap_t = targets['lap_time']
                     if lap_t.dim() == 1:
                         targets_reshaped = lap_t.unsqueeze(-1).unsqueeze(-1)
+                    elif lap_t.dim() == 2:
+                        # Multi-step: take first step only for validation
+                        targets_reshaped = lap_t[:, :1].unsqueeze(-1)  # (batch, 1, 1)
                     else:
                         targets_reshaped = lap_t
                 else:
@@ -649,10 +751,13 @@ class Trainer:
         early_stopping_patience: int = 10,
         early_stopping_min_epochs: int = 0,
         teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
+        multistep_horizon_schedule: Optional[Callable[[int], int]] = None,
+        scheduled_sampling_schedule: Optional[Callable[[int], float]] = None,
+        scheduled_sampling_noise_std: float = 0.02,
     ) -> Dict[str, Any]:
         """
         Train model for multiple epochs.
-        
+
         Parameters
         ----------
         train_loader : DataLoader
@@ -670,7 +775,16 @@ class Trainer:
         teacher_forcing_schedule : callable, optional
             Function that takes epoch number and returns teacher_forcing_ratio
             If None, uses constant 1.0
-        
+        multistep_horizon_schedule : callable, optional
+            Function that takes epoch number and returns the prediction horizon H.
+            If None, uses constant 1 (single-step).
+        scheduled_sampling_schedule : callable, optional
+            Function that takes epoch number and returns the probability of
+            corrupting each context lap's LapTime with noise (0.0 to 1.0).
+            If None, no scheduled sampling is applied.
+        scheduled_sampling_noise_std : float
+            Noise std in normalized space for scheduled sampling.
+
         Returns
         -------
         dict
@@ -678,6 +792,10 @@ class Trainer:
         """
         if teacher_forcing_schedule is None:
             teacher_forcing_schedule = lambda epoch: 1.0
+        if multistep_horizon_schedule is None:
+            multistep_horizon_schedule = lambda epoch: 1
+        if scheduled_sampling_schedule is None:
+            scheduled_sampling_schedule = lambda epoch: 0.0
         
         logger.info(f"Starting training for {num_epochs} epochs")
         logger.info(f"Model: {self.model.model_info()}")
@@ -695,11 +813,18 @@ class Trainer:
             current_lr = self.optimizer.param_groups[0]['lr']
             self.history['learning_rate'].append(current_lr)
             
-            # Get teacher forcing ratio for this epoch
+            # Get teacher forcing ratio, multistep horizon, and scheduled sampling for this epoch
             tf_ratio = teacher_forcing_schedule(epoch)
-            
+            ms_horizon = multistep_horizon_schedule(epoch)
+            ss_prob = scheduled_sampling_schedule(epoch)
+
             # Train
-            train_stats = self.train_epoch(train_loader, epoch, tf_ratio)
+            train_stats = self.train_epoch(
+                train_loader, epoch, tf_ratio,
+                multistep_horizon=ms_horizon,
+                scheduled_sampling_prob=ss_prob,
+                scheduled_sampling_noise_std=scheduled_sampling_noise_std,
+            )
             self.history['train_loss'].append(float(train_stats.get('loss', 0.0)))
             self.history['train_lap_loss'].append(float(train_stats.get('lap_loss', train_stats.get('loss', 0.0))))
             self.history['train_pit_loss'].append(float(train_stats.get('pit_loss', 0.0)))
@@ -743,11 +868,14 @@ class Trainer:
                     break
 
                 elapsed = time.perf_counter() - epoch_start
+                ss_str = f" | ss={ss_prob:.3f}" if ss_prob > 0 else ""
                 logger.info(
-                    "Epoch %d/%d | tf=%.3f | lr=%.2e | train=%.6f | val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
+                    "Epoch %d/%d | tf=%.3f | H=%d%s | lr=%.2e | train=%.6f | val=%.6f | monitored=%.6f | best=%.6f | time=%.1fs",
                     epoch + 1,
                     num_epochs,
                     tf_ratio,
+                    ms_horizon,
+                    ss_str,
                     current_lr,
                     train_stats.get('loss', float('nan')),
                     val_loss,
@@ -758,10 +886,11 @@ class Trainer:
             else:
                 elapsed = time.perf_counter() - epoch_start
                 logger.info(
-                    "Epoch %d/%d | tf=%.3f | lr=%.2e | train=%.6f | time=%.1fs",
+                    "Epoch %d/%d | tf=%.3f | H=%d | lr=%.2e | train=%.6f | time=%.1fs",
                     epoch + 1,
                     num_epochs,
                     tf_ratio,
+                    ms_horizon,
                     current_lr,
                     train_stats.get('loss', float('nan')),
                     elapsed,
@@ -805,16 +934,18 @@ class Trainer:
             lap_t = targets.get('lap_time')
             if lap_t is None:
                 raise ValueError("targets dict must contain 'lap_time' key")
-            
+
             # Data is already normalized by the dataloader - no runtime normalization
             # This prevents data leakage from applying transforms at training time
             lap_tensor_norm = lap_t.clone().type(torch.float32)
 
-            # Build decoder_input shape consistent with previous behavior
+            # Build decoder_input shape: (batch, seq_len, 1)
+            # dim()==1 → single-step scalar targets (batch,)
+            # dim()==2 → multi-step targets (batch, H)
             if lap_tensor_norm.dim() == 1:
                 decoder_input = lap_tensor_norm.unsqueeze(-1).unsqueeze(-1)
             elif lap_tensor_norm.dim() == 2:
-                decoder_input = lap_tensor_norm.unsqueeze(-1)
+                decoder_input = lap_tensor_norm.unsqueeze(-1)  # (batch, H, 1)
             else:
                 decoder_input = lap_tensor_norm.clone()
 

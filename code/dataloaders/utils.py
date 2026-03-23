@@ -218,6 +218,8 @@ def get_numeric_columns() -> List[str]:
         "WindDirection",
         "delta_to_car_ahead",
         "fuel_proxy",
+        "stint_lap",
+        "cumulative_stint_time",
     ]
 
 

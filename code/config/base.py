@@ -81,7 +81,7 @@ class TrainingConfig:
     use_mixed_precision: bool = True  # Enable FP16 training on CUDA
     
     # Learning rate scheduling
-    scheduler_type: str = "cosine"  # "cosine", "linear", "lambda"
+    scheduler_type: str = "cosine"  # "cosine_with_warmup", "cosine", "linear"
     warm_up_epochs: int = 5
     
     # Teacher forcing schedule
@@ -105,7 +105,7 @@ class TrainingConfig:
     scheduled_sampling_noise_std: float = 0.02    # Noise std in normalized space (~0.02 ~ 300ms)
     
     # Early stopping
-    early_stopping_patience: int = 50
+    early_stopping_patience: int = 30
     early_stopping_min_epochs: int = 0  # Grace period: don't start patience counter before this epoch
     validation_freq: int = 1  # Validate every N epochs
     early_stopping_use_ema: bool = False

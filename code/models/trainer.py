@@ -125,6 +125,13 @@ class Trainer:
         
         # Initialize gradient scaler for mixed precision training
         self.scaler = GradScaler() if self.use_mixed_precision else None
+
+        # Compile model for faster execution (torch >= 2.0, silently skipped otherwise)
+        try:
+            self.model = torch.compile(self.model)
+            logger.info("Model compiled with torch.compile()")
+        except Exception:
+            pass
         
         # Ensure model is on the correct device
         try:
@@ -1039,7 +1046,9 @@ def create_scheduler(optimizer: Optimizer, config: Dict[str, Any]) -> Optional[A
         Learning rate scheduler
     """
     scheduler_type = config.get('scheduler_type', 'cosine')
-    
+
+
+
     if scheduler_type == 'cosine':
         total_epochs = config.get('total_epochs', 100)
         return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)

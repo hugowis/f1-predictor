@@ -128,7 +128,7 @@ class Trainer:
 
         # Compile model for faster execution (torch >= 2.0, silently skipped otherwise)
         try:
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model,  backend="aot_eager")
             logger.info("Model compiled with torch.compile()")
         except Exception:
             pass

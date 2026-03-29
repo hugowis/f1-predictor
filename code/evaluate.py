@@ -357,8 +357,11 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
         device=device,
     )
     
-    # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load state dict — strip _orig_mod. prefix added by torch.compile() if present
+    state_dict = checkpoint['model_state_dict']
+    if any(k.startswith('_orig_mod.') for k in state_dict):
+        state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
     model.to(device)
     

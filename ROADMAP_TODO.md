@@ -236,3 +236,18 @@ Success criteria:
 - Functional dashboard accessible via browser
 - Sub-second inference latency for real-time use
 - Scenario predictions that help inform strategy decisions
+
+
+### E12. New season adaptation
+
+The 2026 season just started, how can the model be finetuned with data from the first event (first GPs, sprints, practices) to adapt to the new season dynamics?
+
+Tasks:
+- [ ] Collect and preprocess data from the first few events of the 2026 season
+- [ ] Finetune the best model from 2025 on this new data
+- [ ] Evaluate performance on the latest events, comparing to the 2025 baseline
+- [ ] Analyze results
+
+Success criteria:
+- Improved performance on 2026 events compared to 2025 baseline
+- Model adapts to new season dynamics without overfitting

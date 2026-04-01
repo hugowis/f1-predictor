@@ -126,10 +126,16 @@ class Trainer:
         # Initialize gradient scaler for mixed precision training
         self.scaler = GradScaler() if self.use_mixed_precision else None
 
+        logger.info(f"Trainer initialized with device={self.device}")
+        # Enable TF32 for Ampere+ GPUs (free ~5% speedup, negligible precision impact)
+        if self.device == 'cuda':
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
         # Compile model for faster execution (torch >= 2.0, silently skipped otherwise)
         try:
-            self.model = torch.compile(self.model,  backend="aot_eager")
-            logger.info("Model compiled with torch.compile()")
+            self.model = torch.compile(self.model, backend='aot_eager')
+            logger.info(f"Model compiled with torch.compile(backend='aot_eager')")
         except Exception:
             pass
         
@@ -757,6 +763,7 @@ class Trainer:
         num_epochs: int = 50,
         early_stopping_patience: int = 10,
         early_stopping_min_epochs: int = 0,
+        validation_freq: int = 1,
         teacher_forcing_schedule: Optional[Callable[[int], float]] = None,
         multistep_horizon_schedule: Optional[Callable[[int], int]] = None,
         scheduled_sampling_schedule: Optional[Callable[[int], float]] = None,
@@ -779,6 +786,8 @@ class Trainer:
             Grace period: patience counter won't start before this epoch.
             Prevents a lucky low val loss in the first few epochs from
             triggering early stopping before training has stabilised.
+        validation_freq : int
+            Validate every N epochs. Always validates on the last epoch.
         teacher_forcing_schedule : callable, optional
             Function that takes epoch number and returns teacher_forcing_ratio
             If None, uses constant 1.0
@@ -838,7 +847,8 @@ class Trainer:
             self.history['train_compound_loss'].append(float(train_stats.get('compound_loss', 0.0)))
             
             # Validate
-            if val_loader is not None:
+            should_validate = (epoch % validation_freq == 0) or (epoch == num_epochs - 1)
+            if val_loader is not None and should_validate:
                 val_loss, val_metrics = self.validate(val_loader)
                 self.history['val_loss'].append(val_loss)
 

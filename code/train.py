@@ -176,6 +176,16 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
     if getattr(args, 'ss_end_epoch', None) is not None:
         config.training.scheduled_sampling_end_epoch = args.ss_end_epoch
 
+    # Data loading overrides
+    if getattr(args, 'num_workers', None) is not None:
+        config.data.num_workers = args.num_workers
+
+    # Validation frequency override
+    if getattr(args, 'validation_freq', None) is not None:
+        if args.validation_freq < 1:
+            raise ValueError("--validation-freq must be >= 1")
+        config.training.validation_freq = args.validation_freq
+
 
 def _run_post_training_steps(config: Config, output_dir: Path):
     """Run evaluation and analysis after training finishes."""
@@ -254,30 +264,32 @@ def create_dataloaders(config: Config, batch_size: int = 32):
     logger.info(f"Test set: {len(test_ds)} stints")
     
     # Create dataloaders
+    nw = config.data.num_workers
+    loader_kwargs: dict = dict(pin_memory=True, num_workers=nw)
+    if nw > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=config.data.shuffle_train,
-        num_workers=config.data.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
-    
+
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=config.data.shuffle_val,
-        num_workers=config.data.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
-    
+
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
         shuffle=config.data.shuffle_test,
-        num_workers=config.data.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
-    
+
     return train_loader, val_loader, test_loader
 
 
@@ -338,26 +350,28 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
     logger.info(f"Val set: {len(val_ds)} lap pairs")
     logger.info(f"Test set: {len(test_ds)} lap pairs")
 
+    nw = config.data.num_workers
+    loader_kwargs: dict = dict(pin_memory=True, num_workers=nw)
+    if nw > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=config.data.shuffle_train,
-        num_workers=config.data.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=config.data.shuffle_val,
-        num_workers=config.data.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
         shuffle=config.data.shuffle_test,
-        num_workers=config.data.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
 
     return train_loader, val_loader, test_loader
@@ -650,6 +664,7 @@ def train(config: Config, output_dir: Path = None):
         num_epochs=config.training.num_epochs,
         early_stopping_patience=config.training.early_stopping_patience,
         early_stopping_min_epochs=getattr(config.training, 'early_stopping_min_epochs', 0),
+        validation_freq=getattr(config.training, 'validation_freq', 1),
         teacher_forcing_schedule=lambda epoch: teacher_forcing_schedule(epoch, config),
         multistep_horizon_schedule=lambda epoch: multistep_horizon_schedule(epoch, config),
         scheduled_sampling_schedule=lambda epoch: scheduled_sampling_schedule(epoch, config),
@@ -706,6 +721,8 @@ def main():
     parser.add_argument('--ss-noise-std', type=float, help='Noise std in normalized space (default: 0.02, ~300ms)')
     parser.add_argument('--ss-start-epoch', type=int, help='Epoch to start scheduled sampling (default: 10)')
     parser.add_argument('--ss-end-epoch', type=int, help='Epoch to reach max noise (default: num_epochs)')
+    parser.add_argument('--num-workers', type=int, help='Number of data loading workers (overrides config)')
+    parser.add_argument('--validation-freq', type=int, help='Validate every N epochs (default: 1)')
 
     args = parser.parse_args()
     

@@ -129,6 +129,14 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Print the generated launcher commands without executing them.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume an interrupted grid search. --search-root must point to an "
+            "existing search directory whose grid_manifest.json will be reloaded."
+        ),
+    )
 
     args, launcher_args = parser.parse_known_args()
     _validate_args(parser, args, launcher_args)
@@ -136,7 +144,13 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, launcher_args: Sequence[str]) -> None:
-    if not args.grid and args.grid_file is None:
+    if args.resume:
+        if args.search_root is None:
+            parser.error("--resume requires --search-root pointing to an existing search directory.")
+        manifest_path = args.search_root / "grid_manifest.json"
+        if not manifest_path.exists():
+            parser.error(f"Cannot resume: {manifest_path} not found.")
+    elif not args.grid and args.grid_file is None:
         parser.error("Provide at least one --grid or a --grid-file.")
 
     if args.max_combinations is not None and args.max_combinations < 1:
@@ -467,6 +481,46 @@ def _print_results(search_root: Path, records: Sequence[dict[str, Any]]) -> None
     print(f"Summary JSON: {search_root / 'grid_search_results.json'}")
 
 
+def _is_combo_complete(output_dir: Path) -> bool:
+    """Check whether a combination has already finished successfully."""
+    try:
+        rows = _read_launcher_summary(output_dir)
+        if not rows:
+            return False
+        return any(row.get("exit_code") == 0 for row in rows)
+    except Exception:
+        return False
+
+
+def _rebuild_record_from_existing(item: dict[str, Any]) -> dict[str, Any]:
+    """Build a summary record for an already-completed combo without re-running it."""
+    return _summarize_combo(
+        combo_index=item["combo_index"],
+        combo_name=item["combo_name"],
+        output_dir=Path(item["output_dir"]),
+        command=item["command"],
+        exit_code=0,
+        duration_seconds=0.0,
+        labels=item["params"],
+    )
+
+
+def _load_manifest(search_root: Path) -> dict[str, Any]:
+    """Load an existing grid_manifest.json."""
+    with open(search_root / "grid_manifest.json", "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _dimensions_from_manifest(grid_dict: dict[str, list[str]]) -> list[GridDimension]:
+    """Rebuild GridDimension objects from a manifest's ``grid`` mapping."""
+    dimensions = []
+    for param_name, labels in grid_dict.items():
+        flag = f"--{param_name.replace('_', '-')}"
+        choices = tuple(GridChoice(value=label, label=label) for label in labels)
+        dimensions.append(GridDimension(flag=flag, param_name=param_name, choices=choices))
+    return dimensions
+
+
 def _run_combo(command: Sequence[str], combo_name: str, output_dir: Path) -> tuple[int, float]:
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "grid_search_launcher.log"
@@ -491,41 +545,68 @@ def _run_combo(command: Sequence[str], combo_name: str, output_dir: Path) -> tup
 
 def main() -> int:
     args, launcher_args = parse_args()
-    dimensions = _load_grid_dimensions(args)
-    combinations = _generate_combinations(dimensions)
 
-    if args.max_combinations is not None and len(combinations) > args.max_combinations:
-        raise SystemExit(
-            f"Generated {len(combinations)} combinations, which exceeds --max-combinations={args.max_combinations}."
-        )
+    # ------------------------------------------------------------------
+    # Resume path: reload plan from existing manifest
+    # ------------------------------------------------------------------
+    if args.resume:
+        search_root = args.search_root.resolve()
+        manifest = _load_manifest(search_root)
+        dimensions = _dimensions_from_manifest(manifest["grid"])
+        combo_plan = manifest["combinations"]
+        print(f"Resuming grid search from {search_root}")
+    else:
+        dimensions = _load_grid_dimensions(args)
+        combinations = _generate_combinations(dimensions)
 
-    search_root = (args.search_root or _default_search_root()).resolve()
-    search_root.mkdir(parents=True, exist_ok=True)
+        if args.max_combinations is not None and len(combinations) > args.max_combinations:
+            raise SystemExit(
+                f"Generated {len(combinations)} combinations, which exceeds --max-combinations={args.max_combinations}."
+            )
 
-    combo_plan = []
-    for combo_index, selected_choices in enumerate(combinations, start=1):
-        labels = {param_name: choice.label for param_name, choice in selected_choices.items()}
-        combo_name = _build_combo_name(args.combo_name_template, combo_index, labels)
-        output_dir = search_root / combo_name
-        command = _build_launcher_command(launcher_args, dimensions, selected_choices, output_dir)
-        combo_plan.append(
-            {
-                "combo_index": combo_index,
-                "combo_name": combo_name,
-                "output_dir": str(output_dir),
-                "params": labels,
-                "command": command,
-            }
-        )
+        search_root = (args.search_root or _default_search_root()).resolve()
+        search_root.mkdir(parents=True, exist_ok=True)
 
-    _write_manifest(search_root, dimensions, launcher_args, combo_plan)
+        combo_plan = []
+        for combo_index, selected_choices in enumerate(combinations, start=1):
+            labels = {param_name: choice.label for param_name, choice in selected_choices.items()}
+            combo_name = _build_combo_name(args.combo_name_template, combo_index, labels)
+            output_dir = search_root / combo_name
+            command = _build_launcher_command(launcher_args, dimensions, selected_choices, output_dir)
+            combo_plan.append(
+                {
+                    "combo_index": combo_index,
+                    "combo_name": combo_name,
+                    "output_dir": str(output_dir),
+                    "params": labels,
+                    "command": command,
+                }
+            )
+
+        _write_manifest(search_root, dimensions, launcher_args, combo_plan)
+
     _print_plan(search_root, combo_plan, args.dry_run_grid)
 
     if args.dry_run_grid:
         return 0
 
     records = []
+    skipped = 0
     for item in combo_plan:
+        output_dir = Path(item["output_dir"])
+
+        # Skip already-completed combinations
+        if _is_combo_complete(output_dir):
+            skipped += 1
+            record = _rebuild_record_from_existing(item)
+            records.append(record)
+            print(f"Skipping completed combo={item['combo_name']}")
+            with open(search_root / "grid_search.log", "a", encoding="utf-8") as log_handle:
+                log_handle.write(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] SKIP {item['combo_name']} (already complete)\n"
+                )
+            continue
+
         with open(search_root / "grid_search.log", "a", encoding="utf-8") as log_handle:
             log_handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] START {item['combo_name']}\n")
             log_handle.write(f"Command: {subprocess.list2cmdline(item['command'])}\n")
@@ -533,13 +614,13 @@ def main() -> int:
         exit_code, duration = _run_combo(
             command=item["command"],
             combo_name=item["combo_name"],
-            output_dir=Path(item["output_dir"]),
+            output_dir=output_dir,
         )
         labels = item["params"]
         record = _summarize_combo(
             combo_index=item["combo_index"],
             combo_name=item["combo_name"],
-            output_dir=Path(item["output_dir"]),
+            output_dir=output_dir,
             command=item["command"],
             exit_code=exit_code,
             duration_seconds=duration,
@@ -551,6 +632,12 @@ def main() -> int:
                 f"[{datetime.now().isoformat(timespec='seconds')}] END {item['combo_name']} "
                 f"status={record['status']} exit_code={record['exit_code']}\n"
             )
+
+        # Incremental summary so partial results survive interruption
+        _write_summary(search_root, records, dimensions)
+
+    if skipped:
+        print(f"\nSkipped {skipped} already-completed combination(s)")
 
     _write_summary(search_root, records, dimensions)
     _print_results(search_root, records)

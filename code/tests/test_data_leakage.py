@@ -51,6 +51,24 @@ class TestConfigYearOverlap:
         assert train & val == set()
         assert train & test == set()
 
+    def test_overlapping_train_val_raises(self):
+        """Overlapping train/val years should raise ValueError."""
+        with pytest.raises(ValueError, match="Train and val years overlap"):
+            TrainingConfig(
+                train_years=[2020, 2021, 2022],
+                val_years=[2022, 2023],
+                test_years=[2024],
+            )
+
+    def test_overlapping_train_test_raises(self):
+        """Overlapping train/test years should raise ValueError."""
+        with pytest.raises(ValueError, match="Train and test years overlap"):
+            TrainingConfig(
+                train_years=[2020, 2021, 2022],
+                val_years=[2023],
+                test_years=[2022, 2024],
+            )
+
 
 # ── Vocabulary leakage ──────────────────────────────────────────────────
 

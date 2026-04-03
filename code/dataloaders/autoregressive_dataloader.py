@@ -26,6 +26,7 @@ from .utils import (
     get_categorical_columns,
     get_boolean_columns,
     get_compound_columns,
+    extract_lap_features_vectorized,
 )
 from .normalization import LapTimeNormalizer
 
@@ -118,6 +119,7 @@ class AutoregressiveLapDataloader(Dataset):
         normalize: bool = True,
         scaler_type: str = "standard",
         normalizer: Optional[LapTimeNormalizer] = None,
+        require_normalizer: bool = False,
         data_path: Path = None,
         cache_path: Optional[Path] = None,
         device: str = 'cpu',
@@ -174,6 +176,11 @@ class AutoregressiveLapDataloader(Dataset):
             if normalizer is not None:
                 self.normalizer = normalizer
                 logger.info("Using provided normalizer")
+            elif require_normalizer:
+                raise ValueError(
+                    f"require_normalizer=True but no normalizer was provided for years {self.years}. "
+                    f"Fit a normalizer on training data and pass it explicitly to prevent data leakage."
+                )
             else:
                 self.normalizer = LapTimeNormalizer(scaler_type=scaler_type)
                 # Try to load fitted scaler, if not available fit on data
@@ -181,7 +188,11 @@ class AutoregressiveLapDataloader(Dataset):
                     self.normalizer.load(self.years)
                     logger.info(f"Loaded pre-fitted scaler for years {self.years}")
                 except FileNotFoundError:
-                    logger.info(f"Fitting scaler on data from years {self.years}...")
+                    logger.warning(
+                        f"No pre-fitted scaler found for years {self.years}. "
+                        f"Fitting scaler on provided data. If these are val/test years this "
+                        f"will cause DATA LEAKAGE — pass a train-fitted normalizer instead."
+                    )
                     numeric_data = self.data[self.numeric_columns].copy()
                     self.normalizer.fit(numeric_data, years=self.years)
         
@@ -198,260 +209,209 @@ class AutoregressiveLapDataloader(Dataset):
             self._precomputed_targets = [None] * len(self.lap_pairs)
             self._precomputed_meta = [None] * len(self.lap_pairs)
         else:
-            # Attempt to load precomputed cache if available to speed startup.
-            # Cache must match: years, context_window, scaler_type and numeric column set.
-            cache_loaded = False
+            self._scaler_type = scaler_type
             if self.cache_path is None:
-                # default cache location inside data_path/precomputed/
                 cache_dir = Path(self.data_path) / "precomputed"
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 years_key = "_".join(map(str, sorted(self.years)))
                 cache_fname = f"ar_cache_{years_key}_cw{self.context_window}_h{self.multistep_horizon}_{scaler_type}.pt"
                 self.cache_path = cache_dir / cache_fname
 
-            if self.cache_path.exists():
-                try:
-                    logger.info(f"Loading cached precomputed dataset from {self.cache_path}...")
-                    def _safe_torch_load(p):
-                        safe_globals = [
-                            np._core.multiarray.scalar,
-                            np._core.multiarray._reconstruct,
-                            np.ndarray,
-                            np.dtype,
-                        ]
-
-                        # Pre-allowlist for PyTorch>=2.6 weights_only default behavior
-                        try:
-                            if hasattr(torch.serialization, 'add_safe_globals'):
-                                torch.serialization.add_safe_globals(safe_globals)
-                        except Exception:
-                            pass
-
-                        # 1) Preferred: safe weights-only load
-                        try:
-                            return torch.load(p, weights_only=True)
-                        except Exception:
-                            pass
-
-                        # 2) Safe globals context fallback (older/alternate torch APIs)
-                        try:
-                            if hasattr(torch.serialization, 'safe_globals'):
-                                with torch.serialization.safe_globals(safe_globals):
-                                    return torch.load(p, weights_only=True)
-                        except Exception:
-                            pass
-
-                        # 3) Trusted-local-file fallback for legacy caches
-                        try:
-                            logger.info("Falling back to torch.load(weights_only=False) for trusted local cache")
-                            return torch.load(p, weights_only=False)
-                        except Exception:
-                            pass
-
-                        # 4) Last resort: pickle
-                        import pickle
-                        with open(p, 'rb') as f:
-                            return pickle.load(f)
-
-                    cached = _safe_torch_load(self.cache_path)
-                    # Validate cache compatibility
-                    valid = (
-                        cached.get('years') == self.years and
-                        cached.get('context_window') == self.context_window and
-                        cached.get('multistep_horizon', 1) == self.multistep_horizon and
-                        cached.get('scaler_type') == scaler_type and
-                        cached.get('numeric_columns') == self.numeric_columns
-                    )
-                    if valid:
-                        # Reconstruct contexts: skip None entries safely and accept lists/ndarrays/tensors
-                        loaded_contexts = []
-                        for x in cached.get('contexts', []):
-                            if x is None:
-                                loaded_contexts.append(None)
-                            elif isinstance(x, torch.Tensor):
-                                loaded_contexts.append(x)
-                            elif isinstance(x, np.ndarray):
-                                loaded_contexts.append(torch.from_numpy(x))
-                            elif isinstance(x, list):
-                                try:
-                                    loaded_contexts.append(torch.tensor(x, dtype=torch.float32))
-                                except Exception:
-                                    loaded_contexts.append(torch.tensor(np.array(x), dtype=torch.float32))
-                            else:
-                                # unknown type, try torch.tensor
-                                try:
-                                    loaded_contexts.append(torch.tensor(x))
-                                except Exception:
-                                    loaded_contexts.append(None)
-                        self._precomputed_contexts = loaded_contexts
-
-                        # Reconstruct target tensors from saved primitives (handle None)
-                        loaded_targets = []
-                        for tp in cached.get('targets', []):
-                            if tp is None:
-                                loaded_targets.append(None)
-                                continue
-                            lt = torch.tensor(tp['lap_time'], dtype=torch.float32)
-                            is_pit = torch.tensor(tp.get('is_pitlap', 0), dtype=torch.long)
-                            comp = torch.tensor(tp.get('compound', 0), dtype=torch.long)
-                            tmask = torch.tensor(tp['target_mask'], dtype=torch.float32) if 'target_mask' in tp else torch.ones_like(lt)
-                            loaded_targets.append({'lap_time': lt, 'is_pitlap': is_pit, 'compound': comp, 'target_mask': tmask})
-                        self._precomputed_targets = loaded_targets
-                        self._precomputed_meta = cached['meta']
-                        cache_loaded = True
-                        logger.info(f"Loaded {len(self._precomputed_contexts)} cached context tensors")
-                    else:
-                        logger.info("Cache file did not match current dataloader configuration; ignoring cache.")
-                except Exception:
-                    logger.exception("Failed to load cache; will recompute precomputed tensors.")
-
-            if not cache_loaded:
-                # Precompute feature tensors for all lap pairs to avoid heavy
-                # pandas->numpy work inside __getitem__ which blocks the GPU.
-                # This produces slightly higher memory usage but greatly reduces
-                # per-sample CPU overhead during training.
-                logger.info(f"Precomputing feature tensors for all {len(self.lap_pairs)} lap pairs...")
-                self._precomputed_contexts = [None] * len(self.lap_pairs)
-                self._precomputed_targets = [None] * len(self.lap_pairs)
-                self._precomputed_meta = [None] * len(self.lap_pairs)
-
-            if not cache_loaded:
-                H = self.multistep_horizon
-                for i in tqdm(range(len(self.lap_pairs)), desc="Precomputing contexts", unit="pairs"):
-                    pair = self.lap_pairs[i]
-                    context_indices = pair['context_indices']
-                    target_indices = pair.get('target_indices', [pair['target_index']])
-
-                    context_laps = self.data.loc[context_indices].copy()
-                    target_laps = self.data.loc[target_indices].copy()
-
-                    # NOTE: precompute without augmentation (augmentation per-sample
-                    # would re-introduce CPU work). If augment_prob > 0, augmentation
-                    # will be skipped for precomputed path to maximize throughput.
-                    if self.normalizer is not None:
-                        context_laps = self.normalizer.transform(context_laps)
-                        target_laps = self.normalizer.transform(target_laps)
-
-                    # Extract features for context
-                    context_features = []
-                    for _, lap in context_laps.iterrows():
-                        feat = self._get_lap_features(lap)
-                        context_features.append(feat)
-
-                    if context_features:
-                        context_array = np.array(context_features, dtype=np.float32)
-                    else:
-                        # Empty context
-                        num_features = len(self._get_lap_features(context_laps.iloc[0])) if len(context_laps) > 0 else 100
-                        context_array = np.zeros((0, num_features), dtype=np.float32)
-
-                    # Pad context to window size
-                    if len(context_array) < self.context_window:
-                        padding = np.zeros((self.context_window - len(context_array), context_array.shape[1]), dtype=np.float32)
-                        context_array = np.vstack([padding, context_array])
-
-                    # Multi-step target values (pad to H with mask)
-                    target_laptimes = torch.zeros(H, dtype=torch.float32)
-                    target_pitflags = torch.zeros(H, dtype=torch.long)
-                    target_compounds = torch.zeros(H, dtype=torch.long)
-                    target_mask = torch.zeros(H, dtype=torch.float32)
-
-                    for h in range(min(len(target_laps), H)):
-                        t_lap = target_laps.iloc[h]
-                        target_laptimes[h] = float(t_lap['LapTime'])
-                        target_pitflags[h] = int(t_lap.get('is_pitlap', 0))
-                        comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
-                        if comp_vals.sum() == 0:
-                            target_compounds[h] = len(self.compound_columns) - 1
-                        else:
-                            target_compounds[h] = int(np.argmax(comp_vals))
-                        target_mask[h] = 1.0
-
-                    # Convert to tensors and store
-                    context_tensor = torch.from_numpy(context_array)
-                    target_tensor = {
-                        'lap_time': target_laptimes,
-                        'is_pitlap': target_pitflags,
-                        'compound': target_compounds,
-                        'target_mask': target_mask,
-                    }
-
-                    metadata = {
-                        'driver': pair['driver'],
-                        'year': pair['year'],
-                        'circuit': pair['circuit'],
-                        'race_name': pair['race_name'],
-                        'context_length': len(context_features),
-                    }
-
-                    self._precomputed_contexts[i] = context_tensor
-                    self._precomputed_targets[i] = target_tensor
-                    self._precomputed_meta[i] = metadata
-
-                logger.info(f"Precomputed all {len(self.lap_pairs)} context tensors in RAM for maximum training speed")
-
-                # Persist cache to disk for faster subsequent loads
-                try:
-                    logger.info(f"Saving precomputed cache to {self.cache_path} ...")
-                    # Convert contexts to plain lists to avoid numpy reconstruction issues on load
-                    contexts_np = []
-                    for c in self._precomputed_contexts:
-                        if c is None:
-                            contexts_np.append(None)
-                        elif isinstance(c, torch.Tensor):
-                            contexts_np.append(c.cpu().numpy().tolist())
-                        elif isinstance(c, np.ndarray):
-                            contexts_np.append(c.tolist())
-                        elif isinstance(c, list):
-                            contexts_np.append(c)
-                        else:
-                            try:
-                                contexts_np.append(np.array(c).tolist())
-                            except Exception:
-                                contexts_np.append(None)
-                    # targets are small dicts with tensors; convert to primitives (handle None)
-                    targets_primitives = []
-                    for t in self._precomputed_targets:
-                        if t is None:
-                            targets_primitives.append(None)
-                            continue
-                        tp = {}
-                        for k, v in t.items():
-                            if isinstance(v, torch.Tensor):
-                                tp[k] = v.cpu().item() if v.numel() == 1 else v.cpu().numpy()
-                            else:
-                                tp[k] = v
-                        targets_primitives.append(tp)
-
-                    meta_primitives = []
-                    for m in self._precomputed_meta:
-                        if m is None:
-                            meta_primitives.append(None)
-                            continue
-                        meta_primitives.append({
-                            'driver': int(m.get('driver', 0)),
-                            'year': int(m.get('year', 0)),
-                            'circuit': int(m.get('circuit', 0)),
-                            'race_name': str(m.get('race_name', 'Unknown')),
-                            'context_length': int(m.get('context_length', 0)),
-                        })
-
-                    torch.save({
-                        'years': self.years,
-                        'context_window': self.context_window,
-                        'multistep_horizon': self.multistep_horizon,
-                        'scaler_type': scaler_type,
-                        'numeric_columns': self.numeric_columns,
-                        'contexts': contexts_np,
-                        'targets': targets_primitives,
-                        'meta': meta_primitives,
-                    }, self.cache_path)
-                    logger.info(f"Cache saved to {self.cache_path}")
-                except Exception:
-                    logger.exception("Failed to save precomputed cache")
+            if not self._load_cache():
+                self._precompute_all()
+                self._save_cache()
             else:
                 logger.info("Using cached precomputed tensors; skipping recomputation.")
     
+    @staticmethod
+    def _safe_torch_load(p: Path):
+        """Load a torch file with a progressive fallback chain for cross-version compat."""
+        safe_globals = [
+            np._core.multiarray.scalar,
+            np._core.multiarray._reconstruct,
+            np.ndarray,
+            np.dtype,
+        ]
+        try:
+            if hasattr(torch.serialization, 'add_safe_globals'):
+                torch.serialization.add_safe_globals(safe_globals)
+        except Exception:
+            pass
+
+        for weights_only in (True, True, False):
+            try:
+                if weights_only and hasattr(torch.serialization, 'safe_globals'):
+                    with torch.serialization.safe_globals(safe_globals):
+                        return torch.load(p, weights_only=True)
+                return torch.load(p, weights_only=weights_only)
+            except Exception:
+                pass
+
+        import pickle
+        with open(p, 'rb') as f:
+            return pickle.load(f)
+
+    def _load_cache(self) -> bool:
+        """Try to load precomputed tensors from disk cache.
+
+        Returns True if a valid, compatible cache was loaded; False otherwise.
+        """
+        if not self.cache_path.exists():
+            return False
+
+        try:
+            logger.info(f"Loading cached precomputed dataset from {self.cache_path}...")
+            cached = self._safe_torch_load(self.cache_path)
+
+            normalizer_years = getattr(self.normalizer, 'years', None) if self.normalizer else None
+            valid = (
+                cached.get('years') == self.years
+                and cached.get('context_window') == self.context_window
+                and cached.get('multistep_horizon', 1) == self.multistep_horizon
+                and cached.get('scaler_type') == self._scaler_type
+                and cached.get('numeric_columns') == self.numeric_columns
+            )
+            cached_scaler_years = cached.get('scaler_fitted_years')
+            if valid and cached_scaler_years is not None and normalizer_years is not None:
+                if cached_scaler_years != normalizer_years:
+                    logger.warning(
+                        f"Cache scaler provenance mismatch: cache used scaler fit on "
+                        f"{cached_scaler_years} but current normalizer fit on {normalizer_years}. "
+                        f"Invalidating cache."
+                    )
+                    valid = False
+
+            if not valid:
+                logger.info("Cache file did not match current dataloader configuration; ignoring cache.")
+                return False
+
+            # Contexts: new caches store tensors directly; legacy caches may store lists/ndarrays
+            loaded_contexts = []
+            for x in cached.get('contexts', []):
+                if x is None:
+                    loaded_contexts.append(None)
+                elif isinstance(x, torch.Tensor):
+                    loaded_contexts.append(x)
+                elif isinstance(x, np.ndarray):
+                    loaded_contexts.append(torch.from_numpy(x.astype(np.float32)))
+                elif isinstance(x, list):
+                    loaded_contexts.append(torch.tensor(np.array(x), dtype=torch.float32))
+                else:
+                    loaded_contexts.append(None)
+            self._precomputed_contexts = loaded_contexts
+
+            # Targets: new caches store dicts of tensors directly
+            loaded_targets = []
+            for tp in cached.get('targets', []):
+                if tp is None:
+                    loaded_targets.append(None)
+                    continue
+                lt = tp['lap_time'] if isinstance(tp['lap_time'], torch.Tensor) else torch.tensor(tp['lap_time'], dtype=torch.float32)
+                pit = tp.get('is_pitlap', 0)
+                pit = pit if isinstance(pit, torch.Tensor) else torch.tensor(pit, dtype=torch.long)
+                comp = tp.get('compound', 0)
+                comp = comp if isinstance(comp, torch.Tensor) else torch.tensor(comp, dtype=torch.long)
+                tmask = tp.get('target_mask')
+                if tmask is None:
+                    tmask = torch.ones_like(lt)
+                elif not isinstance(tmask, torch.Tensor):
+                    tmask = torch.tensor(tmask, dtype=torch.float32)
+                loaded_targets.append({'lap_time': lt, 'is_pitlap': pit, 'compound': comp, 'target_mask': tmask})
+            self._precomputed_targets = loaded_targets
+            self._precomputed_meta = cached['meta']
+            logger.info(f"Loaded {len(self._precomputed_contexts)} cached context tensors")
+            return True
+
+        except Exception:
+            logger.exception("Failed to load cache; will recompute precomputed tensors.")
+            return False
+
+    def _precompute_all(self) -> None:
+        """Compute and store feature tensors for all lap pairs."""
+        H = self.multistep_horizon
+        n = len(self.lap_pairs)
+        n_feat = (len(self.numeric_columns) + len(self.categorical_columns)
+                  + len(self.boolean_columns) + len(self.compound_columns))
+
+        logger.info(f"Precomputing feature tensors for all {n} lap pairs...")
+        self._precomputed_contexts = [None] * n
+        self._precomputed_targets = [None] * n
+        self._precomputed_meta = [None] * n
+
+        for i in tqdm(range(n), desc="Precomputing contexts", unit="pairs"):
+            pair = self.lap_pairs[i]
+            context_indices = pair['context_indices']
+            target_indices = pair.get('target_indices', [pair['target_index']])
+
+            context_laps = self.data.loc[context_indices].copy()
+            target_laps = self.data.loc[target_indices].copy()
+
+            if self.normalizer is not None:
+                context_laps = self.normalizer.transform(context_laps)
+                target_laps = self.normalizer.transform(target_laps)
+
+            if len(context_laps) > 0:
+                context_array = extract_lap_features_vectorized(
+                    context_laps,
+                    self.numeric_columns, self.categorical_columns,
+                    self.boolean_columns, self.compound_columns,
+                )
+            else:
+                context_array = np.zeros((0, n_feat), dtype=np.float32)
+
+            if len(context_array) < self.context_window:
+                padding = np.zeros((self.context_window - len(context_array), n_feat), dtype=np.float32)
+                context_array = np.vstack([padding, context_array])
+
+            target_laptimes = torch.zeros(H, dtype=torch.float32)
+            target_pitflags = torch.zeros(H, dtype=torch.long)
+            target_compounds = torch.zeros(H, dtype=torch.long)
+            target_mask = torch.zeros(H, dtype=torch.float32)
+
+            for h in range(min(len(target_laps), H)):
+                t_lap = target_laps.iloc[h]
+                target_laptimes[h] = float(t_lap['LapTime'])
+                target_pitflags[h] = int(t_lap.get('is_pitlap', 0))
+                comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
+                target_compounds[h] = int(np.argmax(comp_vals)) if comp_vals.sum() > 0 else len(self.compound_columns) - 1
+                target_mask[h] = 1.0
+
+            self._precomputed_contexts[i] = torch.from_numpy(context_array)
+            self._precomputed_targets[i] = {
+                'lap_time': target_laptimes,
+                'is_pitlap': target_pitflags,
+                'compound': target_compounds,
+                'target_mask': target_mask,
+            }
+            self._precomputed_meta[i] = {
+                'driver': pair['driver'],
+                'year': pair['year'],
+                'circuit': pair['circuit'],
+                'race_name': pair['race_name'],
+                'context_length': len(context_indices),
+            }
+
+        logger.info(f"Precomputed all {n} context tensors in RAM")
+
+    def _save_cache(self) -> None:
+        """Persist precomputed tensors to disk using native torch serialization."""
+        try:
+            logger.info(f"Saving precomputed cache to {self.cache_path} ...")
+            torch.save({
+                'years': self.years,
+                'context_window': self.context_window,
+                'multistep_horizon': self.multistep_horizon,
+                'scaler_type': self._scaler_type,
+                'numeric_columns': self.numeric_columns,
+                'scaler_fitted_years': getattr(self.normalizer, 'years', None),
+                'contexts': self._precomputed_contexts,
+                'targets': self._precomputed_targets,
+                'meta': self._precomputed_meta,
+            }, self.cache_path)
+            logger.info(f"Cache saved to {self.cache_path}")
+        except Exception:
+            logger.exception("Failed to save precomputed cache")
+
     def _generate_lap_pairs(self) -> List[Dict]:
         """
         Generate (context_laps, next_lap) pairs from race data.
@@ -695,17 +655,18 @@ class AutoregressiveLapDataloader(Dataset):
             context_laps = self.normalizer.transform(context_laps)
             target_laps = self.normalizer.transform(target_laps)
 
-        # Extract features
-        context_features = []
-        for _, lap in context_laps.iterrows():
-            feat = self._get_lap_features(lap)
-            context_features.append(feat)
-
-        if context_features:
-            context_array = np.array(context_features, dtype=np.float32)
+        # Extract features (vectorized)
+        if len(context_laps) > 0:
+            context_array = extract_lap_features_vectorized(
+                context_laps,
+                self.numeric_columns,
+                self.categorical_columns,
+                self.boolean_columns,
+                self.compound_columns,
+            )
         else:
-            num_features = len(self._get_lap_features(context_laps.iloc[0])) if len(context_laps) > 0 else 100
-            context_array = np.zeros((0, num_features), dtype=np.float32)
+            n_feat = len(self.numeric_columns) + len(self.categorical_columns) + len(self.boolean_columns) + len(self.compound_columns)
+            context_array = np.zeros((0, n_feat), dtype=np.float32)
 
         # Pad context to window size
         if len(context_array) < self.context_window:

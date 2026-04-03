@@ -127,17 +127,23 @@ class Trainer:
         self.scaler = GradScaler() if self.use_mixed_precision else None
 
         logger.info(f"Trainer initialized with device={self.device}")
-        # Enable TF32 for Ampere+ GPUs (free ~5% speedup, negligible precision impact)
+        # Enable TF32 and cudnn.benchmark for GPU speedup
         if self.device == 'cuda':
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
 
-        # Compile model for faster execution (torch >= 2.0, silently skipped otherwise)
-        try:
-            self.model = torch.compile(self.model, backend='aot_eager')
-            logger.info(f"Model compiled with torch.compile(backend='aot_eager')")
-        except Exception:
-            pass
+        # Compile model for faster execution (torch >= 2.0).
+        # inductor requires Triton (unavailable on Windows); cudagraphs requires static shapes
+        # (breaks on variable batch sizes / decoder lengths). Use aot_eager on Windows instead.
+        if hasattr(torch, 'compile'):
+            import sys as _sys
+            backend = 'aot_eager' if _sys.platform == 'win32' else 'inductor'
+            try:
+                self.model = torch.compile(self.model, backend=backend)
+                logger.info(f"Model compiled with torch.compile(backend='{backend}')")
+            except Exception as e:
+                logger.warning(f"torch.compile(backend='{backend}') failed: {e}; using uncompiled model")
         
         # Ensure model is on the correct device
         try:
@@ -189,11 +195,12 @@ class Trainer:
                     continue
                 comp_val = target['compound']
                 if isinstance(comp_val, torch.Tensor):
-                    comp_idx = int(comp_val.item())
+                    indices = comp_val.view(-1).tolist()
                 else:
-                    comp_idx = int(comp_val)
-                if 0 <= comp_idx < num_classes:
-                    counts[comp_idx] += 1.0
+                    indices = [int(comp_val)]
+                for comp_idx in indices:
+                    if 0 <= int(comp_idx) < num_classes:
+                        counts[int(comp_idx)] += 1.0
 
             if counts.sum() <= 0:
                 return
@@ -248,6 +255,220 @@ class Trainer:
 
         return encoder_input
 
+    def _prepare_batch(
+        self,
+        encoder_input,
+        decoder_input: torch.Tensor,
+        targets,
+        multistep_horizon: int,
+        scheduled_sampling_prob: float,
+        scheduled_sampling_noise_std: float,
+    ):
+        """Move batch to device, truncate to horizon, and apply scheduled sampling."""
+        if not isinstance(encoder_input, dict):
+            encoder_input = encoder_input.to(self.device)
+        else:
+            encoder_input = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in encoder_input.items()
+            }
+        decoder_input = decoder_input.to(self.device)
+        if isinstance(targets, dict):
+            for k, v in list(targets.items()):
+                if isinstance(v, torch.Tensor):
+                    targets[k] = v.to(self.device)
+        else:
+            targets = targets.to(self.device)
+
+        current_h = max(1, multistep_horizon)
+        if decoder_input.dim() == 3 and decoder_input.size(1) > current_h:
+            decoder_input = decoder_input[:, :current_h, :]
+            if isinstance(targets, dict):
+                for k, v in list(targets.items()):
+                    if isinstance(v, torch.Tensor) and v.dim() == 2:
+                        targets[k] = v[:, :current_h]
+
+        if scheduled_sampling_prob > 0.0 and not isinstance(encoder_input, dict):
+            encoder_input = self._apply_scheduled_sampling(
+                encoder_input, scheduled_sampling_prob, scheduled_sampling_noise_std,
+                lap_time_idx=0,
+            )
+
+        return encoder_input, decoder_input, targets
+
+    def _compute_loss(self, outputs, targets):
+        """Compute combined multi-task loss.
+
+        Returns
+        -------
+        tuple or None
+            (loss_batch, lap_loss_value, pit_loss_value, comp_loss_value, pit_scale, comp_scale)
+            or None if the batch should be skipped (empty mask / non-finite predictions).
+        """
+        if isinstance(targets, dict):
+            lap_t = targets['lap_time']
+            if lap_t.dim() == 1:
+                lap_t_rs = lap_t.unsqueeze(-1).unsqueeze(-1)
+            elif lap_t.dim() == 2:
+                lap_t_rs = lap_t.unsqueeze(-1)
+            else:
+                lap_t_rs = lap_t
+
+            pit_t = targets.get('is_pitlap', None)
+            comp_t = targets.get('compound', None)
+            tmask = targets.get('target_mask', None)
+
+            with torch.no_grad():
+                mask = torch.isfinite(lap_t_rs)
+                if tmask is not None:
+                    if tmask.dim() == 1:
+                        tmask_rs = tmask.unsqueeze(-1).unsqueeze(-1)
+                    elif tmask.dim() == 2:
+                        tmask_rs = tmask.unsqueeze(-1)
+                    else:
+                        tmask_rs = tmask
+                    mask = mask & (tmask_rs > 0.5)
+            if mask.sum() == 0:
+                return None
+
+            lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs
+            if not torch.isfinite(lap_pred).all():
+                return None
+
+            denom = mask.float().sum()
+            if self.lap_loss_kind == 'huber':
+                diff = lap_pred - lap_t_rs
+                ad = diff.abs()
+                delta = self.lap_huber_delta
+                huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+                lap_loss = (huber * mask.float()).sum() / denom
+            else:
+                lap_loss = ((lap_pred - lap_t_rs) ** 2 * mask.float()).sum() / denom
+
+            aux_mask_2d = None
+            if tmask is not None:
+                if tmask.dim() == 2:
+                    aux_mask_2d = tmask
+                elif tmask.dim() == 1:
+                    aux_mask_2d = tmask.unsqueeze(-1)
+
+            pit_loss = torch.tensor(0.0, device=self.device)
+            if pit_t is not None and isinstance(outputs, dict) and 'pit_logits' in outputs:
+                pit_pred = outputs['pit_logits']
+                pit_t_rs = pit_t.unsqueeze(-1) if pit_t.dim() == 1 else pit_t
+                bce = nn.BCEWithLogitsLoss(reduction='none')
+                pit_raw = bce(pit_pred, pit_t_rs.float())
+                if aux_mask_2d is not None:
+                    pit_loss = (pit_raw * aux_mask_2d).sum() / aux_mask_2d.sum().clamp(min=1)
+                else:
+                    pit_loss = pit_raw.mean()
+
+            comp_loss = torch.tensor(0.0, device=self.device)
+            if comp_t is not None and isinstance(outputs, dict) and 'compound_logits' in outputs:
+                comp_pred = outputs['compound_logits']
+                bsz, seq_len, C = comp_pred.shape
+                comp_pred_flat = comp_pred.reshape(bsz * seq_len, C)
+                comp_t_rs = (
+                    comp_t.unsqueeze(-1).expand(-1, seq_len).reshape(-1)
+                    if comp_t.dim() == 1 else comp_t.reshape(-1)
+                )
+                comp_weight = self._compound_class_weight_tensor
+                if comp_weight is not None:
+                    comp_weight = comp_weight.to(device=comp_pred_flat.device, dtype=torch.float32)
+                try:
+                    ce = nn.CrossEntropyLoss(
+                        reduction='none', weight=comp_weight,
+                        label_smoothing=self.compound_label_smoothing,
+                    )
+                except TypeError:
+                    ce = nn.CrossEntropyLoss(reduction='none', weight=comp_weight)
+                from torch.amp import autocast as _autocast
+                with _autocast(device_type='cuda', enabled=False):
+                    comp_raw = ce(comp_pred_flat.float(), comp_t_rs.long())
+                if aux_mask_2d is not None:
+                    comp_mask_flat = aux_mask_2d.reshape(-1)
+                    comp_loss = (comp_raw * comp_mask_flat).sum() / comp_mask_flat.sum().clamp(min=1)
+                else:
+                    comp_loss = comp_raw.mean()
+
+            pit_scale = 1.0
+            comp_scale = 1.0
+            if self.dynamic_aux_balance:
+                self._lap_loss_ema = self._update_loss_ema(self._lap_loss_ema, float(lap_loss.detach()))
+                self._pit_loss_ema = self._update_loss_ema(self._pit_loss_ema, float(pit_loss.detach()))
+                self._compound_loss_ema = self._update_loss_ema(self._compound_loss_ema, float(comp_loss.detach()))
+                if self._pit_loss_ema and self._pit_loss_ema > 0:
+                    pit_scale = float(np.clip(
+                        self._lap_loss_ema / (self._pit_loss_ema + 1e-8),
+                        self.dynamic_aux_min_scale, self.dynamic_aux_max_scale,
+                    ))
+                if self._compound_loss_ema and self._compound_loss_ema > 0:
+                    comp_scale = float(np.clip(
+                        self._lap_loss_ema / (self._compound_loss_ema + 1e-8),
+                        self.dynamic_aux_min_scale, self.dynamic_aux_max_scale,
+                    ))
+
+            loss_batch = (
+                lap_loss
+                + float(self.pit_loss_weight) * pit_scale * pit_loss
+                + float(self.compound_loss_weight) * comp_scale * comp_loss
+            )
+            return (
+                loss_batch,
+                float(lap_loss.detach()),
+                float(pit_loss.detach()),
+                float(comp_loss.detach()),
+                pit_scale,
+                comp_scale,
+            )
+
+        else:
+            # Single-target path
+            targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1) if targets.dim() == 1 else targets
+            with torch.no_grad():
+                mask = torch.isfinite(targets_reshaped)
+            if mask.sum() == 0:
+                return None
+
+            lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs
+            if not torch.isfinite(lap_pred).all():
+                return None
+
+            denom = mask.float().sum()
+            if self.lap_loss_kind == 'huber':
+                diff = lap_pred - targets_reshaped
+                ad = diff.abs()
+                delta = self.lap_huber_delta
+                huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+                loss_batch = (huber * mask.float()).sum() / denom
+            else:
+                loss_batch = ((lap_pred - targets_reshaped) ** 2 * mask.float()).sum() / denom
+
+            return loss_batch, float(loss_batch.detach()), 0.0, 0.0, 1.0, 1.0
+
+    def _optimizer_step(self, batch_idx: int) -> None:
+        """Run one optimizer step with gradient clipping and mixed precision support."""
+        if self.use_mixed_precision:
+            if self.gradient_clip is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            if self.gradient_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+            skip_step = False
+            for name, p in self.model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    logger.warning(
+                        f"Non-finite gradient in {name} at batch {batch_idx}; skipping step"
+                    )
+                    skip_step = True
+                    break
+            if not skip_step:
+                self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
     def train_epoch(
         self,
         train_loader: DataLoader,
@@ -298,292 +519,59 @@ class Trainer:
             disable=not self._show_progress,
         )
 
+        skipped_batches = 0
+
         for batch_idx, batch in progress:
-            # Extract batch data (pass dataset so decoder targets can be normalized/asserted)
             encoder_input, decoder_input, targets, metadata = self._unpack_batch(batch, dataset=train_loader.dataset)
-            # Encoder input may be a dict (structured numeric+categorical); let the
-            # model handle device placement and embedding when it's a dict.
-            if not isinstance(encoder_input, dict):
-                encoder_input = encoder_input.to(self.device)
-            decoder_input = decoder_input.to(self.device)
-            # Move targets tensors to device if targets is a dict
-            if isinstance(targets, dict):
-                for k, v in list(targets.items()):
-                    if isinstance(v, torch.Tensor):
-                        targets[k] = v.to(self.device)
-            else:
-                targets = targets.to(self.device)
+            encoder_input, decoder_input, targets = self._prepare_batch(
+                encoder_input, decoder_input, targets,
+                multistep_horizon, scheduled_sampling_prob, scheduled_sampling_noise_std,
+            )
 
-            # Truncate to current multistep horizon (curriculum may use < max H)
-            current_h = max(1, multistep_horizon)
-            if decoder_input.dim() == 3 and decoder_input.size(1) > current_h:
-                decoder_input = decoder_input[:, :current_h, :]
-                if isinstance(targets, dict):
-                    for k, v in list(targets.items()):
-                        if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(-1) >= current_h:
-                            targets[k] = v[:, :current_h] if v.dim() == 2 else v
-                        elif isinstance(v, torch.Tensor) and v.dim() == 2:
-                            targets[k] = v[:, :current_h]
-
-            # Scheduled sampling: corrupt encoder LapTime with noise
-            if scheduled_sampling_prob > 0.0 and not isinstance(encoder_input, dict):
-                encoder_input = self._apply_scheduled_sampling(
-                    encoder_input, scheduled_sampling_prob, scheduled_sampling_noise_std,
-                    lap_time_idx=0,  # LapTime is first numeric feature
-                )
-
-            # Forward pass with optional mixed precision
+            # Forward pass
             with autocast(device_type='cuda', enabled=self.use_mixed_precision):
                 outputs = self.model(
-                    encoder_input,
-                    decoder_input,
-                    teacher_forcing=True,
-                    teacher_forcing_ratio=teacher_forcing_ratio,
+                    encoder_input, decoder_input,
+                    teacher_forcing=True, teacher_forcing_ratio=teacher_forcing_ratio,
                 )
 
-            # Determine if targets is a dict (multi-task) or single tensor
-            if isinstance(targets, dict):
-                # Lap time target
-                lap_t = targets['lap_time']
-                if lap_t.dim() == 1:
-                    lap_t_rs = lap_t.unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
-                elif lap_t.dim() == 2:
-                    lap_t_rs = lap_t.unsqueeze(-1)  # (batch, H, 1)
-                else:
-                    lap_t_rs = lap_t
+            # Compute loss
+            result = self._compute_loss(outputs, targets)
+            if result is None:
+                skipped_batches += 1
+                continue
+            loss_batch, lap_loss_value, pit_loss_value, comp_loss_value, pit_scale, comp_scale = result
 
-                # Pit and compound targets
-                pit_t = targets.get('is_pitlap', None)
-                comp_t = targets.get('compound', None)
-
-                # Build combined mask: finite values AND valid target positions
-                with torch.no_grad():
-                    mask = torch.isfinite(lap_t_rs)
-                    # Apply target_mask for multi-step padded positions
-                    tmask = targets.get('target_mask', None)
-                    if tmask is not None:
-                        if tmask.dim() == 1:
-                            tmask_rs = tmask.unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
-                        elif tmask.dim() == 2:
-                            tmask_rs = tmask.unsqueeze(-1)  # (batch, H, 1)
-                        else:
-                            tmask_rs = tmask
-                        mask = mask & (tmask_rs > 0.5)
-                if mask.sum() == 0:
-                    continue
-
-                lap_pred = outputs['lap'] if isinstance(outputs, dict) else outputs
-                if not torch.isfinite(lap_pred).all():
-                    continue
-
-                denom = mask.float().sum()
-                # Compute lap loss: Huber (preferred) or MSE
-                if self.lap_loss_kind == 'huber':
-                    diff = lap_pred - lap_t_rs
-                    ad = diff.abs()
-                    delta = self.lap_huber_delta
-                    huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
-                    masked = huber * mask.float()
-                    lap_loss = masked.sum() / denom
-                else:
-                    se = (lap_pred - lap_t_rs) ** 2
-                    masked_se = se * mask.float()
-                    lap_loss = masked_se.sum() / denom
-
-                # Build 2D mask for auxiliary losses (batch, seq_len)
-                aux_mask_2d = None
-                if tmask is not None and tmask.dim() == 2:
-                    aux_mask_2d = tmask  # (batch, H)
-                elif tmask is not None and tmask.dim() == 1:
-                    aux_mask_2d = tmask.unsqueeze(-1)  # (batch, 1)
-
-                # Pit loss (BCEWithLogits)
-                pit_loss = torch.tensor(0.0, device=self.device)
-                if pit_t is not None and 'pit_logits' in outputs:
-                    pit_pred = outputs['pit_logits']  # (batch, seq_len)
-                    # Align shapes: make pit_t same shape as pit_pred
-                    if pit_t.dim() == 1:
-                        pit_t_rs = pit_t.unsqueeze(-1)
-                    else:
-                        pit_t_rs = pit_t
-                    bce = nn.BCEWithLogitsLoss(reduction='none')
-                    pit_raw_loss = bce(pit_pred, pit_t_rs.float())
-                    if aux_mask_2d is not None:
-                        pit_raw_loss = pit_raw_loss * aux_mask_2d
-                        pit_loss = pit_raw_loss.sum() / aux_mask_2d.sum().clamp(min=1)
-                    else:
-                        pit_loss = pit_raw_loss.mean()
-
-                # Compound loss (CrossEntropy)
-                comp_loss = torch.tensor(0.0, device=self.device)
-                if comp_t is not None and 'compound_logits' in outputs:
-                    comp_pred = outputs['compound_logits']  # (batch, seq_len, C)
-                    # Flatten for cross-entropy: (batch*seq_len, C)
-                    bsz, seq_len, C = comp_pred.shape
-                    comp_pred_flat = comp_pred.reshape(bsz * seq_len, C)
-                    # comp_t may be (batch,) or (batch, seq_len)
-                    if comp_t.dim() == 1:
-                        comp_t_rs = comp_t.unsqueeze(-1).expand(-1, seq_len).reshape(-1)
-                    else:
-                        comp_t_rs = comp_t.reshape(-1)
-                    comp_weight = self._compound_class_weight_tensor
-                    if comp_weight is not None:
-                        comp_weight = comp_weight.to(device=comp_pred_flat.device, dtype=torch.float32)
-                    try:
-                        ce = nn.CrossEntropyLoss(
-                            reduction='none',
-                            weight=comp_weight,
-                            label_smoothing=self.compound_label_smoothing,
-                        )
-                    except TypeError:
-                        ce = nn.CrossEntropyLoss(
-                            reduction='none',
-                            weight=comp_weight,
-                        )
-                    with autocast(device_type='cuda', enabled=False):
-                        comp_raw = ce(comp_pred_flat.float(), comp_t_rs.long())
-                    if aux_mask_2d is not None:
-                        comp_mask_flat = aux_mask_2d.reshape(-1)
-                        comp_raw = comp_raw * comp_mask_flat
-                        comp_loss = comp_raw.sum() / comp_mask_flat.sum().clamp(min=1)
-                    else:
-                        comp_loss = comp_raw.mean()
-
-                pit_scale = 1.0
-                comp_scale = 1.0
-                if self.dynamic_aux_balance:
-                    self._lap_loss_ema = self._update_loss_ema(self._lap_loss_ema, float(lap_loss.detach().item()))
-                    self._pit_loss_ema = self._update_loss_ema(self._pit_loss_ema, float(pit_loss.detach().item()))
-                    self._compound_loss_ema = self._update_loss_ema(self._compound_loss_ema, float(comp_loss.detach().item()))
-
-                    if self._pit_loss_ema is not None and self._pit_loss_ema > 0:
-                        pit_scale = float(np.clip(
-                            self._lap_loss_ema / (self._pit_loss_ema + 1e-8),
-                            self.dynamic_aux_min_scale,
-                            self.dynamic_aux_max_scale,
-                        ))
-                    if self._compound_loss_ema is not None and self._compound_loss_ema > 0:
-                        comp_scale = float(np.clip(
-                            self._lap_loss_ema / (self._compound_loss_ema + 1e-8),
-                            self.dynamic_aux_min_scale,
-                            self.dynamic_aux_max_scale,
-                        ))
-
-                # Combine losses with configurable weighting
-                loss_batch = (
-                    lap_loss +
-                    float(self.pit_loss_weight) * pit_scale * pit_loss +
-                    float(self.compound_loss_weight) * comp_scale * comp_loss
-                )
-
-                lap_loss_value = float(lap_loss.detach().item())
-                pit_loss_value = float(pit_loss.detach().item())
-                comp_loss_value = float(comp_loss.detach().item())
-                total_pit_scale += pit_scale
-                total_comp_scale += comp_scale
-                num_multitask_batches += 1
-
-            else:
-                # Old single-target behavior
-                if targets.dim() == 1:
-                    targets_reshaped = targets.unsqueeze(-1).unsqueeze(-1)
-                else:
-                    targets_reshaped = targets
-
-                with torch.no_grad():
-                    mask = torch.isfinite(targets_reshaped)
-                if mask.sum() == 0:
-                    continue
-
-                if isinstance(outputs, dict):
-                    lap_pred = outputs['lap']
-                else:
-                    lap_pred = outputs
-
-                if not torch.isfinite(lap_pred).all():
-                    continue
-
-                denom = mask.float().sum()
-                if self.lap_loss_kind == 'huber':
-                    diff = lap_pred - targets_reshaped
-                    ad = diff.abs()
-                    delta = self.lap_huber_delta
-                    huber = torch.where(ad <= delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
-                    masked = huber * mask.float()
-                    loss_batch = masked.sum() / denom
-                else:
-                    se = (lap_pred - targets_reshaped) ** 2
-                    masked_se = se * mask.float()
-                    loss_batch = masked_se.sum() / denom
-                lap_loss_value = float(loss_batch.detach().item())
-                pit_loss_value = 0.0
-                comp_loss_value = 0.0
-
-            # Skip pathological batches that would dominate epoch loss and destabilize training
+            # Skip pathological batches
             if not torch.isfinite(loss_batch):
                 self.optimizer.zero_grad(set_to_none=True)
+                skipped_batches += 1
                 continue
-
             loss_value = float(loss_batch.detach().item())
             if loss_value > 1e3:
-                logger.debug(
-                    f"Skipping pathological batch at epoch {epoch}, batch {batch_idx}: "
-                    f"loss={loss_value:.6f}"
-                )
+                logger.debug(f"Skipping pathological batch at epoch {epoch}, batch {batch_idx}: loss={loss_value:.6f}")
                 self.optimizer.zero_grad(set_to_none=True)
+                skipped_batches += 1
                 continue
 
-            # Scale loss for gradient accumulation (common to both branches)
+            # Backward + optimizer step
             loss = loss_batch / self.accumulation_steps
-            
-            # Backward pass with gradient accumulation and mixed precision
             if self.use_mixed_precision:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
-            # Optimizer step with gradient accumulation and mixed precision
+
             if (batch_idx + 1) % self.accumulation_steps == 0:
-                if self.use_mixed_precision:
-                    # Unscale gradients for clipping
-                    if self.gradient_clip is not None:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.gradient_clip
-                        )
-                    
-                    # Step optimizer with scaler
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    # Standard training without mixed precision
-                    if self.gradient_clip is not None:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.gradient_clip
-                        )
-                    
-                    # Check for non-finite gradients
-                    skip_step = False
-                    for name, p in self.model.named_parameters():
-                        if p.grad is None:
-                            continue
-                        if not torch.isfinite(p.grad).all():
-                            logger.warning(f"Non-finite gradient detected for {name} at batch {batch_idx}, skipping optimizer step")
-                            skip_step = True
-                            break
-                    
-                    if not skip_step:
-                        self.optimizer.step()
-                
-                # Zero gradients
-                self.optimizer.zero_grad()
-            
+                self._optimizer_step(batch_idx)
+
             total_loss += loss_value
             total_lap_loss += lap_loss_value
             total_pit_loss += pit_loss_value
             total_comp_loss += comp_loss_value
+            total_pit_scale += pit_scale
+            total_comp_scale += comp_scale
+            if pit_scale != 1.0 or comp_scale != 1.0:
+                num_multitask_batches += 1
             num_batches += 1
 
             if num_batches > 0:
@@ -592,6 +580,14 @@ class Trainer:
                     'lap': f"{(total_lap_loss / num_batches):.4f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
                 })
+
+        # Flush remaining accumulated gradients (fixes silent drop when
+        # len(train_loader) % accumulation_steps != 0)
+        if self.accumulation_steps > 1 and num_batches % self.accumulation_steps != 0:
+            self._optimizer_step(num_batches - 1)
+
+        if skipped_batches > 0:
+            logger.warning(f"Epoch {epoch}: skipped {skipped_batches} batches (NaN/Inf/pathological)")
 
         progress.close()
         

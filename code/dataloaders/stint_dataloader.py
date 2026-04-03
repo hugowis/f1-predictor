@@ -27,6 +27,7 @@ from .utils import (
     get_categorical_columns,
     get_boolean_columns,
     get_compound_columns,
+    extract_lap_features_vectorized,
 )
 from .normalization import LapTimeNormalizer
 
@@ -111,6 +112,7 @@ class StintDataloader(Dataset):
         normalize: bool = True,
         scaler_type: str = "standard",
         normalizer: Optional[LapTimeNormalizer] = None,
+        require_normalizer: bool = False,
         data_path: Path = None,
         device: str = 'cpu',
         seed: int = None,
@@ -150,6 +152,11 @@ class StintDataloader(Dataset):
             if normalizer is not None:
                 self.normalizer = normalizer
                 logger.info("Using provided normalizer")
+            elif require_normalizer:
+                raise ValueError(
+                    f"require_normalizer=True but no normalizer was provided for years {self.years}. "
+                    f"Fit a normalizer on training data and pass it explicitly to prevent data leakage."
+                )
             else:
                 self.normalizer = LapTimeNormalizer(scaler_type=scaler_type)
                 # Try to load fitted scaler, if not available fit on data
@@ -157,7 +164,11 @@ class StintDataloader(Dataset):
                     self.normalizer.load(self.years)
                     logger.info(f"Loaded pre-fitted scaler for years {self.years}")
                 except FileNotFoundError:
-                    logger.info(f"Fitting scaler on data from years {self.years}...")
+                    logger.warning(
+                        f"No pre-fitted scaler found for years {self.years}. "
+                        f"Fitting scaler on provided data. If these are val/test years this "
+                        f"will cause DATA LEAKAGE — pass a train-fitted normalizer instead."
+                    )
                     numeric_data = self.data[self.numeric_columns].copy()
                     self.normalizer.fit(numeric_data, years=self.years)
         
@@ -404,18 +415,18 @@ class StintDataloader(Dataset):
         if len(input_laps) > self.window_size:
             input_laps = input_laps.iloc[-self.window_size:]
 
-        # Build feature matrix
-        features_list = []
-        for _, lap in input_laps.iterrows():
-            feat = self._get_lap_features(lap)
-            features_list.append(feat)
-
-        # Convert to tensor
-        if features_list:
-            features = np.array(features_list, dtype=np.float32)
+        # Build feature matrix (vectorized — avoids slow iterrows loop)
+        if len(input_laps) > 0:
+            features = extract_lap_features_vectorized(
+                input_laps,
+                self.numeric_columns,
+                self.categorical_columns,
+                self.boolean_columns,
+                self.compound_columns,
+            )
         else:
-            num_features = len(self._get_lap_features(input_laps.iloc[0])) if len(input_laps) > 0 else 100
-            features = np.zeros((0, num_features), dtype=np.float32)
+            n_feat = len(self.numeric_columns) + len(self.categorical_columns) + len(self.boolean_columns) + len(self.compound_columns)
+            features = np.zeros((0, n_feat), dtype=np.float32)
 
         # Pad sequence to window size
         if len(features) < self.window_size:

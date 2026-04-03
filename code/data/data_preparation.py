@@ -60,13 +60,24 @@ class DataPreparation:
 
     ]
 
-    def __init__(self, data_path: Path):
-
+    def __init__(self, data_path: Path, vocab_years: List[int] = None):
+        """
+        Parameters
+        ----------
+        data_path : Path
+            Root data directory containing raw_data/, clean_data/, vocabs/
+        vocab_years : list of int, optional
+            Years to use for building categorical vocabularies.
+            Categories appearing ONLY in years outside this list will be
+            mapped to <UNK> (index 0). If None, all available years are
+            used (legacy behaviour — not recommended, causes data leakage).
+        """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.vocabs_path = data_path / "vocabs"
         self.raw_data_path = data_path / "raw_data"
         self.save_dir = data_path / "clean_data"
         self.schedules, self.years = self._load_schedules()
+        self.vocab_years = set(vocab_years) if vocab_years is not None else None
 
         self.categories = {
             col: {"<UNK>": 0} for col in self.CATEGORICAL_COLUMNS
@@ -224,7 +235,17 @@ class DataPreparation:
         return df.drop(columns=[c for c in self.DROP_COLS if c in df.columns])
 
 
-    def _to_categorical(self, df, **_):
+    def _to_categorical(self, df, *, year=None, **_):
+        """Encode categorical columns as integer indices.
+
+        When ``self.vocab_years`` is set, new vocabulary entries are only
+        created for rows belonging to those years.  Categories that appear
+        exclusively in held-out years (val / test) are mapped to ``<UNK>``
+        (index 0), preventing data leakage through the embedding layer.
+        """
+        # Determine whether this DataFrame comes from a vocab-building year
+        allow_new_entries = (self.vocab_years is None) or (year in self.vocab_years)
+
         for col in self.CATEGORICAL_COLUMNS:
             vocab = self.categories[col]
 
@@ -238,7 +259,12 @@ class DataPreparation:
 
             for v in values:
                 if v not in vocab:
-                    vocab[v] = len(vocab)
+                    if allow_new_entries:
+                        vocab[v] = len(vocab)
+                    else:
+                        # Map unseen category to <UNK>
+                        encoded.append(vocab["<UNK>"])
+                        continue
                 encoded.append(vocab[v])
 
             df[col] = pd.Series(encoded, index=df.index).astype("Int64")
@@ -280,9 +306,17 @@ class DataPreparation:
     # ---------------------------------------------------------------------
 
     def prepare(self, skip_2018: bool = True):
-        for year in self.years:
-            if year == 2018 and skip_2018:
-                continue
+        # Process vocab years first so the vocabulary is fully built
+        # before encountering held-out years (which should use <UNK>).
+        if self.vocab_years is not None:
+            ordered = sorted(
+                [y for y in self.years if (y != 2018 or not skip_2018)],
+                key=lambda y: (y not in self.vocab_years, y),
+            )
+        else:
+            ordered = [y for y in self.years if (y != 2018 or not skip_2018)]
+
+        for year in ordered:
 
             self.logger.info(f"Preparing year {year}")
 
@@ -328,4 +362,7 @@ class DataPreparation:
                 json.dump(self.categories[k], f, indent=2, sort_keys=True)
 
 if __name__ == "__main__":
-    DataPreparation(DATA_PATH).prepare(skip_2018=False)
+    # Build vocabularies from training years only to prevent data leakage.
+    # Validation/test year categories unseen in training will map to <UNK>.
+    TRAIN_YEARS = [2019, 2020, 2021, 2022, 2023]
+    DataPreparation(DATA_PATH, vocab_years=TRAIN_YEARS).prepare(skip_2018=False)

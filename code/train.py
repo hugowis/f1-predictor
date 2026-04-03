@@ -248,6 +248,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
         normalizer=shared_normalizer,
+        require_normalizer=config.data.normalize,
     )
 
     test_ds = StintDataloader(
@@ -257,6 +258,7 @@ def create_dataloaders(config: Config, batch_size: int = 32):
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
         normalizer=shared_normalizer,
+        require_normalizer=config.data.normalize,
     )
     
     logger.info(f"Train set: {len(train_ds)} stints")
@@ -325,16 +327,8 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
         normalizer=shared_normalizer,
+        require_normalizer=config.data.normalize,
     )
-    
-    # DEBUG: Verify val dataset is using shared normalizer
-    if val_ds.normalizer is not None:
-        val_stats = val_ds.normalizer.get_statistics()
-        val_lap_idx = val_stats['columns'].index('LapTime')
-        logger.info(f"Val normalizer stats: mean={val_stats['mean'][val_lap_idx]:.2f}, std={val_stats['std'][val_lap_idx]:.2f}")
-        if shared_normalizer is not None:
-            is_same = (val_ds.normalizer is shared_normalizer)
-            logger.info(f"Val normalizer is same object as train normalizer: {is_same}")
 
     test_ds = AutoregressiveLapDataloader(
         year=config.training.test_years,
@@ -344,6 +338,7 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
         normalize=config.data.normalize,
         scaler_type=config.data.scaler_type,
         normalizer=shared_normalizer,
+        require_normalizer=config.data.normalize,
     )
 
     logger.info(f"Train set: {len(train_ds)} lap pairs")

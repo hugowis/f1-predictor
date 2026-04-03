@@ -133,7 +133,16 @@ class TrainingConfig:
         if self.test_years is None:
             self.test_years = [2025]
 
-        # Multi-task loss weights are explicit dataclass fields
+        # Validate no overlap between train/val/test splits
+        train_set = set(self.train_years)
+        val_set = set(self.val_years)
+        test_set = set(self.test_years)
+        if train_set & val_set:
+            raise ValueError(f"Train and val years overlap: {train_set & val_set}")
+        if train_set & test_set:
+            raise ValueError(f"Train and test years overlap: {train_set & test_set}")
+        if val_set & test_set:
+            raise ValueError(f"Val and test years overlap: {val_set & test_set}")
 
 
 @dataclass

@@ -336,11 +336,19 @@ class LapTimeNormalizer:
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
         
+        saved_years = data.get('years')
+        if saved_years is not None and years_list != saved_years:
+            raise ValueError(
+                f"Scaler provenance mismatch: requested years {years_list} "
+                f"but scaler at {filepath} was fit on {saved_years}. "
+                f"Pass the correct years or re-fit the scaler on training data only."
+            )
+
         self.scaler = data['scaler']
         self.columns = data['columns']
         self.years = data['years']
         self.scaler_type = data['scaler_type']
-        
+
         logger.info(f"Scaler loaded from {filepath}")
         return self
     

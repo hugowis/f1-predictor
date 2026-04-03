@@ -264,6 +264,92 @@ class Seq2Seq(BaseModel):
         for emb in self.embeddings.values():
             nn.init.normal_(emb.weight, mean=0.0, std=0.1)
 
+    def _decode_step(self, current_input, decoder_hidden):
+        """Run a single decoder step and project to output heads.
+
+        Returns (step_output, step_pit_logit, step_comp_logits, decoder_hidden).
+        """
+        decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
+        step_output = self.fc_decoder_output(decoder_output)
+        step_pit_logit = self.fc_pit(decoder_output)
+        step_comp_logits = self.fc_compound(decoder_output)
+        return step_output, step_pit_logit, step_comp_logits, decoder_hidden
+
+    def _apply_embeddings(self, encoder_input):
+        """Apply categorical embeddings and return a single tensor.
+
+        Handles three input formats:
+        1. Dict with 'numeric' and 'categorical' keys (AutoregressiveLapDataloader)
+        2. Raw tensor with total_dim == expected column count (old format)
+        3. Plain tensor (already processed) — returned as-is
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (batch, seq_len, processed_features)
+        """
+        target_device = self.device
+
+        # Format 1: structured dict from dataloader
+        if isinstance(encoder_input, dict) and 'numeric' in encoder_input and 'categorical' in encoder_input:
+            numeric = encoder_input['numeric']
+            categorical = encoder_input['categorical']
+
+            numeric_tensor = numeric if isinstance(numeric, torch.Tensor) else torch.from_numpy(numeric)
+            numeric_tensor = numeric_tensor.to(target_device)
+
+            cat_tensor = categorical if isinstance(categorical, torch.Tensor) else torch.from_numpy(categorical)
+            cat_tensor = cat_tensor.to(target_device)
+
+            cat_names = encoder_input.get('cat_names', [])
+            emb_list = []
+            if cat_tensor.numel() > 0:
+                for i in range(cat_tensor.shape[-1]):
+                    feat_name = cat_names[i] if i < len(cat_names) else None
+                    if feat_name and feat_name in self.embeddings:
+                        idxs = cat_tensor[:, :, i].long()
+                        emb_list.append(self.embeddings[feat_name](idxs))
+
+            if emb_list:
+                cat_emb = torch.cat(emb_list, dim=-1)
+            else:
+                cat_emb = torch.zeros(numeric_tensor.shape[0], numeric_tensor.shape[1], 0, device=target_device)
+
+            return torch.cat([numeric_tensor, cat_emb], dim=-1)
+
+        # Format 2: raw tensor with categorical indices at known positions
+        if isinstance(encoder_input, torch.Tensor) and self.embeddings and encoder_input.dim() == 3:
+            encoder_input = encoder_input.to(target_device)
+            total_dim = encoder_input.size(-1)
+            n_num = len(get_numeric_columns())
+            n_cat = len(get_categorical_columns())
+            n_bool = len(get_boolean_columns())
+            n_comp = len(get_compound_columns())
+            expected = n_num + n_cat + n_bool + n_comp
+            if total_dim == expected:
+                num_part = encoder_input[:, :, :n_num]
+                cat_part = encoder_input[:, :, n_num:n_num + n_cat].long()
+                bool_part = encoder_input[:, :, n_num + n_cat:n_num + n_cat + n_bool]
+                comp_part = encoder_input[:, :, n_num + n_cat + n_bool:]
+
+                emb_list = []
+                for i, feat_name in enumerate(get_categorical_columns()):
+                    if feat_name in self.embeddings:
+                        emb_list.append(self.embeddings[feat_name](cat_part[:, :, i]))
+
+                if emb_list:
+                    cat_emb = torch.cat(emb_list, dim=-1)
+                else:
+                    cat_emb = torch.zeros(num_part.shape[0], num_part.shape[1], 0, device=target_device)
+
+                return torch.cat([num_part, bool_part, comp_part, cat_emb], dim=-1)
+
+        # Format 3: already processed tensor
+        if isinstance(encoder_input, torch.Tensor):
+            return encoder_input.to(target_device)
+
+        return encoder_input
+
     def forward(
         self,
         encoder_input: torch.Tensor,
@@ -293,99 +379,8 @@ class Seq2Seq(BaseModel):
             Shape (batch_size, decoder_seq_len, output_size)
             Predicted lap times
         """
-        # If encoder_input is a structured dict from the dataloader, build the
-        # final tensor here by applying categorical embeddings and concatenating
-        # with numeric features. This centralizes embedding behavior in the model.
-        if isinstance(encoder_input, dict) and 'numeric' in encoder_input and 'categorical' in encoder_input:
-            numeric = encoder_input['numeric']
-            categorical = encoder_input['categorical']
-
-            if isinstance(numeric, torch.Tensor):
-                numeric_tensor = numeric
-            else:
-                numeric_tensor = torch.from_numpy(numeric)
-
-            # Ensure numeric on model device
-            try:
-                numeric_tensor = numeric_tensor.to(self.device)
-            except Exception:
-                pass
-
-            emb_list = []
-            if isinstance(categorical, torch.Tensor):
-                cat_tensor = categorical
-            else:
-                cat_tensor = torch.from_numpy(categorical)
-
-            # For each categorical feature, run through embedding if available
-            if cat_tensor.numel() > 0:
-                num_cat = cat_tensor.shape[-1]
-                for i in range(num_cat):
-                    feat_name = encoder_input.get('cat_names', [])[i] if i < len(encoder_input.get('cat_names', [])) else None
-                    idxs = cat_tensor[:, :, i].long()
-                    if feat_name and feat_name in self.embeddings:
-                        emb_layer = self.embeddings[feat_name]
-                        try:
-                            emb_device = next(emb_layer.parameters()).device
-                            idxs = idxs.to(emb_device)
-                        except Exception:
-                            emb_device = None
-                        emb_out = emb_layer(idxs)
-                        try:
-                            emb_out = emb_out.to(numeric_tensor.device)
-                        except Exception:
-                            pass
-                        emb_list.append(emb_out)
-
-            if emb_list:
-                cat_emb = torch.cat(emb_list, dim=-1)
-            else:
-                cat_emb = torch.zeros(numeric_tensor.shape[0], numeric_tensor.shape[1], 0, device=numeric_tensor.device)
-
-            # Final encoder input: numeric features + embeddings
-            encoder_input = torch.cat([numeric_tensor, cat_emb], dim=-1)
-
-        # If encoder_input is a raw tensor (old dataloader format) and includes
-        # categorical indices in fixed positions, extract them and apply
-        # embeddings here as well.
-        if isinstance(encoder_input, torch.Tensor) and self.embeddings and encoder_input.dim() == 3:
-            total_dim = encoder_input.size(-1)
-            # Assume dataloader order: numeric, categorical, boolean, compound
-            n_num = len(get_numeric_columns())
-            n_cat = len(get_categorical_columns())
-            n_bool = len(get_boolean_columns())
-            n_comp = len(get_compound_columns())
-            expected = n_num + n_cat + n_bool + n_comp
-            if total_dim == expected:
-                # Slice parts
-                num_part = encoder_input[:, :, 0:n_num]
-                cat_part = encoder_input[:, :, n_num:n_num + n_cat].long()
-                bool_part = encoder_input[:, :, n_num + n_cat:n_num + n_cat + n_bool]
-                comp_part = encoder_input[:, :, n_num + n_cat + n_bool:n_num + n_cat + n_bool + n_comp]
-
-                # Build embeddings
-                emb_list = []
-                for i, feat_name in enumerate(get_categorical_columns()):
-                    if feat_name in self.embeddings:
-                        emb_layer = self.embeddings[feat_name]
-                        try:
-                            idxs = cat_part[:, :, i].long().to(next(emb_layer.parameters()).device)
-                        except Exception:
-                            idxs = cat_part[:, :, i].long()
-                        emb_out = emb_layer(idxs)
-                        try:
-                            emb_out = emb_out.to(num_part.device)
-                        except Exception:
-                            pass
-                        emb_list.append(emb_out)
-
-                if emb_list:
-                    cat_emb = torch.cat(emb_list, dim=-1)
-                else:
-                    cat_emb = torch.zeros(num_part.shape[0], num_part.shape[1], 0, device=num_part.device)
-
-                # Final numeric input: numeric + boolean + compound + embeddings
-                encoder_input = torch.cat([num_part, bool_part, comp_part, cat_emb], dim=-1)
+        # Apply categorical embeddings and build final encoder tensor
+        encoder_input = self._apply_embeddings(encoder_input)
 
         batch_size = encoder_input.size(0)
         decoder_seq_len = decoder_input.size(1)
@@ -437,19 +432,7 @@ class Seq2Seq(BaseModel):
 
         for t in range(decoder_seq_len):
             # Decoder step: single time step
-            decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
-            # Ensure decoder_hidden is contiguous for next iteration (GPU requirement)
-            if isinstance(decoder_hidden, tuple):
-                h, c = decoder_hidden
-                decoder_hidden = (h.contiguous(), c.contiguous())
-            else:
-                decoder_hidden = decoder_hidden.contiguous()
-            # decoder_output: (batch, 1, hidden_size)
-
-            # Project hidden state to output
-            step_output = self.fc_decoder_output(decoder_output)  # (batch, 1, output_size)
-            step_pit_logit = self.fc_pit(decoder_output)  # (batch, 1, 1)
-            step_comp_logits = self.fc_compound(decoder_output)  # (batch, 1, C)
+            step_output, step_pit_logit, step_comp_logits, decoder_hidden = self._decode_step(current_input, decoder_hidden)
 
             outputs_lap.append(step_output)
             outputs_pit.append(step_pit_logit.squeeze(-1))
@@ -459,10 +442,8 @@ class Seq2Seq(BaseModel):
             use_teacher = teacher_forcing and (torch.rand(1).item() < teacher_forcing_ratio)
 
             if use_teacher and t < decoder_seq_len - 1:
-                # Use ground truth from decoder_input (lap time only)
                 current_input = decoder_input[:, t+1:t+2, :]
             else:
-                # Use model's prediction (autoregressive)
                 current_input = step_output
         
         # Concatenate all outputs
@@ -528,16 +509,7 @@ class Seq2Seq(BaseModel):
         current_input = decoder_input[:, 0:1, :]
 
         for _ in range(max_length):
-            decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
-            # Normalize hidden tensors if LSTM tuple
-            if isinstance(decoder_hidden, tuple):
-                h, c = decoder_hidden
-                decoder_hidden = (h.contiguous(), c.contiguous())
-            else:
-                decoder_hidden = decoder_hidden.contiguous()
-            step_output = self.fc_decoder_output(decoder_output)
-            step_pit_logit = self.fc_pit(decoder_output)
-            step_comp_logits = self.fc_compound(decoder_output)
+            step_output, step_pit_logit, step_comp_logits, decoder_hidden = self._decode_step(current_input, decoder_hidden)
 
             outputs_lap.append(step_output)
             outputs_pit.append(step_pit_logit.squeeze(-1))

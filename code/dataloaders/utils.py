@@ -323,9 +323,10 @@ def extract_lap_features_vectorized(
     if compound_columns is None:
         compound_columns = get_compound_columns()
 
-    return np.concatenate([
+    features = np.concatenate([
         laps[numeric_columns].values.astype(np.float32),
         laps[categorical_columns].values.astype(np.float32),
         laps[boolean_columns].values.astype(np.float32),
         laps[compound_columns].values.astype(np.float32),
     ], axis=1)
+    return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)

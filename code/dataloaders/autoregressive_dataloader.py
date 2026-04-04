@@ -370,11 +370,16 @@ class AutoregressiveLapDataloader(Dataset):
 
             for h in range(min(len(target_laps), H)):
                 t_lap = target_laps.iloc[h]
-                target_laptimes[h] = float(t_lap['LapTime'])
+                lap_time_val = float(t_lap['LapTime'])
+                if not np.isfinite(lap_time_val):
+                    target_laptimes[h] = 0.0
+                    target_mask[h] = 0.0
+                else:
+                    target_laptimes[h] = lap_time_val
+                    target_mask[h] = 1.0
                 target_pitflags[h] = int(t_lap.get('is_pitlap', 0))
                 comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
                 target_compounds[h] = int(np.argmax(comp_vals)) if comp_vals.sum() > 0 else len(self.compound_columns) - 1
-                target_mask[h] = 1.0
 
             self._precomputed_contexts[i] = torch.from_numpy(context_array)
             self._precomputed_targets[i] = {
@@ -681,14 +686,19 @@ class AutoregressiveLapDataloader(Dataset):
 
         for h in range(min(len(target_laps), H)):
             t_lap = target_laps.iloc[h]
-            target_laptimes[h] = float(t_lap['LapTime'])
+            lap_time_val = float(t_lap['LapTime'])
+            if not np.isfinite(lap_time_val):
+                target_laptimes[h] = 0.0
+                target_mask[h] = 0.0
+            else:
+                target_laptimes[h] = lap_time_val
+                target_mask[h] = 1.0
             target_pitflags[h] = int(t_lap.get('is_pitlap', 0))
             comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
             if comp_vals.sum() == 0:
                 target_compounds[h] = len(self.compound_columns) - 1
             else:
                 target_compounds[h] = int(np.argmax(comp_vals))
-            target_mask[h] = 1.0
 
         context_tensor = torch.from_numpy(context_array).to(self.device)
         target_tensor = {

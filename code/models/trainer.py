@@ -294,6 +294,16 @@ class Trainer:
                 lap_time_idx=0,
             )
 
+        # Sanitize inputs: replace any NaN/Inf with 0.0 before the forward pass
+        if isinstance(encoder_input, torch.Tensor):
+            encoder_input = torch.nan_to_num(encoder_input, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            encoder_input = {
+                k: torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) if isinstance(v, torch.Tensor) else v
+                for k, v in encoder_input.items()
+            }
+        decoder_input = torch.nan_to_num(decoder_input, nan=0.0, posinf=0.0, neginf=0.0)
+
         return encoder_input, decoder_input, targets
 
     def _compute_loss(self, outputs, targets):
@@ -538,18 +548,20 @@ class Trainer:
             # Compute loss
             result = self._compute_loss(outputs, targets)
             if result is None:
+                logger.debug(f"Epoch {epoch}, batch {batch_idx}: skipped (NaN model output or empty mask)")
                 skipped_batches += 1
                 continue
             loss_batch, lap_loss_value, pit_loss_value, comp_loss_value, pit_scale, comp_scale = result
 
             # Skip pathological batches
             if not torch.isfinite(loss_batch):
+                logger.debug(f"Epoch {epoch}, batch {batch_idx}: skipped (non-finite loss)")
                 self.optimizer.zero_grad(set_to_none=True)
                 skipped_batches += 1
                 continue
             loss_value = float(loss_batch.detach().item())
             if loss_value > 1e3:
-                logger.debug(f"Skipping pathological batch at epoch {epoch}, batch {batch_idx}: loss={loss_value:.6f}")
+                logger.debug(f"Epoch {epoch}, batch {batch_idx}: skipped (loss={loss_value:.1f} > 1e3)")
                 self.optimizer.zero_grad(set_to_none=True)
                 skipped_batches += 1
                 continue

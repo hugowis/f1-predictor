@@ -11,22 +11,34 @@ This file tracks the next experimentation steps ordered by priority. All experim
 
 ## High Priority
 
-### E1. Rollout Grid Search
+### E1. Rollout Grid Search — ✅ COMPLETED (negative result)
 
-Systematic grid over rollout-related hyperparameters to find the configuration that minimizes multi-step error accumulation.
+**Status**: Completed 2026-04-07. Multi-step training does NOT improve rollout under any configuration tested.
 
-Hypothesis:
-- The rollout evaluator shows systematic drift at h>10. A joint sweep of rollout training parameters (steps, weight, start epoch) may find a sweet spot that current single-axis experiments missed.
+**Experiment**: 24-combo grid (H ∈ {1,3,5,10} × curriculum ∈ {none,linear} × start_epoch ∈ {0,10,20}), 3 seeds each.
+- Results: `results/E1_rollout_grid/`
 
-Tasks:
-- [ ] Define grid: `rollout_steps` x `rollout_weight` x `rollout_start_epoch`
-- [ ] Run via `grid_search_experiment.py` with 3 seeds per combo
-- [ ] Evaluate on stint MAE, stability ratio, and next-lap MAE (must not regress)
-- [ ] Build on best config (scheduled sampling + tire degradation features)
+**Summary table** (sorted by stint MAE, mean over 3 seeds):
 
-Success criteria:
-- Stint total time MAE < 70,000ms
-- No regression on next-lap MAE (must stay < 40ms)
+| Config | Next-lap MAE | Stint MAE | Stability |
+|---|---|---|---|
+| **H=1 (any)** | **37.5ms** | **82,344ms** | **1.63** |
+| H=10 linear s=10 | 103ms | 100,502ms | 1.76 |
+| H=10 linear s=20 | 93ms | 103,562ms | 1.78 |
+| H=5 linear s=10-20 | 101ms | 116,460ms | 1.85 |
+| H=10 none (any) | 96ms | 116,518ms | 1.85 |
+| H=3 linear s=20 | 97ms | 116,920ms | 1.88 |
+| H=5 none (any) | 162ms | 158,995ms | 2.24 |
+| H=10 linear s=0 | 165ms | 171,788ms | 2.20 |
+
+**Key findings**:
+1. **H=1 wins on every single metric** — best stint MAE, best next-lap MAE, best stability ratio
+2. **If you must use multi-step**: linear curriculum + late start (s=10 or s=20) is always better than no curriculum; `start_epoch=0` is always the worst
+3. **H=10 linear s=10 is the best multi-step config** (100,502ms stint MAE) — but still 22% worse than H=1
+4. **`curriculum=none` with H>1 is always bad** — dilutes the next-step gradient from the start with no benefit
+5. Multi-step makes stability ratio *worse* (1.85-2.24) vs H=1 (1.63)
+
+**Conclusion**: Multi-step training is definitively not the path to better rollout. The drift is structural — the model lacks information about its position in a race/stint. The way forward is richer contextual features or architectural changes, not loss function modifications.
 
 ---
 

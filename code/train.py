@@ -610,18 +610,22 @@ def train(config: Config, output_dir: Path = None):
     # Create model
     model = create_model(config, device=config.device)
     
-    # Apply linear LR scaling when batch size differs from reference
+    # Apply sqrt LR scaling when batch size differs from reference
+    # (sqrt scaling is more stable for RNNs than linear scaling)
     if config.training.lr_scale_with_batch:
         ref_bs = config.training.lr_scale_reference_batch
         actual_bs = config.training.batch_size
         if actual_bs != ref_bs:
-            scale = actual_bs / ref_bs
+            scale = (actual_bs / ref_bs) ** 0.5
             old_lr = config.training.learning_rate
             config.training.learning_rate = old_lr * scale
-            config.training.warm_up_epochs = max(1, int(config.training.warm_up_epochs / scale))
+            # Scale warmup UP for larger batches (larger LR needs more warmup)
+            base_warmup = config.training.warm_up_epochs
+            config.training.warm_up_epochs = max(base_warmup, int(base_warmup * scale))
             logger.info(
-                f"Linear LR scaling: {old_lr:.2e} * {scale:.2f} = {config.training.learning_rate:.2e} "
-                f"(batch_size={actual_bs}, ref={ref_bs})"
+                f"Sqrt LR scaling: {old_lr:.2e} * {scale:.2f} = {config.training.learning_rate:.2e} "
+                f"(batch_size={actual_bs}, ref={ref_bs}), "
+                f"warmup={config.training.warm_up_epochs} epochs"
             )
 
     # Create optimizer

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 import json
@@ -1069,7 +1069,12 @@ def create_scheduler(optimizer: Optimizer, config: Dict[str, Any]) -> Optional[A
 
     if scheduler_type == 'cosine':
         total_epochs = config.get('total_epochs', 100)
-        return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+        warm_up = config.get('warm_up_epochs', 5)
+        cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_epochs - warm_up), eta_min=1e-6)
+        if warm_up > 0:
+            warmup_sched = LinearLR(optimizer, start_factor=1e-3, total_iters=warm_up)
+            return SequentialLR(optimizer, schedulers=[warmup_sched, cosine], milestones=[warm_up])
+        return cosine
     
     elif scheduler_type == 'linear':
         total_epochs = config.get('total_epochs', 100)

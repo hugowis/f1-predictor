@@ -624,19 +624,19 @@ class AutoregressiveLapDataloader(Dataset):
         """
         # Fast path: if this index was precomputed, return cached tensors
         if idx < len(self._precomputed_contexts) and self._precomputed_contexts[idx] is not None:
-            context_tensor = self._precomputed_contexts[idx].clone()
-            target_tensor = {
-                k: (v.clone() if isinstance(v, torch.Tensor) else v)
-                for k, v in self._precomputed_targets[idx].items()
-            }
-
             if self.augment_prob > 0.0 and np.random.random() < self.augment_prob:
+                # Clone before mutating for augmentation
+                context_tensor = self._precomputed_contexts[idx].clone()
+                target_tensor = {
+                    k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                    for k, v in self._precomputed_targets[idx].items()
+                }
                 context_tensor, target_tensor = self._apply_cached_tensor_augmentation(context_tensor, target_tensor)
+            else:
+                # No augmentation (val/test) — return cached tensors directly
+                context_tensor = self._precomputed_contexts[idx]
+                target_tensor = self._precomputed_targets[idx]
 
-            context_tensor = context_tensor.to(self.device)
-            for k, v in list(target_tensor.items()):
-                if isinstance(v, torch.Tensor):
-                    target_tensor[k] = v.to(self.device)
             metadata = self._precomputed_meta[idx]
             return context_tensor, target_tensor, metadata
 
@@ -700,12 +700,12 @@ class AutoregressiveLapDataloader(Dataset):
             else:
                 target_compounds[h] = int(np.argmax(comp_vals))
 
-        context_tensor = torch.from_numpy(context_array).to(self.device)
+        context_tensor = torch.from_numpy(context_array)
         target_tensor = {
-            'lap_time': target_laptimes.to(self.device),
-            'is_pitlap': target_pitflags.to(self.device),
-            'compound': target_compounds.to(self.device),
-            'target_mask': target_mask.to(self.device),
+            'lap_time': target_laptimes,
+            'is_pitlap': target_pitflags,
+            'compound': target_compounds,
+            'target_mask': target_mask,
         }
 
         metadata = {

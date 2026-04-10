@@ -437,8 +437,8 @@ class StintDataloader(Dataset):
         target_laptime = float(target_lap['LapTime'])
 
         # Convert to tensors
-        features_tensor = torch.from_numpy(features).to(self.device)
-        target_tensor = torch.tensor(target_laptime, dtype=torch.float32, device=self.device)
+        features_tensor = torch.from_numpy(features)
+        target_tensor = torch.tensor(target_laptime, dtype=torch.float32)
 
         metadata = {
             'driver': stint['driver'],

@@ -79,6 +79,10 @@ class TrainingConfig:
     gradient_clip: Optional[float] = 1.0
     accumulation_steps: int = 1
     use_mixed_precision: bool = True  # Enable FP16 training on CUDA
+
+    # Linear LR scaling with batch size
+    lr_scale_with_batch: bool = True
+    lr_scale_reference_batch: int = 32
     
     # Learning rate scheduling
     scheduler_type: str = "cosine"  # "cosine_with_warmup", "cosine", "linear"
@@ -105,7 +109,7 @@ class TrainingConfig:
     scheduled_sampling_noise_std: float = 0.02    # Noise std in normalized space (~0.02 ~ 300ms)
     
     # Early stopping
-    early_stopping_patience: int = 30
+    early_stopping_patience: int = 20
     early_stopping_min_epochs: int = 0  # Grace period: don't start patience counter before this epoch
     validation_freq: int = 1  # Validate every N epochs
     early_stopping_use_ema: bool = False
@@ -153,10 +157,23 @@ class DataConfig:
     augment_prob: float = 0.3
     normalize: bool = True
     scaler_type: str = "standard"
-    num_workers: int = 0
+    num_workers: int = -1  # -1 = auto-detect
     shuffle_train: bool = True
     shuffle_val: bool = False
     shuffle_test: bool = False
+
+    def __post_init__(self):
+        if self.num_workers == -1:
+            import os
+            import sys
+            if sys.platform == 'win32':
+                # Windows uses spawn (not fork): each worker pickles the entire
+                # dataset including precomputed tensors, which is very slow for
+                # large in-memory caches.  Keep 0 (main-thread) by default.
+                self.num_workers = 0
+            else:
+                cpu_count = os.cpu_count() or 1
+                self.num_workers = min(cpu_count, 8)
 
 
 @dataclass

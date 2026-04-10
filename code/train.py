@@ -186,6 +186,10 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
             raise ValueError("--validation-freq must be >= 1")
         config.training.validation_freq = args.validation_freq
 
+    # LR scaling override
+    if getattr(args, 'no_lr_scaling', False):
+        config.training.lr_scale_with_batch = False
+
 
 def _run_post_training_steps(config: Config, output_dir: Path):
     """Run evaluation and analysis after training finishes."""
@@ -606,6 +610,20 @@ def train(config: Config, output_dir: Path = None):
     # Create model
     model = create_model(config, device=config.device)
     
+    # Apply linear LR scaling when batch size differs from reference
+    if config.training.lr_scale_with_batch:
+        ref_bs = config.training.lr_scale_reference_batch
+        actual_bs = config.training.batch_size
+        if actual_bs != ref_bs:
+            scale = actual_bs / ref_bs
+            old_lr = config.training.learning_rate
+            config.training.learning_rate = old_lr * scale
+            config.training.warm_up_epochs = max(1, int(config.training.warm_up_epochs / scale))
+            logger.info(
+                f"Linear LR scaling: {old_lr:.2e} * {scale:.2f} = {config.training.learning_rate:.2e} "
+                f"(batch_size={actual_bs}, ref={ref_bs})"
+            )
+
     # Create optimizer
     optimizer = Adam(
         model.parameters(),
@@ -718,6 +736,7 @@ def main():
     parser.add_argument('--ss-end-epoch', type=int, help='Epoch to reach max noise (default: num_epochs)')
     parser.add_argument('--num-workers', type=int, help='Number of data loading workers (overrides config)')
     parser.add_argument('--validation-freq', type=int, help='Validate every N epochs (default: 1)')
+    parser.add_argument('--no-lr-scaling', action='store_true', help='Disable automatic linear LR scaling with batch size')
 
     args = parser.parse_args()
     

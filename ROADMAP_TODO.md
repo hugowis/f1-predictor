@@ -42,24 +42,42 @@ This file tracks the next experimentation steps ordered by priority. All experim
 
 ---
 
-### E2. Scheduled Sampling Hyperparameter Sweep
+### E2. Scheduled Sampling Hyperparameter Sweep — ✅ COMPLETED (flat landscape)
 
-P0.2 validated the approach with a single config (p=0.5, std=0.02, start=10). A proper sweep may find a significantly better operating point.
+**Status**: Completed 2026-04-13. Scheduled sampling consistently beats E1 baseline but hyperparameter choice is irrelevant — all 36 configs converge to the same performance.
 
-Hypothesis:
-- Higher noise or earlier start could further reduce exposure bias.
-- Lower noise might preserve next-lap accuracy while still helping rollout.
+**Experiment**: 36-combo grid (`ss_max_prob` ∈ {0.3, 0.5, 0.7, 1.0} × `ss_noise_std` ∈ {0.01, 0.02, 0.05} × `ss_start_epoch` ∈ {5, 10, 20}), 3 seeds each.
+- Results: `results/E2_scheduled_sampling_sweep/`
 
-Tasks:
-- [ ] Grid search `ss-max-prob` in {0.3, 0.5, 0.7, 1.0}
-- [ ] Grid search `ss-noise-std` in {0.01, 0.02, 0.05}
-- [ ] Grid search `ss-start-epoch` in {5, 10, 20}
-- [ ] Run via `grid_search_experiment.py`, 3 seeds per combo
-- [ ] Analyze interaction between noise intensity and rollout stability
+**Summary table** (sorted by stint MAE, mean over 3 seeds):
 
-Success criteria:
-- Find config with stint MAE < 73,000ms
-- All 3 seeds converge (no catastrophic failures)
+| Config | Next-lap MAE | Stint MAE | Stability |
+|---|---|---|---|
+| **prob=1.0, noise=0.01, start=20** | **33.5ms** | **79,163ms** | **1.599** |
+| prob=1.0, noise=0.02, start=20 | 33.6ms | 79,170ms | 1.601 |
+| prob=1.0, noise=0.01, start=5 | 33.7ms | 79,197ms | 1.599 |
+| prob=0.5, noise=0.01, start=20 | 33.5ms | 79,215ms | 1.600 |
+| prob=0.5, noise=0.02, start=20 | 33.5ms | 79,226ms | 1.599 |
+| ... (all 36 configs within 320ms spread) | 33.4–33.8ms | 79,163–79,482ms | 1.599–1.604 |
+| **E1 baseline (H=1, reference)** | 37.5ms | 82,344ms | 1.63 |
+
+**Marginal effects** (each dim averaged over all others):
+
+| Dimension | Best → Worst | Range |
+|---|---|---|
+| `ss_max_prob`: 1.0 → 0.3 | 79,258ms → 79,333ms | 75ms |
+| `ss_noise_std`: 0.01 ≈ 0.02 → 0.05 | 79,294ms → 79,300ms | 6ms |
+| `ss_start_epoch`: 20 → 10 | 79,278ms → 79,318ms | 40ms |
+
+**Key findings**:
+1. **All hyperparameters are essentially irrelevant** — the entire 36-combo landscape spans only ~320ms of stint MAE. Any config in the tested range will work equally well.
+2. **Scheduled sampling consistently beats E1 H=1 baseline** — improvement of ~3,180ms (~3.9%) on stint MAE and ~4ms on next-lap MAE across all configs.
+3. **Stability improved slightly** — stability ratio ~1.60 vs 1.63 for E1 H=1, but negligible.
+4. **Success criterion NOT met** — best stint MAE is 79,163ms vs the target of <73,000ms.
+5. **Noise level (ss_noise_std) has zero measurable effect** — 0.01, 0.02, and 0.05 all give identical marginal stint MAE (~79,294–79,300ms).
+6. **Later start (start=20) is marginally better**, consistent with E1 finding that delayed curriculum helps.
+
+**Conclusion**: Scheduled sampling is a confirmed, stable improvement over the E1 H=1 baseline, but the gain is modest (~3.9%). The hyperparameter landscape is flat — the method works but is not sensitive to configuration. The recommended default is any moderate setting (e.g., prob=0.5, noise=0.02, start=10 or prob=1.0, noise=0.01, start=20). The path to sub-73,000ms stint MAE requires structural changes (richer context features, architecture improvements) rather than further scheduled sampling tuning.
 
 ---
 
@@ -68,18 +86,55 @@ Success criteria:
 Teacher forcing decay controls how quickly the model transitions from seeing ground-truth to its own predictions during decoder training.
 
 Hypothesis:
-- Current exponential decay to 0.3 may not be optimal. A hold-then-decay schedule could let the model learn basics before exposure to autoregressive noise.
+- Current linear decay to 0.5 may not be optimal. A hold-then-decay schedule could let the model learn basics before exposure to autoregressive noise.
+- The interaction with scheduled sampling (both active vs only one) may matter.
+
+Note: `hold_then_decay` is the only decay type where `--teacher-forcing-hold-epochs` has any effect. Running a full Cartesian product with all hold_epoch values would generate redundant combos for other decay types. Two-phase approach used instead.
+
+**Phase 1** — Find best decay type and end value (32 combos):
+
+```bash
+python code/grid_search_experiment.py \
+  --search-root results/E3_teacher_forcing_sweep \
+  --grid teacher-forcing-decay=linear,exponential,hold_then_decay,constant \
+  --grid teacher-forcing-end=0.0,0.1,0.3,0.5 \
+  --grid scheduled-sampling=true,false \
+  --autoregressive \
+  --seeds 111 222 333 \
+  --device cuda \
+  --batch-size 128
+```
+
+> 4 decay × 4 end × 2 ss = **32 combos × 3 seeds = 96 runs**
+
+**Phase 2** — Only if `hold_then_decay` wins phase 1, sweep hold epochs (8 combos):
+
+```bash
+python code/grid_search_experiment.py \
+  --search-root results/E3_hold_then_decay_sweep \
+  --grid teacher-forcing-hold-epochs=0,10,20,30 \
+  --grid teacher-forcing-end=<best_end_from_phase1> \
+  --grid scheduled-sampling=true,false \
+  --teacher-forcing-decay hold_then_decay \
+  --autoregressive \
+  --seeds 111 222 333 \
+  --device cuda \
+  --batch-size 128
+```
+
+> 4 hold_epochs × 1 end × 2 ss = **8 combos × 3 seeds = 24 runs**
+
+Epoch variation ({100, 150, 200}) is skipped for now — E2 showed the landscape is flat and tripling compute for marginal insight is not worthwhile. Revisit if a strong decay type is found but appears to need more training time.
 
 Tasks:
-- [ ] Grid search `teacher-forcing-decay` in {linear, exponential, hold_then_decay, constant}
-- [ ] Grid search `teacher-forcing-end` in {0.0, 0.1, 0.3, 0.5}
-- [ ] Grid search `teacher-forcing-hold-epochs` in {0, 10, 20, 30} (for hold_then_decay)
-- [ ] Test interaction with scheduled sampling (on vs off)
-- [ ] Test with different epoch counts {100, 150, 200}
+- [ ] Run Phase 1 (32 combos)
+- [ ] Identify best decay type and end value
+- [ ] Run Phase 2 if `hold_then_decay` wins (8 combos)
+- [ ] Analyze interaction between scheduled sampling on/off and decay type
 
 Success criteria:
-- Lower rollout error accumulation on long stints
-- Identify best TF schedule to combine with scheduled sampling
+- Find a TF schedule that reduces stint MAE below 79,163ms (E2 best)
+- Identify best TF schedule to combine with scheduled sampling as new default
 
 ---
 

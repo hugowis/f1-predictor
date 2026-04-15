@@ -460,8 +460,10 @@ def teacher_forcing_schedule(epoch: int, config: Config) -> float:
     eff_epoch = epoch - hold_epochs
     eff_total = max(1, total_epochs - hold_epochs)
 
-    if decay_type == "linear":
-        # Linear decay from start to end over effective total
+    if decay_type in ("linear", "hold_then_decay"):
+        # Linear decay from start to end over effective total.
+        # For hold_then_decay the hold period is already consumed above;
+        # what remains is a standard linear decay from start to end.
         ratio = start - (start - end) * (eff_epoch / eff_total)
     elif decay_type == "exponential":
         # Exponential decay over effective total.

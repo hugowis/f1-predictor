@@ -31,6 +31,7 @@ def evaluate_autoregressive_rollout(
     test_dataset,
     device: str = 'cpu',
     max_horizon: int = 50,
+    return_sequences: bool = False,
 ) -> Dict:
     """
     Evaluate model via full autoregressive rollout over driver-race sequences.
@@ -53,11 +54,18 @@ def evaluate_autoregressive_rollout(
         Torch device.
     max_horizon : int
         Maximum number of autoregressive steps per sequence.
+    return_sequences : bool
+        If True, return a tuple ``(metrics, sequence_rollouts)`` where
+        ``sequence_rollouts`` is the list of per-sequence dicts augmented with
+        ``predicted_laps_norm`` and ``actual_laps_norm`` arrays (normalized
+        space) and ``context_actual_norm`` (the seed context laps).
+        If False (default), return only the metrics dict.
 
     Returns
     -------
-    dict
-        Dictionary with rollout metrics (see ``_compute_rollout_metrics``).
+    dict or tuple
+        Metrics dict, or ``(metrics, sequence_rollouts)`` when
+        ``return_sequences=True``.
     """
     model.eval()
     context_window = test_dataset.context_window
@@ -121,6 +129,8 @@ def evaluate_autoregressive_rollout(
 
             errors = []        # |pred - target| per step
             signed_errors = [] # pred - target per step
+            predicted_laps_norm = []  # predicted lap times (normalized)
+            actual_laps_norm = []     # ground-truth lap times (normalized)
 
             for h in range(num_predictions):
                 target_idx = context_window + h
@@ -148,6 +158,8 @@ def evaluate_autoregressive_rollout(
 
                 errors.append(abs(pred_laptime - target_laptime))
                 signed_errors.append(pred_laptime - target_laptime)
+                predicted_laps_norm.append(pred_laptime)
+                actual_laps_norm.append(target_laptime)
 
                 # Shift context window: use ground-truth features for the new
                 # row but override LapTime with the model's prediction.  This
@@ -176,13 +188,19 @@ def evaluate_autoregressive_rollout(
 
             # Only include sequences that produced at least one valid step
             if errors:
-                sequence_rollouts.append({
+                entry = {
                     'driver': int(driver),
                     'year': int(year),
                     'circuit': int(circuit),
                     'errors': errors,
                     'signed_errors': signed_errors,
-                })
+                }
+                if return_sequences:
+                    entry['predicted_laps_norm'] = predicted_laps_norm
+                    entry['actual_laps_norm'] = actual_laps_norm
+                    # Context window lap times (ground-truth seed, normalized)
+                    entry['context_actual_norm'] = all_laptimes[:context_window].tolist()
+                sequence_rollouts.append(entry)
 
     total_groups = len(grouped)
     logger.info(
@@ -191,6 +209,8 @@ def evaluate_autoregressive_rollout(
     )
 
     metrics = _compute_rollout_metrics(sequence_rollouts)
+    if return_sequences:
+        return metrics, sequence_rollouts
     return metrics
 
 

@@ -27,35 +27,16 @@ Given race data up to lap `t` for a driver, predict future lap time(s), while us
 
 ## Latest Results
 
-Results are read from tracked experiment outputs in `results/*/evaluation/evaluation_results.json`.
-
-### Best Run (current best in repository)
-
- - Run: `results/step2_compound_0.01/`
- - Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.001`
+**Current best model**: Seq2Seq GRU (256 hidden, 3 layers, 35 features) with scheduled sampling — `E2_scheduled_sampling_sweep`.
 
 | Metric | Value |
 |---|---:|
-| MAE (ms) | 23.05 |
-| RMSE (ms) | 40.97 |
-| Median AE (ms) | 15.68 |
-| MAPE (%) | 0.0256 |
-| Mean Bias (ms) | 3.20 |
-| Errors < 50 ms (%) | 90.65 |
+| Next-lap MAE (ms) | ~33.5 |
+| Stint rollout MAE (s) | ~79 |
+| Stability ratio | ~1.60 |
 
-### Latest Run
-
-- Run: `results/step6b_150ep_aug0.20/`
-- Config family: Phase 2 autoregressive, `compound_loss_weight=0.01`, `pit_loss_weight=0.001`
-
-| Metric | Value |
-|---|---:|
-| MAE (ms) | 29.43 |
-| RMSE (ms) | 59.20 |
-| Median AE (ms) | 16.61 |
-| MAPE (%) | 0.0315 |
-| Mean Bias (ms) | 12.91 |
-| Errors < 50 ms (%) | 88.43 |
+Results are read from tracked experiment outputs in `results/*/evaluation/evaluation_results.json`.  
+Full experiment history and next steps: see `ROADMAP_TODO.md`.
 
 
 
@@ -63,9 +44,11 @@ Results are read from tracked experiment outputs in `results/*/evaluation/evalua
 
 ```text
 code/
-  train.py
-  evaluate.py
-  analyze_results.py
+  train.py                  # Main training script
+  evaluate.py               # Evaluation & rollout inference
+  analyze_results.py        # Post-run plots and reports
+  grid_search_experiment.py # Cartesian-product hyperparameter sweep
+  launch_seed_experiments.py# Multi-seed launcher
   config/
   data/
   dataloaders/
@@ -77,6 +60,16 @@ data/
   vocabs/
 results/
   <experiment_name>/
+web/                        # Streamlit dashboard (E11)
+  app.py
+  pages/
+    1_Experiments.py
+    2_Model_Performance.py
+    3_Race_Visualization.py
+  utils/
+    data_loader.py
+    inference.py
+    charts.py
 ```
 
 ## Installation
@@ -286,6 +279,22 @@ Each run folder in `results/<run_name>/` can include:
 - `evaluation/evaluation_report.txt`
 - analysis figures (`loss_curves.png`, `error_breakdown.png`, etc.)
 
+## Web Dashboard
+
+A Streamlit dashboard ships in `web/` for interactive experiment exploration.
+
+```bash
+streamlit run web/app.py
+```
+
+| Page | Description |
+|------|-------------|
+| **1 · Experiments** | Sortable leaderboard comparing all runs in `results/` by MAE, Stint MAE, Stability |
+| **2 · Model Performance** | Training curves, error breakdown, per-driver / circuit / team / compound bars, rollout horizon chart |
+| **3 · Race Visualization** | On-demand rollout inference — select a circuit + driver and see predicted vs actual lap times step by step |
+
+Inference on page 3 loads a trained checkpoint at runtime and caches the result; switching seeds or experiments re-runs automatically.
+
 ## Development Status
 
 ### Completed
@@ -293,6 +302,8 @@ Each run folder in `results/<run_name>/` can include:
 - Phase 1 stint-based modeling and evaluation.
 - Phase 2 autoregressive setup with auxiliary heads.
 - Per-run reporting and grouped error analysis.
+- Hyperparameter grid search (E1 rollout, E2 scheduled sampling).
+- Streamlit web dashboard (E11).
 
 ### Next
 

@@ -6,3 +6,5 @@ torch>=2.0
 numpy
 matplotlib
 seaborn
+streamlit>=1.35.0
+plotly>=5.20.0

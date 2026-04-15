@@ -45,7 +45,7 @@ def plot_experiments_bar(
     fig = go.Figure(
         go.Bar(
             x=df[metric],
-            y=df["name"],
+            y=df["Name"] if "Name" in df.columns else df["name"],
             orientation="h",
             marker_color=_RED,
             text=df[metric].round(1),
@@ -170,13 +170,12 @@ def plot_error_breakdown(error_dict: dict) -> go.Figure:
         )
 
     fig.update_layout(
-        **_LAYOUT_DEFAULTS,
+        **{**_LAYOUT_DEFAULTS, "margin": dict(l=50, r=20, t=40, b=80)},
         barmode="stack",
         title="Error distribution",
         xaxis_title="% of predictions",
         height=160,
         legend=dict(orientation="h", y=-0.4),
-        margin=dict(l=50, r=20, t=40, b=80),
     )
     return fig
 

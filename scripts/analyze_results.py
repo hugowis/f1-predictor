@@ -1,20 +1,24 @@
 """
 Post-training analysis and visualization: combines evaluation results,
 loss/history plotting, and an error analysis report. This script reads
-the outputs produced by `code/evaluate.py` and `code/train.py` and
+the outputs produced by `scripts/evaluate.py` and `scripts/train.py` and
 writes human-readable reports and figures into `results/phase1/`.
 """
 
 import argparse
 import json
+import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
+
+# Add f1predictor library to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "f1predictor"))
 # Use a non-interactive backend for headless environments (no $DISPLAY)
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
 
 sns.set_style("whitegrid")
 
@@ -45,7 +49,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
         with open(eval_dir / "evaluation_results.json") as f:
             eval_results = json.load(f)
     else:
-        print(f"Warning: evaluation_results.json not found in {eval_dir}. Run code/evaluate.py first.")
+        print(f"Warning: evaluation_results.json not found in {eval_dir}. Run scripts/evaluate.py first.")
 
     metrics_denorm = eval_results.get('metrics_denormalized_ms', {})
     error_breakdown = eval_results.get('error_breakdown', {})

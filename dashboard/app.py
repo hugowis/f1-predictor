@@ -2,7 +2,7 @@
 F1 Predictor — Streamlit Dashboard
 
 Entry point.  Launch with:
-    streamlit run web/app.py
+    streamlit run dashboard/app.py
 
 from the repo root (f1-predictor/).
 """
@@ -15,7 +15,7 @@ from pathlib import Path
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Ensure the repo root is on sys.path so that web.utils imports work
+# Ensure the repo root is on sys.path so that dashboard.utils imports work
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -99,6 +99,6 @@ results_path = Path(st.session_state.results_root)
 if not results_path.exists():
     st.warning(f"Results directory not found: `{results_path}`.  Update the path in the sidebar.")
 else:
-    from web.utils.data_loader import scan_experiments
+    from dashboard.utils.data_loader import scan_experiments
     exps = scan_experiments(results_path)
     st.success(f"Found **{len(exps)}** experiment(s) in `{results_path}`.")

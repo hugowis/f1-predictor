@@ -63,7 +63,7 @@ class LapTimeNormalizer:
     scaler_type : str, optional
         Type of scaler: "standard", "minmax", or "robust". Default is "standard".
     scaler_dir : Path, optional
-        Directory to save/load fitted scalers. Default is ./code/dataloaders/scalers/
+        Directory to save/load fitted scalers. Default is ./f1predictor/dataloaders/scalers/
     columns : list of str, optional
         Specific columns to normalize. If None, uses default numeric columns.
     

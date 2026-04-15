@@ -12,8 +12,8 @@ import pandas as pd
 import torch
 import pytest
 
-# Ensure project root is on the path so imports work
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Ensure f1predictor library is on the path so imports work
+PROJECT_ROOT = Path(__file__).resolve().parent.parent / "f1predictor"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

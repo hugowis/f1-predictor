@@ -20,7 +20,7 @@ _REPO_ROOT = Path(__file__).parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from web.utils.data_loader import (
+from dashboard.utils.data_loader import (
     scan_experiments,
     get_seed_dirs,
     get_seed_labels,
@@ -29,7 +29,7 @@ from web.utils.data_loader import (
     load_rollout_metrics,
     load_entity_csvs,
 )
-from web.utils.charts import (
+from dashboard.utils.charts import (
     plot_training_curves,
     plot_loss_components,
     plot_error_breakdown,

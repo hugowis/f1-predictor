@@ -1,6 +1,6 @@
 """Launch repeated training runs across multiple random seeds.
 
-This script wraps ``code/train.py`` so each seed runs in its own process,
+This script wraps ``scripts/train.py`` so each seed runs in its own process,
 which allows either sequential or parallel execution while keeping the
 existing training, evaluation, and analysis pipeline unchanged.
 """

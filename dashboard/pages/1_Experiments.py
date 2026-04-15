@@ -18,8 +18,8 @@ _REPO_ROOT = Path(__file__).parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from web.utils.data_loader import scan_experiments, load_leaderboard, get_seed_dirs
-from web.utils.charts import plot_experiments_bar
+from dashboard.utils.data_loader import scan_experiments, load_leaderboard, get_seed_dirs
+from dashboard.utils.charts import plot_experiments_bar
 
 st.set_page_config(page_title="Experiments · F1 Predictor", layout="wide")
 st.title("Experiments Leaderboard")

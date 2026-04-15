@@ -22,13 +22,13 @@ _REPO_ROOT = Path(__file__).parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from web.utils.data_loader import scan_experiments, get_seed_dirs, get_seed_labels
-from web.utils.inference import (
+from dashboard.utils.data_loader import scan_experiments, get_seed_dirs, get_seed_labels
+from dashboard.utils.inference import (
     run_rollout_sequences,
     resolve_checkpoint_and_config,
     get_test_years_from_config,
 )
-from web.utils.charts import plot_race_rollout
+from dashboard.utils.charts import plot_race_rollout
 
 st.set_page_config(page_title="Race Visualization · F1 Predictor", layout="wide")
 st.title("Race Visualization")

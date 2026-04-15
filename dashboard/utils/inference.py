@@ -17,11 +17,12 @@ import numpy as np
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Make sure the project's code/ directory is importable
+# Make sure the f1predictor library and scripts are importable
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).parent.parent.parent  # f1-predictor/
-_CODE_DIR = _REPO_ROOT / "code"
-for _p in (str(_CODE_DIR), str(_REPO_ROOT)):
+_CODE_DIR = _REPO_ROOT / "f1predictor"
+_SCRIPTS_DIR = _REPO_ROOT / "scripts"
+for _p in (str(_CODE_DIR), str(_SCRIPTS_DIR), str(_REPO_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -101,7 +102,7 @@ def run_rollout_sequences(
         evaluate_autoregressive_rollout,
         denormalize_rollout_metrics,
     )
-    from web.utils.data_loader import load_vocabs
+    from dashboard.utils.data_loader import load_vocabs
 
     model, normalizer, config = load_model_and_normalizer(
         checkpoint_path, config_path, device

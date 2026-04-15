@@ -1,5 +1,5 @@
 """
-Tests for the Trainer class (code/models/trainer.py).
+Tests for the Trainer class (f1predictor/models/trainer.py).
 
 Covers batch unpacking, single-batch training, validation metrics,
 and gradient accumulation.

@@ -1,6 +1,6 @@
 """Run grid searches over any option accepted by launch_seed_experiments.py.
 
-This script orchestrates repeated invocations of ``code/launch_seed_experiments.py``.
+This script orchestrates repeated invocations of ``scripts/launch_seed_experiments.py``.
 Each hyperparameter combination gets its own output directory containing the
 launcher's normal multi-seed artifacts. The grid search then writes a master
 manifest plus aggregated CSV/JSON summaries at the search root.
@@ -9,7 +9,7 @@ Examples
 --------
 Teacher forcing schedule sweep:
 
-    python code/grid_search_experiments.py \
+    python scripts/grid_search_experiment.py \
       --search-root results/tf_schedule_grid \
       --grid teacher-forcing-decay=linear,exponential \
       --grid teacher-forcing-hold-epochs=0,10,20,30 \
@@ -22,7 +22,7 @@ Teacher forcing schedule sweep:
 
 Grid over list-valued launcher arguments:
 
-    python code/grid_search_experiments.py \
+    python scripts/grid_search_experiment.py \
       --grid seeds=42|123|789,101|202|303 \
       --grid batch-size=64,128 \
       --phase 2

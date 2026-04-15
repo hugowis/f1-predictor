@@ -1,5 +1,5 @@
 """
-Tests for the Seq2Seq model (code/models/seq2seq.py).
+Tests for the Seq2Seq model (f1predictor/models/seq2seq.py).
 
 Covers forward pass shapes, embedding application, teacher forcing,
 and decode() consistency.

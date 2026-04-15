@@ -1,5 +1,5 @@
 """
-Tests for dataloaders and data pipeline (code/dataloaders/).
+Tests for dataloaders and data pipeline (f1predictor/dataloaders/).
 
 Covers feature extraction consistency, normalizer round-trips,
 column definitions, and augmentation shape preservation.

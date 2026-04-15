@@ -2,8 +2,8 @@
 Training script for F1 lap time prediction models.
 
 Usage:
-    python code/train.py --config config/phase1.json --device cuda
-    python code/train.py --phase 1  # Use preset Phase 1 config
+    python scripts/train.py --config config/phase1.json --device cuda
+    python scripts/train.py --phase 1  # Use preset Phase 1 config
 """
 
 import argparse
@@ -18,8 +18,8 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from analyze_results import analyze_results as run_analysis
 
-# Add current directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add f1predictor library to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "f1predictor"))
 
 from dataloaders import StintDataloader
 from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader

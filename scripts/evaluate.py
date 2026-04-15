@@ -2,8 +2,8 @@
 Evaluation script for F1 lap time prediction models.
 
 Usage:
-    python code/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --test-years 2022
-    python code/evaluate.py --checkpoint model.pt --config config.json
+    python scripts/evaluate.py --checkpoint results/phase1/checkpoints/best_model.pt --test-years 2022
+    python scripts/evaluate.py --checkpoint model.pt --config config.json
 """
 
 import argparse
@@ -17,8 +17,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
-# Add current directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add f1predictor library to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "f1predictor"))
 
 from dataloaders import StintDataloader, LapTimeNormalizer
 from dataloaders.utils import load_all_races

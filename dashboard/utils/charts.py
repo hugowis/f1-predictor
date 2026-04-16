@@ -22,12 +22,13 @@ _ORANGE = "#FF8000"
 _BG = "#1a1a2e"
 _GRID = "#2a2a3e"
 
+_MARGIN_DEFAULT = dict(l=50, r=20, t=40, b=40)
+
 _LAYOUT_DEFAULTS = dict(
     template="plotly_dark",
     paper_bgcolor=_BG,
     plot_bgcolor=_BG,
     font=dict(family="Inter, sans-serif", size=13),
-    margin=dict(l=50, r=20, t=40, b=40),
 )
 
 
@@ -54,6 +55,7 @@ def plot_experiments_bar(
     )
     fig.update_layout(
         **_LAYOUT_DEFAULTS,
+        margin=_MARGIN_DEFAULT,
         title=title or metric,
         xaxis_title=metric,
         yaxis_title="",
@@ -102,6 +104,7 @@ def plot_training_curves(history: pd.DataFrame) -> go.Figure:
 
     fig.update_layout(
         **_LAYOUT_DEFAULTS,
+        margin=_MARGIN_DEFAULT,
         title="Training curves",
         xaxis_title="Epoch",
         yaxis_title="Loss",
@@ -132,6 +135,7 @@ def plot_loss_components(history: pd.DataFrame) -> Optional[go.Figure]:
         )
     fig.update_layout(
         **_LAYOUT_DEFAULTS,
+        margin=_MARGIN_DEFAULT,
         title="Loss components (train)",
         xaxis_title="Epoch",
         yaxis_title="Loss",
@@ -170,7 +174,8 @@ def plot_error_breakdown(error_dict: dict) -> go.Figure:
         )
 
     fig.update_layout(
-        **{**_LAYOUT_DEFAULTS, "margin": dict(l=50, r=20, t=40, b=80)},
+        **_LAYOUT_DEFAULTS,
+        margin=dict(l=50, r=20, t=40, b=80),
         barmode="stack",
         title="Error distribution",
         xaxis_title="% of predictions",
@@ -253,6 +258,7 @@ def plot_rollout_horizon(rollout_ms: dict) -> go.Figure:
 
     fig.update_layout(
         **_LAYOUT_DEFAULTS,
+        margin=_MARGIN_DEFAULT,
         title="Rollout error vs horizon",
         xaxis_title="Horizon step (laps ahead)",
         yaxis_title="Error (ms)",
@@ -291,6 +297,7 @@ def plot_rollout_drift(rollout_ms: dict) -> go.Figure:
 
     fig.update_layout(
         **_LAYOUT_DEFAULTS,
+        margin=_MARGIN_DEFAULT,
         title="Cumulative drift vs horizon",
         xaxis_title="Horizon step",
         yaxis_title="Cumulative error (ms)",
@@ -393,6 +400,7 @@ def plot_race_rollout(seq: dict) -> go.Figure:
 
     fig.update_layout(
         **_LAYOUT_DEFAULTS,
+        margin=_MARGIN_DEFAULT,
         title=f"{driver} — {circuit} {year}  |  Rollout predictions vs actuals",
         xaxis_title="Lap",
         yaxis_title="Lap time (s)",

@@ -138,8 +138,8 @@ def run_rollout_sequences(
         return_sequences=True,
     )
 
-    # Determine denormalization scale
-    scale = _get_laptime_scale(normalizer)
+    # Determine denormalization parameters (offset + scale for full inverse transform)
+    offset, scale = _get_laptime_denorm_params(normalizer)
 
     # Load vocabs for human-readable names
     vocabs = load_vocabs(Path(data_root))
@@ -153,9 +153,9 @@ def run_rollout_sequences(
         pred_norm = seq.get("predicted_laps_norm", [])
         act_norm = seq.get("actual_laps_norm", [])
 
-        ctx_ms = [v * scale for v in ctx_norm]
-        pred_ms = [v * scale for v in pred_norm]
-        act_ms = [v * scale for v in act_norm]
+        ctx_ms = [v * scale + offset for v in ctx_norm]
+        pred_ms = [v * scale + offset for v in pred_norm]
+        act_ms = [v * scale + offset for v in act_norm]
 
         n_ctx = len(ctx_ms)
         n_pred = len(pred_ms)
@@ -180,23 +180,30 @@ def run_rollout_sequences(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_laptime_scale(normalizer) -> float:
-    """Extract LapTime std-dev (or range) from normalizer for denormalization."""
+def _get_laptime_denorm_params(normalizer) -> tuple[float, float]:
+    """Return (offset, scale) to fully invert LapTime normalization.
+
+    For all scaler types the inverse transform is: x = z * scale + offset
+      - StandardScaler:  offset=mean,   scale=std
+      - MinMaxScaler:    offset=min,    scale=(max - min)
+      - RobustScaler:    offset=center, scale=scale
+    """
     if normalizer is None:
-        return 1.0
+        return 0.0, 1.0
     stats = normalizer.get_statistics()
     if stats is None:
-        return 1.0
-    col_index = (
-        stats["columns"].index("LapTime") if "columns" in stats else 0
-    )
+        return 0.0, 1.0
+    col_index = stats["columns"].index("LapTime") if "columns" in stats else 0
     if "std" in stats:
-        return float(stats["std"][col_index])
+        # StandardScaler: z = (x - mean) / std  →  x = z * std + mean
+        return float(stats["mean"][col_index]), float(stats["std"][col_index])
     if "max" in stats and "min" in stats:
-        return float(stats["max"][col_index] - stats["min"][col_index])
+        # MinMaxScaler: z = (x - min) / (max - min)  →  x = z * (max-min) + min
+        return float(stats["min"][col_index]), float(stats["max"][col_index] - stats["min"][col_index])
     if "scale" in stats:
-        return float(stats["scale"][col_index])
-    return 1.0
+        # RobustScaler: z = (x - center) / scale  →  x = z * scale + center
+        return float(stats["center"][col_index]), float(stats["scale"][col_index])
+    return 0.0, 1.0
 
 
 def get_test_years_from_config(config_path: str) -> list[int]:

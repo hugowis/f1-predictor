@@ -177,6 +177,10 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         config.training.scheduled_sampling_end_epoch = args.ss_end_epoch
 
     # Data loading overrides
+    if getattr(args, 'context_window', None) is not None:
+        if args.context_window < 1:
+            raise ValueError("--context-window must be >= 1")
+        config.data.context_window = args.context_window
     if getattr(args, 'num_workers', None) is not None:
         config.data.num_workers = args.num_workers
 
@@ -740,6 +744,7 @@ def main():
     parser.add_argument('--ss-noise-std', type=float, help='Noise std in normalized space (default: 0.02, ~300ms)')
     parser.add_argument('--ss-start-epoch', type=int, help='Epoch to start scheduled sampling (default: 10)')
     parser.add_argument('--ss-end-epoch', type=int, help='Epoch to reach max noise (default: num_epochs)')
+    parser.add_argument('--context-window', type=int, help='Number of past laps used as encoder context (overrides config.data.context_window)')
     parser.add_argument('--num-workers', type=int, help='Number of data loading workers (overrides config)')
     parser.add_argument('--validation-freq', type=int, help='Validate every N epochs (default: 1)')
     parser.add_argument('--no-lr-scaling', action='store_true', help='Disable automatic linear LR scaling with batch size')

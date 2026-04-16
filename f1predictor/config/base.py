@@ -88,12 +88,12 @@ class TrainingConfig:
     scheduler_type: str = "cosine"  # "cosine_with_warmup", "cosine", "linear"
     warm_up_epochs: int = 5
     
-    # Teacher forcing schedule
+    # Teacher forcing schedule (E3 best-stability config: hold_then_decay, hold=20, end=0.3)
     teacher_forcing_start: float = 1.0  # Start with full teacher forcing
-    teacher_forcing_end: float = 0.5    # End with 50%
-    teacher_forcing_decay: str = "linear"  # "linear", "exponential"
+    teacher_forcing_end: float = 0.3    # End value after decay
+    teacher_forcing_decay: str = "hold_then_decay"  # "linear", "exponential", "hold_then_decay", "constant"
     # Hold then decay settings: number of epochs to keep `teacher_forcing_start` before decaying
-    teacher_forcing_hold_epochs: int = 0
+    teacher_forcing_hold_epochs: int = 20
 
     # Multi-step autoregressive training
     multistep_horizon: int = 1  # Max prediction horizon (1 = single-step, default)

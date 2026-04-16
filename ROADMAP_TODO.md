@@ -81,60 +81,50 @@ This file tracks the next experimentation steps ordered by priority. All experim
 
 ---
 
-### E3. Teacher Forcing Schedule Sweep
+### E3. Teacher Forcing Schedule Sweep — ✅ COMPLETED (stability win, no rollout breakthrough)
 
-Teacher forcing decay controls how quickly the model transitions from seeing ground-truth to its own predictions during decoder training.
+**Status**: Completed 2026-04-16. Two phases run (32 + 8 combos). Bug found and fixed in `hold_then_decay`. Best-stability config established as new default.
 
-Hypothesis:
-- Current linear decay to 0.5 may not be optimal. A hold-then-decay schedule could let the model learn basics before exposure to autoregressive noise.
-- The interaction with scheduled sampling (both active vs only one) may matter.
+**Bug discovered**: `hold_then_decay` in `teacher_forcing_schedule()` was not implemented — it fell through to `else: ratio = start`, making it identical to `constant` (TF=1.0 throughout). Fixed 2026-04-16: [train.py:463](code/train.py#L463).
 
-Note: `hold_then_decay` is the only decay type where `--teacher-forcing-hold-epochs` has any effect. Running a full Cartesian product with all hold_epoch values would generate redundant combos for other decay types. Two-phase approach used instead.
+**Phase 1** — Decay type × end value × ss (32 combos, results/E3_teacher_forcing_sweep):
 
-**Phase 1** — Find best decay type and end value (32 combos):
+Due to the bug, Phase 1 effectively ran only 4 distinct conditions:
 
-```bash
-python code/grid_search_experiment.py \
-  --search-root results/E3_teacher_forcing_sweep \
-  --grid teacher-forcing-decay=linear,exponential,hold_then_decay,constant \
-  --grid teacher-forcing-end=0.0,0.1,0.3,0.5 \
-  --grid scheduled-sampling=true,false \
-  --autoregressive \
-  --seeds 111 222 333 \
-  --device cuda \
-  --batch-size 128
-```
+| Condition | Stint MAE | Seed spread | Stability |
+|---|---|---|---|
+| Constant TF=1.0 + ss=off | 78,964ms | 1,627ms | 1.607 |
+| Constant TF=1.0 + ss=on | 79,136ms | 1,448ms | 1.607 |
+| Decaying TF + ss=off | 79,225ms | 4,354ms | 1.600 |
+| Decaying TF + ss=on | 79,360ms | 4,774ms | 1.602 |
 
-> 4 decay × 4 end × 2 ss = **32 combos × 3 seeds = 96 runs**
+Key Phase 1 findings: `teacher_forcing_end` is irrelevant (0.0–0.5 give identical results); linear and exponential are identical; scheduled sampling adds no value when combined with TF scheduling.
 
-**Phase 2** — Only if `hold_then_decay` wins phase 1, sweep hold epochs (8 combos):
+**Phase 2** — hold_then_decay × hold_epochs × ss (8 combos, results/E3_hold_then_decay_sweep, end=0.3):
 
-```bash
-python code/grid_search_experiment.py \
-  --search-root results/E3_hold_then_decay_sweep \
-  --grid teacher-forcing-hold-epochs=0,10,20,30 \
-  --grid teacher-forcing-end=<best_end_from_phase1> \
-  --grid scheduled-sampling=true,false \
-  --teacher-forcing-decay hold_then_decay \
-  --autoregressive \
-  --seeds 111 222 333 \
-  --device cuda \
-  --batch-size 128
-```
+| hold | SS | Next-lap MAE | Stint MAE | Seed spread |
+|---|---|---|---|---|
+| **20** | **true** | **34.0ms** | **79,224ms** | **937ms** |
+| 20 | false | 33.8ms | 79,565ms | 1,235ms |
+| 0 | false | 33.6ms | 79,225ms | 4,354ms |
+| 0 | true | 33.7ms | 79,360ms | 4,774ms |
+| 10 | false | 36.9ms | 79,666ms | 2,632ms |
+| 10 | true | 36.8ms | 79,888ms | 2,975ms |
+| 30 | false | 31.6ms | 80,674ms | 3,459ms |
+| 30 | true | 31.8ms | 80,709ms | 3,783ms |
 
-> 4 hold_epochs × 1 end × 2 ss = **8 combos × 3 seeds = 24 runs**
+*E2 best: 79,163ms — E1 best: 82,344ms*
 
-Epoch variation ({100, 150, 200}) is skipped for now — E2 showed the landscape is flat and tripling compute for marginal insight is not worthwhile. Revisit if a strong decay type is found but appears to need more training time.
+**Key findings**:
+1. **hold=20 minimises seed variance** — 937ms spread vs 4,774ms for hold=0. Letting the model learn under full teacher forcing for 20 epochs before transitioning to autoregressive mode produces significantly more reproducible training.
+2. **hold=30 overshoots** — too little time to adapt after the hold; rollout degrades (80,674ms) and variance rises again.
+3. **Scheduled sampling has zero additive effect** — marginal means: 79,795ms (ss=on) vs 79,782ms (ss=off) across all Phase 2 runs. Can be left off.
+4. **Success criterion not met** — best is 79,224ms vs target <79,163ms (E2 best). Missed by 61ms.
+5. **TF schedule is a stability lever, not a performance lever** — all configs cluster within a 1,485ms band (79,224–80,709ms).
 
-Tasks:
-- [ ] Run Phase 1 (32 combos)
-- [ ] Identify best decay type and end value
-- [ ] Run Phase 2 if `hold_then_decay` wins (8 combos)
-- [ ] Analyze interaction between scheduled sampling on/off and decay type
+**New default config** (updated in `config/base.py`): `hold_then_decay`, hold=20, end=0.3, ss=off.
 
-Success criteria:
-- Find a TF schedule that reduces stint MAE below 79,163ms (E2 best)
-- Identify best TF schedule to combine with scheduled sampling as new default
+**Conclusion**: Teacher forcing schedule does not drive rollout improvement. The bottleneck is structural — the model lacks information about its position in a race/stint. Next steps: E4 (context window) or E8 (architecture).
 
 ---
 

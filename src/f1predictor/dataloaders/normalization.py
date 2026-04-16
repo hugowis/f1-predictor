@@ -119,7 +119,7 @@ class LapTimeNormalizer:
         
         Examples
         --------
-        >>> from code.dataloaders.utils import load_all_races
+        >>> from f1predictor.dataloaders.utils import load_all_races
         >>> df = load_all_races([2019, 2020])
         >>> norm = LapTimeNormalizer()
         >>> norm.fit(df[[col for col in df.columns if col in norm.columns]], years=[2019, 2020])

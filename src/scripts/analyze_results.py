@@ -39,7 +39,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
     # Results directory
     if results_dir is None:
-        results_dir = Path(__file__).parent.parent / "results" / run
+        results_dir = Path(__file__).parent.parent.parent / "results" / run
     results_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n[1/3] Loading evaluation results...")
@@ -209,7 +209,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
 
             # Map driver/circuit integer IDs back to short codes using vocabs if available
             try:
-                vocabs_dir = Path(__file__).parent.parent / 'data' / 'vocabs'
+                vocabs_dir = Path(__file__).parent.parent.parent / 'data' / 'vocabs'
                 driver_map = {}
                 circuit_map = {}
                 driver_vocab_path = vocabs_dir / 'Driver.json'
@@ -454,7 +454,7 @@ def analyze_results(run: str = 'phase1', results_dir: Path = None):
     print("\n[3/3] Writing analysis report...")
 
     # Optional comparison with strong baseline if available
-    baseline_eval_path = Path(__file__).parent.parent / 'results' / 'experiment_100epochs_gru_run1' / 'evaluation' / 'evaluation_results.json'
+    baseline_eval_path = Path(__file__).parent.parent.parent / 'results' / 'experiment_100epochs_gru_run1' / 'evaluation' / 'evaluation_results.json'
     baseline_comparison = {}
     if baseline_eval_path.exists() and metrics_denorm:
         try:

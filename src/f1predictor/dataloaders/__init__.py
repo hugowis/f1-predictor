@@ -33,7 +33,7 @@ Examples
 
 Single-year stint dataloader:
 
-    >>> from code.dataloaders import StintDataloader
+    >>> from f1predictor.dataloaders import StintDataloader
     >>> ds = StintDataloader(year=2019, window_size=20)
     >>> print(f"Total stints: {len(ds)}")
     >>> sample = ds[0]
@@ -42,7 +42,7 @@ Single-year stint dataloader:
 
 Multi-year autoregressive dataloader:
 
-    >>> from code.dataloaders import AutoregressiveLapDataloader
+    >>> from f1predictor.dataloaders import AutoregressiveLapDataloader
     >>> from torch.utils.data import DataLoader
     >>> ds = AutoregressiveLapDataloader(
     ...     year=[2019, 2020, 2021],
@@ -64,7 +64,7 @@ Accessing metadata:
 
 Using normalization:
 
-    >>> from code.dataloaders import LapTimeNormalizer
+    >>> from f1predictor.dataloaders import LapTimeNormalizer
     >>> norm = LapTimeNormalizer(scaler_type="robust")  # Use RobustScaler
     >>> ds = StintDataloader(year=2019)  # Uses normalizer internally
     >>> stats = ds.normalizer.get_statistics()

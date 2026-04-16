@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Sequence
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TRAIN_SCRIPT = Path(__file__).resolve().with_name("train.py")
 
 

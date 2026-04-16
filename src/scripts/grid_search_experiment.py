@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LAUNCHER_SCRIPT = Path(__file__).resolve().with_name("launch_seed_experiments.py")
 
 

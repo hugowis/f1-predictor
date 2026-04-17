@@ -17,8 +17,9 @@ import pandas as pd
 import streamlit as st
 
 _REPO_ROOT = Path(__file__).parent.parent.parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SRC = _REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 from dashboard.utils.data_loader import (
     scan_experiments,

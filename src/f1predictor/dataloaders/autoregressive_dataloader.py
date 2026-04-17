@@ -26,8 +26,13 @@ from .utils import (
     get_categorical_columns,
     get_boolean_columns,
     get_compound_columns,
+    get_decoder_extra_feature_indices,
     extract_lap_features_vectorized,
 )
+
+# Indices of the extra features included in the decoder input (excludes LapTime,
+# which is always slot 0 and comes from the previous predicted lap).
+_DECODER_EXTRA_FEAT_IDX: list = get_decoder_extra_feature_indices()  # 7 values
 from .normalization import LapTimeNormalizer
 
 
@@ -301,8 +306,15 @@ class AutoregressiveLapDataloader(Dataset):
             self._precomputed_contexts = loaded_contexts
 
             # Targets: new caches store dicts of tensors directly
+            # Invalidate caches that predate the decoder_extra_features field.
+            raw_targets = cached.get('targets', [])
+            first_valid = next((tp for tp in raw_targets if tp is not None), None)
+            if first_valid is not None and 'decoder_extra_features' not in first_valid:
+                logger.info("Cache is missing decoder_extra_features; invalidating.")
+                return False
+
             loaded_targets = []
-            for tp in cached.get('targets', []):
+            for tp in raw_targets:
                 if tp is None:
                     loaded_targets.append(None)
                     continue
@@ -316,7 +328,17 @@ class AutoregressiveLapDataloader(Dataset):
                     tmask = torch.ones_like(lt)
                 elif not isinstance(tmask, torch.Tensor):
                     tmask = torch.tensor(tmask, dtype=torch.float32)
-                loaded_targets.append({'lap_time': lt, 'is_pitlap': pit, 'compound': comp, 'target_mask': tmask})
+                dex = tp.get('decoder_extra_features')
+                H = lt.shape[0] if lt.dim() >= 1 else 1
+                n_extra = len(_DECODER_EXTRA_FEAT_IDX)
+                if dex is None:
+                    dex = torch.zeros(H, n_extra, dtype=torch.float32)
+                elif not isinstance(dex, torch.Tensor):
+                    dex = torch.tensor(dex, dtype=torch.float32)
+                loaded_targets.append({
+                    'lap_time': lt, 'is_pitlap': pit, 'compound': comp,
+                    'target_mask': tmask, 'decoder_extra_features': dex,
+                })
             self._precomputed_targets = loaded_targets
             self._precomputed_meta = cached['meta']
             logger.info(f"Loaded {len(self._precomputed_contexts)} cached context tensors")
@@ -381,12 +403,30 @@ class AutoregressiveLapDataloader(Dataset):
                 comp_vals = t_lap[self.compound_columns].values.astype(np.int32)
                 target_compounds[h] = int(np.argmax(comp_vals)) if comp_vals.sum() > 0 else len(self.compound_columns) - 1
 
+            # Decoder extra features: strategy-known values for each target lap
+            # (TyreLife, fuel_proxy, stint_lap, compound one-hot) — 7 features
+            n_extra = len(_DECODER_EXTRA_FEAT_IDX)
+            if len(target_laps) > 0:
+                target_feat_array = extract_lap_features_vectorized(
+                    target_laps,
+                    self.numeric_columns, self.categorical_columns,
+                    self.boolean_columns, self.compound_columns,
+                )
+                target_extra = target_feat_array[:, _DECODER_EXTRA_FEAT_IDX].astype(np.float32)
+                if len(target_extra) < H:
+                    pad = np.zeros((H - len(target_extra), n_extra), dtype=np.float32)
+                    target_extra = np.vstack([target_extra, pad])
+                target_extra = target_extra[:H]
+            else:
+                target_extra = np.zeros((H, n_extra), dtype=np.float32)
+
             self._precomputed_contexts[i] = torch.from_numpy(context_array)
             self._precomputed_targets[i] = {
                 'lap_time': target_laptimes,
                 'is_pitlap': target_pitflags,
                 'compound': target_compounds,
                 'target_mask': target_mask,
+                'decoder_extra_features': torch.from_numpy(target_extra),
             }
             self._precomputed_meta[i] = {
                 'driver': pair['driver'],

@@ -20,9 +20,10 @@ import streamlit as st
 # Make sure the f1predictor library and scripts are importable
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).parent.parent.parent.parent  # f1-predictor/
-_CODE_DIR = _REPO_ROOT / "src" / "f1predictor"
-_SCRIPTS_DIR = _REPO_ROOT / "src" / "scripts"
-for _p in (str(_CODE_DIR), str(_SCRIPTS_DIR), str(_REPO_ROOT)):
+_SRC = _REPO_ROOT / "src"
+_CODE_DIR = _SRC / "f1predictor"
+_SCRIPTS_DIR = _SRC / "scripts"
+for _p in (str(_CODE_DIR), str(_SCRIPTS_DIR), str(_SRC)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

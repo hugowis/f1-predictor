@@ -15,11 +15,12 @@ from pathlib import Path
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Ensure the repo root is on sys.path so that dashboard.utils imports work
+# Ensure src/ is on sys.path so that dashboard.utils imports work
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).parent.parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SRC = _REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 # ---------------------------------------------------------------------------
 # Page config (must be first Streamlit call)

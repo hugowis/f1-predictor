@@ -283,6 +283,42 @@ def get_compound_columns() -> List[str]:
     ]
 
 
+def get_decoder_extra_feature_indices() -> List[int]:
+    """Return feature-vector indices for the decoder's non-LapTime inputs.
+
+    The decoder input is composed of:
+      slot 0  : previous predicted/actual LapTime  (handled externally)
+      slots 1+: these extra features, taken from the *target* lap
+
+    Features chosen because they are all known at inference time from the
+    planned race strategy (tire compound, tire age, fuel load, stint position).
+
+    Returns
+    -------
+    list of int
+        Indices into the full feature vector
+        (numeric | categorical | boolean | compound) for:
+        TyreLife, fuel_proxy, stint_lap, compound_soft, compound_medium,
+        compound_hard, compound_unknown  →  7 features total.
+    """
+    numeric = get_numeric_columns()          # indices 0-14
+    categorical = get_categorical_columns()  # indices 15-18
+    boolean = get_boolean_columns()          # indices 19-30
+    compound = get_compound_columns()        # indices 31-34
+
+    comp_offset = len(numeric) + len(categorical) + len(boolean)  # 31
+
+    return [
+        numeric.index("TyreLife"),    # 1
+        numeric.index("fuel_proxy"),  # 12
+        numeric.index("stint_lap"),   # 13
+        comp_offset + compound.index("compound_soft"),     # 31
+        comp_offset + compound.index("compound_medium"),   # 32
+        comp_offset + compound.index("compound_hard"),     # 33
+        comp_offset + compound.index("compound_unknown"),  # 34
+    ]
+
+
 def extract_lap_features_vectorized(
     laps: pd.DataFrame,
     numeric_columns: List[str] = None,

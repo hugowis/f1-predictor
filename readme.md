@@ -43,28 +43,29 @@ Full experiment history and next steps: see `ROADMAP_TODO.md`.
 ## Repository Structure
 
 ```text
-f1predictor/                # Core ML library (importable package)
-  config/                   # Dataclass-based configuration
-  data/                     # Data download and preparation
-  dataloaders/              # Dataset classes and normalization
-  models/                   # Model definitions, trainer, evaluator
-scripts/                    # CLI entry points
-  train.py                  # Main training script
-  evaluate.py               # Evaluation & rollout inference
-  analyze_results.py        # Post-run plots and reports
-  grid_search_experiment.py # Cartesian-product hyperparameter sweep
-  launch_seed_experiments.py# Multi-seed launcher
+src/
+  f1predictor/              # Core ML library (importable package)
+    config/                 # Dataclass-based configuration
+    data/                   # Data download and preparation
+    dataloaders/            # Dataset classes and normalization
+    models/                 # Model definitions, trainer, evaluator
+  scripts/                  # CLI entry points
+    train.py                # Main training script
+    evaluate.py             # Evaluation & rollout inference
+    analyze_results.py      # Post-run plots and reports
+    grid_search_experiment.py # Cartesian-product hyperparameter sweep
+    launch_seed_experiments.py# Multi-seed launcher
+  dashboard/                # Streamlit dashboard
+    app.py
+    pages/
+      1_Experiments.py
+      2_Model_Performance.py
+      3_Race_Visualization.py
+    utils/
+      data_loader.py
+      inference.py
+      charts.py
 tests/                      # Test suite (pytest)
-dashboard/                  # Streamlit dashboard
-  app.py
-  pages/
-    1_Experiments.py
-    2_Model_Performance.py
-    3_Race_Visualization.py
-  utils/
-    data_loader.py
-    inference.py
-    charts.py
 data/                       # Data storage (git-ignored)
   raw_data/
   clean_data/
@@ -116,8 +117,8 @@ pip install -r requirements.txt
 ### 1. Download and prepare data
 
 ```bash
-python f1predictor/data/data_downloader.py
-python f1predictor/data/data_preparation.py
+python src/f1predictor/data/data_downloader.py
+python src/f1predictor/data/data_preparation.py
 ```
 
 ### 2. Train
@@ -125,19 +126,19 @@ python f1predictor/data/data_preparation.py
 Phase 1 (stint mode):
 
 ```bash
-python scripts/train.py --phase 1 --device cuda
+python src/scripts/train.py --phase 1 --device cuda
 ```
 
 Phase 2 (autoregressive mode):
 
 ```bash
-python scripts/train.py --phase 2 --autoregressive --device cuda
+python src/scripts/train.py --phase 2 --autoregressive --device cuda
 ```
 
 Custom run example:
 
 ```bash
-python scripts/train.py \
+python src/scripts/train.py \
   --phase 2 \
   --autoregressive \
   --epochs 150 \
@@ -151,7 +152,7 @@ python scripts/train.py \
 ### 3. Evaluate a checkpoint
 
 ```bash
-python scripts/evaluate.py \
+python src/scripts/evaluate.py \
   --checkpoint results/my_run/checkpoints/best_model.pt \
   --config results/my_run/config.json \
   --test-years 2025 \
@@ -161,7 +162,7 @@ python scripts/evaluate.py \
 ### 4. Generate analysis plots/reports
 
 ```bash
-python scripts/analyze_results.py --run my_run
+python src/scripts/analyze_results.py --run my_run
 ```
 
 ## Reproducibility
@@ -170,7 +171,7 @@ This project is designed for practical reproducibility, but exact bitwise reprod
 
 ### What is already implemented
 
-- Fixed random seed support (`--seed` in `scripts/train.py`).
+- Fixed random seed support (`--seed` in `src/scripts/train.py`).
 - Deterministic CuDNN settings enabled in training script.
 - Config snapshot is saved per run (`results/<run>/config.json`).
 - Training history, checkpoints, evaluation outputs, and reports are persisted under each run directory.
@@ -191,7 +192,7 @@ This project is designed for practical reproducibility, but exact bitwise reprod
 ### Example reproducible command
 
 ```bash
-python scripts/train.py \
+python src/scripts/train.py \
   --phase 2 \
   --autoregressive \
   --seed 42 \
@@ -207,7 +208,7 @@ python scripts/train.py \
 Use the launcher when you want to repeat the same training configuration across several seeds and optionally run them in parallel.
 
 ```bash
-python scripts/launch_seed_experiments.py \
+python src/scripts/launch_seed_experiments.py \
   --config results/step2_compound_0.01/config.json \
   --seeds 42 123 789 \
   --batch-size 128 \
@@ -216,14 +217,14 @@ python scripts/launch_seed_experiments.py \
   --output-root results/step2_multiseed
 ```
 
-Any extra CLI flags that are not consumed by the launcher are forwarded to `scripts/train.py`, so you can still sweep things like `--epochs`, `--augment-prob`, or `--compound-loss-weight`. The launcher creates one subdirectory per seed, keeps a `launch_manifest.json`, and writes `leaderboard.csv` plus `leaderboard.json` at the output root after all runs finish.
+Any extra CLI flags that are not consumed by the launcher are forwarded to `src/scripts/train.py`, so you can still sweep things like `--epochs`, `--augment-prob`, or `--compound-loss-weight`. The launcher creates one subdirectory per seed, keeps a `launch_manifest.json`, and writes `leaderboard.csv` plus `leaderboard.json` at the output root after all runs finish.
 
 ### Grid-search launcher
 
 Use the grid-search wrapper when you want to sweep several launcher or training arguments at once while keeping the existing multi-seed workflow.
 
 ```bash
-python scripts/grid_search_experiment.py \
+python src/scripts/grid_search_experiment.py \
   --search-root results/tf_schedule_grid \
   --grid teacher-forcing-decay=linear,exponential \
   --grid teacher-forcing-hold-epochs=0,10,20 \
@@ -238,7 +239,7 @@ python scripts/grid_search_experiment.py \
 How it works:
 
 - Each `--grid` defines one Cartesian-product dimension.
-- Any non-wrapper arguments are forwarded to `scripts/launch_seed_experiments.py`.
+- Any non-wrapper arguments are forwarded to `src/scripts/launch_seed_experiments.py`.
 - Each hyperparameter combination gets its own output directory under `--search-root`.
 - The wrapper writes `grid_manifest.json`, `grid_search_results.csv`, and `grid_search_results.json` at the search root.
 
@@ -283,10 +284,10 @@ Each run folder in `results/<run_name>/` can include:
 
 ## Web Dashboard
 
-A Streamlit dashboard ships in `dashboard/` for interactive experiment exploration.
+A Streamlit dashboard ships in `src/dashboard/` for interactive experiment exploration.
 
 ```bash
-streamlit run dashboard/app.py
+streamlit run src/dashboard/app.py
 ```
 
 | Page | Description |

@@ -247,3 +247,5 @@ data/vocabs/Team.json
 data/vocabs/Year.json
 .vscode/settings.json
 .gitignore
+.claude/settings.local.json
+CLAUDE.md

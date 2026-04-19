@@ -21,6 +21,7 @@ from torch.utils.data._utils.collate import default_collate
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "f1predictor"))
 
 from dataloaders import StintDataloader, LapTimeNormalizer
+from dataloaders.autoregressive_dataloader import AutoregressiveLapDataloader
 from dataloaders.utils import load_all_races
 from models import Seq2Seq, Evaluator, compute_regression_metrics, report_evaluation
 from models.rollout_evaluator import (
@@ -48,6 +49,8 @@ def _load_eval_runtime_config(config_path: Path):
     runtime = {
         'batch_size': 32,
         'window_size': 20,
+        'context_window': 20,
+        'multistep_horizon': 1,
         'normalize': True,
         'scaler_type': 'standard',
         'normalizer': None,
@@ -59,6 +62,8 @@ def _load_eval_runtime_config(config_path: Path):
     config = Config.load(config_path)
     runtime['batch_size'] = config.training.batch_size
     runtime['window_size'] = config.data.window_size
+    runtime['context_window'] = getattr(config.data, 'context_window', config.data.window_size)
+    runtime['multistep_horizon'] = getattr(config.training, 'multistep_horizon', 1)
     runtime['normalize'] = config.data.normalize
     runtime['scaler_type'] = config.data.scaler_type
 
@@ -343,6 +348,14 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
     if not model_config:
         raise ValueError("No model config found in checkpoint. Use --config flag or retrain.")
     
+    # Detect architecture generation from state dict keys so old checkpoints
+    # (single Linear decoder head) and new ones (MLP Sequential) both load.
+    state_dict = checkpoint['model_state_dict']
+    if any(k.startswith('_orig_mod.') for k in state_dict):
+        state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
+    use_mlp_decoder_head = 'fc_decoder_output.0.weight' in state_dict  # Sequential
+    logger.info(f"Checkpoint decoder head: {'MLP' if use_mlp_decoder_head else 'Linear (legacy)'}")
+
     # Create model with saved config
     model = Seq2Seq(
         input_size=model_config.get('input_size', 33),
@@ -355,12 +368,10 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
         embedding_dims=model_config.get('embedding_dims', {}),
         vocab_sizes=model_config.get('vocab_sizes', {}),
         device=device,
+        decoder_extra_features_size=model_config.get('decoder_extra_features_size', 0),
+        use_mlp_decoder_head=use_mlp_decoder_head,
     )
     
-    # Load state dict — strip _orig_mod. prefix added by torch.compile() if present
-    state_dict = checkpoint['model_state_dict']
-    if any(k.startswith('_orig_mod.') for k in state_dict):
-        state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     model.eval()
     model.to(device)
@@ -375,40 +386,29 @@ def create_test_dataloader(
     years: list,
     batch_size: int = 32,
     window_size: int = 20,
+    context_window: int = None,
+    multistep_horizon: int = 1,
     normalize: bool = True,
     scaler_type: str = "standard",
     normalizer: LapTimeNormalizer = None,
 ):
-    """
-    Create test dataloader.
-    
-    Parameters
-    ----------
-    years : list
-        Years to load
-    batch_size : int
-        Batch size
-    window_size : int
-        Window size for stint sequences
-    
-    Returns
-    -------
-    DataLoader
-        Test dataloader
-    """
+    """Create test dataloader using AutoregressiveLapDataloader."""
+    context_window = context_window or window_size
     logger.info(f"Creating test dataloader for years {years}")
-    
-    test_ds = StintDataloader(
+
+    test_ds = AutoregressiveLapDataloader(
         year=years,
-        window_size=window_size,
+        context_window=context_window,
+        multistep_horizon=multistep_horizon,
         augment_prob=0.0,
         normalize=normalize,
         scaler_type=scaler_type,
         normalizer=normalizer,
+        require_normalizer=normalize,
     )
-    
-    logger.info(f"Test set: {len(test_ds)} stints")
-    
+
+    logger.info(f"Test set: {len(test_ds)} lap pairs")
+
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
@@ -416,7 +416,7 @@ def create_test_dataloader(
         num_workers=0,
         collate_fn=_collate_with_none_filter,
     )
-    
+
     return test_loader
 
 
@@ -456,11 +456,15 @@ def evaluate(
     
     runtime = _load_eval_runtime_config(config_path)
     
-    # Create test dataloader
+    # Create test dataloader — always H=1 so next-lap MAE is comparable across
+    # runs regardless of training multistep_horizon. Rollout evaluation below
+    # handles multi-step horizon separately via evaluate_autoregressive_rollout.
     test_loader = create_test_dataloader(
         years=test_years,
         batch_size=runtime['batch_size'],
         window_size=runtime['window_size'],
+        context_window=runtime['context_window'],
+        multistep_horizon=1,
         normalize=runtime['normalize'],
         scaler_type=runtime['scaler_type'],
         normalizer=runtime['normalizer'],

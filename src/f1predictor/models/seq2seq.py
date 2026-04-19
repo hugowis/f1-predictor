@@ -106,6 +106,8 @@ class Seq2Seq(BaseModel):
         embedding_dims: Optional[Dict[str, int]] = None,
         vocab_sizes: Optional[Dict[str, int]] = None,
         device: str = 'cpu',
+        decoder_extra_features_size: int = 7,
+        use_mlp_decoder_head: bool = True,
         **kwargs
     ):
         config = {
@@ -120,6 +122,7 @@ class Seq2Seq(BaseModel):
             'embedding_dims': embedding_dims or {},
             'vocab_sizes': vocab_sizes or {},
             'device': device,
+            'decoder_extra_features_size': decoder_extra_features_size,
         }
         super().__init__(config)
         
@@ -188,11 +191,12 @@ class Seq2Seq(BaseModel):
         # Encoder output projection (optional, for decoder initialization)
         self.fc_encoder_to_hidden = nn.Linear(hidden_size, hidden_size)
         
-        # DECODER: GRU that generates future laps
-        # Decoder input will be the previous lap time (autoregressive scalar).
-        # If you later want to include embeddings or extra context per step,
-        # adjust `decoder_input_size` and ensure `current_input` includes them.
-        decoder_input_size = output_size
+        self.decoder_extra_features_size = decoder_extra_features_size
+
+        # DECODER: GRU that generates future laps.
+        # Input = previous lap time + strategy-known extra features (tyre life,
+        # fuel proxy, stint lap, compound one-hot) — all known at inference time.
+        decoder_input_size = output_size + decoder_extra_features_size
         # Decoder can be GRU or LSTM based on `decoder_type`.
         if self.rnn_type == 'gru':
             self.decoder = nn.GRU(
@@ -214,8 +218,17 @@ class Seq2Seq(BaseModel):
                 bidirectional=False,
             )
         
-        # Decoder output projection to lap time prediction
-        self.fc_decoder_output = nn.Linear(hidden_size, output_size)
+        # Decoder output projection to lap time prediction.
+        # MLP (non-linear) for new models; single Linear for backward compat
+        # with old checkpoints that predate the MLP head change.
+        if use_mlp_decoder_head:
+            self.fc_decoder_output = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.GELU(),
+                nn.Linear(64, output_size),
+            )
+        else:
+            self.fc_decoder_output = nn.Linear(hidden_size, output_size)
         # Pit stop head (binary logit)
         self.fc_pit = nn.Linear(hidden_size, 1)
         # Compound prediction head (logits over compound classes)
@@ -254,12 +267,20 @@ class Seq2Seq(BaseModel):
 
         for fc in [
             self.fc_encoder_to_hidden,
-            self.fc_decoder_output,
             self.fc_pit,
             self.fc_compound,
         ]:
             nn.init.xavier_uniform_(fc.weight)
             nn.init.zeros_(fc.bias)
+
+        if isinstance(self.fc_decoder_output, nn.Sequential):
+            for layer in self.fc_decoder_output:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+        else:
+            nn.init.xavier_uniform_(self.fc_decoder_output.weight)
+            nn.init.zeros_(self.fc_decoder_output.bias)
 
         for emb in self.embeddings.values():
             nn.init.normal_(emb.weight, mean=0.0, std=0.1)
@@ -444,7 +465,12 @@ class Seq2Seq(BaseModel):
             if use_teacher and t < decoder_seq_len - 1:
                 current_input = decoder_input[:, t+1:t+2, :]
             else:
-                current_input = step_output
+                if self.decoder_extra_features_size > 0 and t < decoder_seq_len - 1:
+                    current_input = torch.cat(
+                        [step_output, decoder_input[:, t+1:t+2, self.output_size:]], dim=-1
+                    )
+                else:
+                    current_input = step_output
         
         # Concatenate all outputs
         lap_out = torch.cat(outputs_lap, dim=1)  # (batch, decoder_seq_len, output_size)
@@ -508,13 +534,18 @@ class Seq2Seq(BaseModel):
         outputs_compound = []
         current_input = decoder_input[:, 0:1, :]
 
-        for _ in range(max_length):
+        for i in range(max_length):
             step_output, step_pit_logit, step_comp_logits, decoder_hidden = self._decode_step(current_input, decoder_hidden)
 
             outputs_lap.append(step_output)
             outputs_pit.append(step_pit_logit.squeeze(-1))
             outputs_compound.append(step_comp_logits)
-            current_input = step_output
+            if self.decoder_extra_features_size > 0 and i < max_length - 1:
+                current_input = torch.cat(
+                    [step_output, decoder_input[:, i+1:i+2, self.output_size:]], dim=-1
+                )
+            else:
+                current_input = step_output
 
         lap_out = torch.cat(outputs_lap, dim=1)
         pit_out = torch.cat(outputs_pit, dim=1)

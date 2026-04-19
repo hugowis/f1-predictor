@@ -23,6 +23,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+try:
+    from dataloaders.utils import get_decoder_extra_feature_indices as _get_decoder_extra_feat_idx
+    _DECODER_EXTRA_FEAT_IDX = _get_decoder_extra_feat_idx()
+except Exception:
+    _DECODER_EXTRA_FEAT_IDX = []
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,11 +145,16 @@ def evaluate_autoregressive_rollout(
                 # Build encoder input tensor
                 context_tensor = torch.from_numpy(context).unsqueeze(0).to(device)
 
-                # Decoder input: last context lap time
+                # Decoder input: previous lap time + strategy-known extra features
+                # Extra features (tyre life, fuel proxy, stint lap, compound)
+                # come from the TARGET lap since they are known from race strategy.
                 last_laptime = float(context[-1, lap_time_feat_idx])
-                decoder_input = torch.tensor(
-                    [[[last_laptime]]], dtype=torch.float32, device=device,
-                )
+                if _DECODER_EXTRA_FEAT_IDX:
+                    target_extra = all_features[target_idx][_DECODER_EXTRA_FEAT_IDX].astype(np.float32)
+                    decoder_data = np.concatenate([[last_laptime], target_extra])[np.newaxis, np.newaxis, :]
+                else:
+                    decoder_data = np.array([[[last_laptime]]], dtype=np.float32)
+                decoder_input = torch.tensor(decoder_data, dtype=torch.float32, device=device)
 
                 # Single-step forward pass (no teacher forcing)
                 outputs = model(context_tensor, decoder_input, teacher_forcing=False)

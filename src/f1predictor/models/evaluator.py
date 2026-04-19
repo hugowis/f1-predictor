@@ -109,8 +109,17 @@ class Evaluator:
                     encoder_input, decoder_input, targets, metadata = batch
                 elif len(batch) == 3:
                     encoder_input, targets, metadata = batch
-                    # Create decoder_input with shape (batch, seq_len, output_size)
-                    if targets.dim() == 1:
+                    # Create decoder_input with shape (batch, seq_len, output_size[+extra])
+                    if isinstance(targets, dict):
+                        lap_t = targets['lap_time']
+                        if lap_t.dim() == 1:
+                            decoder_input = lap_t.unsqueeze(-1).unsqueeze(-1)
+                        else:
+                            decoder_input = lap_t.unsqueeze(-1)
+                        dex = targets.get('decoder_extra_features')
+                        if dex is not None:
+                            decoder_input = torch.cat([decoder_input, dex.float()], dim=-1)
+                    elif targets.dim() == 1:
                         decoder_input = targets.unsqueeze(-1).unsqueeze(-1)
                     elif targets.dim() == 2:
                         decoder_input = targets.unsqueeze(-1)
@@ -172,6 +181,13 @@ class Evaluator:
                 else:
                     targets = targets.to(self.device)
                 
+                # Trim decoder_input to what the model's decoder GRU actually expects.
+                # Phase-1 models have decoder_extra_features_size=0 (GRU input_size=1)
+                # but the AR dataloader always produces 8-dim decoder inputs.
+                expected_dec_size = self.model.output_size + getattr(self.model, 'decoder_extra_features_size', 0)
+                if decoder_input.shape[-1] > expected_dec_size:
+                    decoder_input = decoder_input[..., :expected_dec_size]
+
                 # Forward pass with autocast for faster inference
                 with autocast(device_type='cuda', enabled=self.device == 'cuda'):
                     outputs = self.model(encoder_input, decoder_input, teacher_forcing=False)
@@ -298,6 +314,15 @@ class Evaluator:
                     meta_list = list(metadata)
                 else:
                     meta_list = [metadata]
+
+                # Autoregressive predictions flatten to (batch * seq_len,) while
+                # meta_list has batch-length entries. Replicate each sample's
+                # metadata across its sequence dimension so driver/circuit slicing
+                # works on rollout runs.
+                if len(meta_list) > 0 and len(valid_mask) % len(meta_list) == 0:
+                    seq_len = len(valid_mask) // len(meta_list)
+                    if seq_len > 1:
+                        meta_list = [dict(m) for m in meta_list for _ in range(seq_len)]
 
                 # If metadata length matches preds length, select by valid_mask
                 if len(meta_list) == len(valid_mask):

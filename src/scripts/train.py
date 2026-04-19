@@ -380,7 +380,7 @@ def create_autoregressive_dataloaders(config: Config, batch_size: int = 32):
     return train_loader, val_loader, test_loader
 
 
-def create_model(config: Config, device: str = 'cpu'):
+def create_model(config: Config, device: str = 'cpu', use_autoregressive: bool = False):
     """
     Create model instance.
     
@@ -417,6 +417,7 @@ def create_model(config: Config, device: str = 'cpu'):
     except Exception:
         compound_classes = getattr(config.model, 'compound_classes', 4)
     model_config['compound_classes'] = compound_classes
+    model_config['decoder_extra_features_size'] = 7 if use_autoregressive else 0
 
     if config.model.name in ("seq2seq", "seq2seq_gru"):
         model = Seq2Seq(**model_config)
@@ -614,7 +615,7 @@ def train(config: Config, output_dir: Path = None):
     _run_dataset_normalizer_consistency_check(train_loader)
     
     # Create model
-    model = create_model(config, device=config.device)
+    model = create_model(config, device=config.device, use_autoregressive=getattr(config, 'use_autoregressive', False))
     
     # Apply sqrt LR scaling when batch size differs from reference
     # (sqrt scaling is more stable for RNNs than linear scaling)

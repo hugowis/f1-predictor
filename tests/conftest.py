@@ -107,6 +107,7 @@ def small_seq2seq(minimal_model_config):
         embedding_dims=minimal_model_config.embedding_dims,
         vocab_sizes=minimal_model_config.vocab_sizes,
         device='cpu',
+        decoder_extra_features_size=0,
     )
     model.eval()
     return model

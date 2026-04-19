@@ -974,6 +974,13 @@ class Trainer:
             else:
                 decoder_input = lap_tensor_norm.clone()
 
+            dex = targets.get('decoder_extra_features') if isinstance(targets, dict) else None
+            if dex is not None:
+                dex = dex.type(torch.float32)
+                if dex.dim() == 2:
+                    dex = dex.unsqueeze(-1)
+                decoder_input = torch.cat([decoder_input, dex], dim=-1)
+
             return encoder_final, decoder_input, targets, metadata
         else:
             raise ValueError(f"Unexpected batch format: {type(batch)}")

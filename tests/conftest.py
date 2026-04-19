@@ -35,11 +35,11 @@ COMPOUND_COLS = get_compound_columns()
 ALL_FEATURE_COLS = NUMERIC_COLS + CATEGORICAL_COLS + BOOLEAN_COLS + COMPOUND_COLS
 
 # Expected total raw feature count (before embeddings)
-N_NUM = len(NUMERIC_COLS)       # 15
+N_NUM = len(NUMERIC_COLS)       # 31 post-Part-C (was 15)
 N_CAT = len(CATEGORICAL_COLS)   # 4
 N_BOOL = len(BOOLEAN_COLS)      # 12
 N_COMP = len(COMPOUND_COLS)     # 4
-TOTAL_RAW = N_NUM + N_CAT + N_BOOL + N_COMP  # 35
+TOTAL_RAW = N_NUM + N_CAT + N_BOOL + N_COMP  # 51
 
 
 @pytest.fixture
@@ -134,6 +134,30 @@ def _make_synthetic_rows(n_rows: int = 30, seed: int = 42) -> pd.DataFrame:
     data['fuel_proxy'] = rng.uniform(0.2, 1.0, n_rows)
     data['stint_lap'] = rng.randint(1, 20, n_rows).astype(float)
     data['cumulative_stint_time'] = rng.uniform(80000, 1500000, n_rows)
+
+    # Part-C engineered features (fill with reasonable ranges so tests run)
+    # C1: rolling lap-time trend
+    data['laptime_ema_3'] = rng.uniform(80000, 100000, n_rows)
+    data['laptime_ema_5'] = rng.uniform(80000, 100000, n_rows)
+    data['laptime_delta_1'] = rng.uniform(-500, 500, n_rows)
+    data['laptime_delta_3'] = rng.uniform(-1000, 1000, n_rows)
+    # C2: tyre-deg slope
+    data['stint_deg_slope_3'] = rng.uniform(-50, 200, n_rows)
+    # C3: weather deltas vs race start
+    data['d_airtemp_vs_start'] = rng.uniform(-5, 5, n_rows)
+    data['d_tracktemp_vs_start'] = rng.uniform(-10, 10, n_rows)
+    data['d_humidity_vs_start'] = rng.uniform(-20, 20, n_rows)
+    # C4: traffic rate
+    data['d_delta_to_car_ahead'] = rng.uniform(-1000, 1000, n_rows)
+    # C5: sector times + deltas (ms)
+    data['Sector1Time_ms'] = rng.uniform(20000, 35000, n_rows)
+    data['Sector2Time_ms'] = rng.uniform(25000, 40000, n_rows)
+    data['Sector3Time_ms'] = rng.uniform(25000, 40000, n_rows)
+    data['sector1_delta'] = rng.uniform(-500, 500, n_rows)
+    data['sector2_delta'] = rng.uniform(-500, 500, n_rows)
+    data['sector3_delta'] = rng.uniform(-500, 500, n_rows)
+    # C6: stint progress %
+    data['stint_progress_pct'] = rng.uniform(0, 1, n_rows)
 
     # Categorical columns (small integer ids)
     data['Driver'] = rng.randint(0, 8, n_rows)

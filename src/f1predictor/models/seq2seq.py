@@ -108,6 +108,12 @@ class Seq2Seq(BaseModel):
         device: str = 'cpu',
         decoder_extra_features_size: int = 7,
         use_mlp_decoder_head: bool = True,
+        decoder_head_hidden: int = 64,
+        decoder_head_layers: int = 2,
+        decoder_head_dropout: float = 0.0,
+        decoder_skip_type: str = 'none',
+        encoder_pool: bool = False,
+        encoder_pool_k: int = 5,
         **kwargs
     ):
         config = {
@@ -188,8 +194,15 @@ class Seq2Seq(BaseModel):
                 bidirectional=False,
             )
         
-        # Encoder output projection (optional, for decoder initialization)
-        self.fc_encoder_to_hidden = nn.Linear(hidden_size, hidden_size)
+        # Encoder output projection for decoder hidden-state init (B3).
+        # encoder_pool=False: project last encoder output (legacy).
+        # encoder_pool=True:  project concat(last_output, mean_pool_last_k).
+        if encoder_pool_k < 1:
+            raise ValueError(f"encoder_pool_k must be >= 1, got {encoder_pool_k}")
+        self.encoder_pool = bool(encoder_pool)
+        self.encoder_pool_k = int(encoder_pool_k)
+        proj_in = 2 * hidden_size if self.encoder_pool else hidden_size
+        self.fc_encoder_to_hidden = nn.Linear(proj_in, hidden_size)
         
         self.decoder_extra_features_size = decoder_extra_features_size
 
@@ -219,16 +232,45 @@ class Seq2Seq(BaseModel):
             )
         
         # Decoder output projection to lap time prediction.
-        # MLP (non-linear) for new models; single Linear for backward compat
-        # with old checkpoints that predate the MLP head change.
-        if use_mlp_decoder_head:
-            self.fc_decoder_output = nn.Sequential(
-                nn.Linear(hidden_size, 64),
-                nn.GELU(),
-                nn.Linear(64, output_size),
-            )
-        else:
+        # Configurable MLP: [Linear -> GELU -> Dropout] x (layers-1) -> Linear.
+        # layers=1 collapses to a single Linear (same as use_mlp_decoder_head=False).
+        self.decoder_head_hidden = decoder_head_hidden
+        self.decoder_head_layers = decoder_head_layers
+        self.decoder_head_dropout = decoder_head_dropout
+        if not use_mlp_decoder_head or decoder_head_layers <= 1:
             self.fc_decoder_output = nn.Linear(hidden_size, output_size)
+        else:
+            layers: list = []
+            in_dim = hidden_size
+            for _ in range(decoder_head_layers - 1):
+                layers.append(nn.Linear(in_dim, decoder_head_hidden))
+                layers.append(nn.GELU())
+                if decoder_head_dropout > 0.0:
+                    layers.append(nn.Dropout(decoder_head_dropout))
+                in_dim = decoder_head_hidden
+            layers.append(nn.Linear(in_dim, output_size))
+            self.fc_decoder_output = nn.Sequential(*layers)
+
+        # Skip connection over decoder extras (B2).
+        # - 'additive': small MLP residual added to decoder output.
+        # - 'film': per-step gamma/beta modulating decoder output.
+        # Both variants are zero-initialised in _init_weights so an untrained
+        # model starts as the identity ('none') transform.
+        if decoder_skip_type not in ('none', 'additive', 'film'):
+            raise ValueError(
+                f"decoder_skip_type must be 'none', 'additive', or 'film'; got {decoder_skip_type!r}"
+            )
+        self.decoder_skip_type = decoder_skip_type
+        if decoder_skip_type == 'additive':
+            self.decoder_skip = nn.Sequential(
+                nn.Linear(decoder_input_size, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+        elif decoder_skip_type == 'film':
+            # Output = [gamma_residual, beta]; gamma = 1 + gamma_residual, so
+            # zero-init => gamma=1, beta=0 (identity).
+            self.decoder_film = nn.Linear(decoder_input_size, 2 * hidden_size)
         # Pit stop head (binary logit)
         self.fc_pit = nn.Linear(hidden_size, 1)
         # Compound prediction head (logits over compound classes)
@@ -285,13 +327,37 @@ class Seq2Seq(BaseModel):
         for emb in self.embeddings.values():
             nn.init.normal_(emb.weight, mean=0.0, std=0.1)
 
+        # Skip connection identity init (B2): additive residual final layer is
+        # zero -> skip returns 0; FiLM weights/bias zero -> gamma=1, beta=0.
+        if self.decoder_skip_type == 'additive':
+            first, last = self.decoder_skip[0], self.decoder_skip[-1]
+            nn.init.xavier_uniform_(first.weight)
+            nn.init.zeros_(first.bias)
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+        elif self.decoder_skip_type == 'film':
+            nn.init.zeros_(self.decoder_film.weight)
+            nn.init.zeros_(self.decoder_film.bias)
+
+    def _apply_decoder_skip(self, decoder_output, decoder_input):
+        """Combine decoder RNN output with a skip from the decoder input (B2)."""
+        if self.decoder_skip_type == 'none':
+            return decoder_output
+        if self.decoder_skip_type == 'additive':
+            return decoder_output + self.decoder_skip(decoder_input)
+        # film
+        film = self.decoder_film(decoder_input)
+        gamma_res, beta = film.chunk(2, dim=-1)
+        return (1.0 + gamma_res) * decoder_output + beta
+
     def _decode_step(self, current_input, decoder_hidden):
         """Run a single decoder step and project to output heads.
 
         Returns (step_output, step_pit_logit, step_comp_logits, decoder_hidden).
         """
         decoder_output, decoder_hidden = self.decoder(current_input, decoder_hidden)
-        step_output = self.fc_decoder_output(decoder_output)
+        head_input = self._apply_decoder_skip(decoder_output, current_input)
+        step_output = self.fc_decoder_output(head_input)
         step_pit_logit = self.fc_pit(decoder_output)
         step_comp_logits = self.fc_compound(decoder_output)
         return step_output, step_pit_logit, step_comp_logits, decoder_hidden
@@ -416,8 +482,15 @@ class Seq2Seq(BaseModel):
         # encoder_output: (batch, encoder_seq_len, hidden_size)
         # encoder_hidden: (num_layers, batch, hidden_size)
         
-        # Use last encoder hidden state to initialize decoder
-        base_hidden = self.fc_encoder_to_hidden(encoder_output[:, -1, :]).unsqueeze(0)
+        # Use last encoder hidden state to initialize decoder (B3 optional pool).
+        last_enc = encoder_output[:, -1, :]
+        if self.encoder_pool:
+            k = min(self.encoder_pool_k, encoder_output.size(1))
+            pooled = encoder_output[:, -k:, :].mean(dim=1)
+            enc_feat = torch.cat([last_enc, pooled], dim=-1)
+        else:
+            enc_feat = last_enc
+        base_hidden = self.fc_encoder_to_hidden(enc_feat).unsqueeze(0)
         # expand to (num_layers, batch, hidden_size)
         expanded = base_hidden.expand(self.num_layers, batch_size, self.hidden_size).contiguous()
         if self.decoder_type == 'gru':
@@ -436,7 +509,8 @@ class Seq2Seq(BaseModel):
             # decoder_input shape: (batch, seq_len, output_size)
             decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
             # decoder_output: (batch, seq_len, hidden_size)
-            lap_out = self.fc_decoder_output(decoder_output)  # (batch, seq_len, output_size)
+            head_input = self._apply_decoder_skip(decoder_output, decoder_input)
+            lap_out = self.fc_decoder_output(head_input)  # (batch, seq_len, output_size)
             pit_out = self.fc_pit(decoder_output).squeeze(-1)  # (batch, seq_len)
             comp_out = self.fc_compound(decoder_output)  # (batch, seq_len, C)
 

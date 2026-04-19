@@ -199,13 +199,16 @@ def get_scaler_key(years: Union[int, List[int]]) -> str:
 def get_numeric_columns() -> List[str]:
     """
     Get list of numeric columns that should be normalized.
-    
+
     Returns
     -------
     list of str
-        Column names for numeric features
+        Column names for numeric features. New C1–C6 columns are appended at
+        the end so existing index-based slicing (e.g. legacy normalizers and
+        decoder-extra indices) remains valid for the first 15 positions.
     """
     return [
+        # Legacy 15 (order preserved)
         "LapTime",
         "TyreLife",
         "Position",
@@ -221,6 +224,28 @@ def get_numeric_columns() -> List[str]:
         "fuel_proxy",
         "stint_lap",
         "cumulative_stint_time",
+        # C1: rolling lap-time trend
+        "laptime_ema_3",
+        "laptime_ema_5",
+        "laptime_delta_1",
+        "laptime_delta_3",
+        # C2: tyre-deg slope
+        "stint_deg_slope_3",
+        # C3: weather deltas vs race start
+        "d_airtemp_vs_start",
+        "d_tracktemp_vs_start",
+        "d_humidity_vs_start",
+        # C4: traffic rate
+        "d_delta_to_car_ahead",
+        # C5: sector times + per-stint deltas
+        "Sector1Time_ms",
+        "Sector2Time_ms",
+        "Sector3Time_ms",
+        "sector1_delta",
+        "sector2_delta",
+        "sector3_delta",
+        # C6: stint progress normalized by expected stint length
+        "stint_progress_pct",
     ]
 
 
@@ -291,31 +316,43 @@ def get_decoder_extra_feature_indices() -> List[int]:
       slots 1+: these extra features, taken from the *target* lap
 
     Features chosen because they are all known at inference time from the
-    planned race strategy (tire compound, tire age, fuel load, stint position).
+    planned race strategy (tyre compound/age, fuel load, stint position) plus
+    engineered trend/shape signals (C1–C6).
+
+    Ordering note (backward compat):
+        The first 7 entries are the legacy order (TyreLife, fuel_proxy,
+        stint_lap, compound_{soft,medium,hard,unknown}). Older checkpoints
+        trained with ``decoder_extra_features_size=7`` rely on this order when
+        the rollout evaluator slices ``[:model_extra_size]``. New features from
+        Part C are appended after slot 7 (decoder_extra_features_size=11).
 
     Returns
     -------
     list of int
         Indices into the full feature vector
-        (numeric | categorical | boolean | compound) for:
-        TyreLife, fuel_proxy, stint_lap, compound_soft, compound_medium,
-        compound_hard, compound_unknown  →  7 features total.
+        (numeric | categorical | boolean | compound).
     """
-    numeric = get_numeric_columns()          # indices 0-14
-    categorical = get_categorical_columns()  # indices 15-18
-    boolean = get_boolean_columns()          # indices 19-30
-    compound = get_compound_columns()        # indices 31-34
+    numeric = get_numeric_columns()
+    categorical = get_categorical_columns()
+    boolean = get_boolean_columns()
+    compound = get_compound_columns()
 
-    comp_offset = len(numeric) + len(categorical) + len(boolean)  # 31
+    comp_offset = len(numeric) + len(categorical) + len(boolean)
 
     return [
-        numeric.index("TyreLife"),    # 1
-        numeric.index("fuel_proxy"),  # 12
-        numeric.index("stint_lap"),   # 13
-        comp_offset + compound.index("compound_soft"),     # 31
-        comp_offset + compound.index("compound_medium"),   # 32
-        comp_offset + compound.index("compound_hard"),     # 33
-        comp_offset + compound.index("compound_unknown"),  # 34
+        # Legacy 7 (order frozen for backward compat with old checkpoints)
+        numeric.index("TyreLife"),
+        numeric.index("fuel_proxy"),
+        numeric.index("stint_lap"),
+        comp_offset + compound.index("compound_soft"),
+        comp_offset + compound.index("compound_medium"),
+        comp_offset + compound.index("compound_hard"),
+        comp_offset + compound.index("compound_unknown"),
+        # Part C additions (E15): strategy-known trend / deg / weather signals
+        numeric.index("laptime_delta_1"),       # C1
+        numeric.index("stint_deg_slope_3"),     # C2
+        numeric.index("d_tracktemp_vs_start"),  # C3
+        numeric.index("stint_progress_pct"),    # C6
     ]
 
 

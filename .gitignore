@@ -238,6 +238,7 @@ analysis/
 *.swap
 
 # Project datasets and caches (reproducible/generated)
+data/stint_norms.json
 data/raw_data/
 data/clean_data/
 data/precomputed/

@@ -353,13 +353,79 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
     state_dict = checkpoint['model_state_dict']
     if any(k.startswith('_orig_mod.') for k in state_dict):
         state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
-    use_mlp_decoder_head = 'fc_decoder_output.0.weight' in state_dict  # Sequential
-    logger.info(f"Checkpoint decoder head: {'MLP' if use_mlp_decoder_head else 'Linear (legacy)'}")
+
+    # Infer decoder head shape from Sequential indices so runs with non-default
+    # head widths / layer counts reload correctly.  Sequential layout:
+    #   dropout==0: [Linear(0), GELU(1), Linear(2), GELU(3), ..., Linear(N)]
+    #   dropout>0:  [Linear(0), GELU(1), Dropout(2), Linear(3), ..., Linear(N)]
+    linear_keys = [
+        k for k in state_dict
+        if k.startswith('fc_decoder_output.') and k.endswith('.weight')
+        and k.split('.')[1].isdigit()
+    ]
+    if linear_keys:
+        use_mlp_decoder_head = True
+        linear_indices = sorted(int(k.split('.')[1]) for k in linear_keys)
+        decoder_head_layers = len(linear_indices)
+        decoder_head_hidden_inferred = int(state_dict[f'fc_decoder_output.{linear_indices[0]}.weight'].shape[0])
+        step = (linear_indices[1] - linear_indices[0]) if len(linear_indices) >= 2 else 2
+        decoder_head_dropout_inferred = 0.1 if step >= 3 else 0.0
+    else:
+        use_mlp_decoder_head = False
+        decoder_head_layers = 1
+        decoder_head_hidden_inferred = model_config.get('decoder_head_hidden', 64)
+        decoder_head_dropout_inferred = 0.0
+    logger.info(
+        f"Checkpoint decoder head: {'MLP' if use_mlp_decoder_head else 'Linear (legacy)'} "
+        f"(layers={decoder_head_layers}, hidden={decoder_head_hidden_inferred}, "
+        f"dropout_present={decoder_head_dropout_inferred > 0})"
+    )
+
+    # Infer encoder_pool from fc_encoder_to_hidden input dim (B3).
+    # Input dim = hidden -> legacy; 2*hidden -> encoder_pool=True.
+    hidden_size = model_config.get('hidden_size', 128)
+    encoder_pool_inferred = False
+    fc_key = 'fc_encoder_to_hidden.weight'
+    if fc_key in state_dict:
+        fc_in = int(state_dict[fc_key].shape[1])
+        encoder_pool_inferred = fc_in == 2 * hidden_size
+    encoder_pool_k_inferred = model_config.get('encoder_pool_k', 5)
+    logger.info(f"Checkpoint encoder_pool: {encoder_pool_inferred} (k={encoder_pool_k_inferred})")
+
+    # Infer skip-connection type from state_dict keys (B2).
+    if any(k.startswith('decoder_film.') for k in state_dict):
+        decoder_skip_type_inferred = 'film'
+    elif any(k.startswith('decoder_skip.') for k in state_dict):
+        decoder_skip_type_inferred = 'additive'
+    else:
+        decoder_skip_type_inferred = 'none'
+    logger.info(f"Checkpoint decoder skip: {decoder_skip_type_inferred}")
+
+    # Infer decoder_extra_features_size from the checkpoint's decoder layer
+    # shape.  `decoder.weight_ih_l0` is (3*hidden, decoder_input_size) for a
+    # GRU / (4*hidden, decoder_input_size) for an LSTM, where
+    # decoder_input_size = output_size + decoder_extra_features_size.  This
+    # overrides the saved model_config entry because older configs omitted
+    # the field entirely and would otherwise default to 0.
+    output_size = model_config.get('output_size', 1)
+    decoder_extra_saved = model_config.get('decoder_extra_features_size')
+    decoder_extra_inferred = decoder_extra_saved
+    ih_key = 'decoder.weight_ih_l0'
+    if ih_key in state_dict:
+        inferred_input = int(state_dict[ih_key].shape[1])
+        decoder_extra_inferred = max(0, inferred_input - output_size)
+        if decoder_extra_saved is not None and decoder_extra_saved != decoder_extra_inferred:
+            logger.warning(
+                "decoder_extra_features_size in config (%s) disagrees with checkpoint (%s); "
+                "using checkpoint-inferred value",
+                decoder_extra_saved, decoder_extra_inferred,
+            )
+    decoder_extra_features_size = decoder_extra_inferred if decoder_extra_inferred is not None else 0
 
     # Create model with saved config
     model = Seq2Seq(
         input_size=model_config.get('input_size', 33),
-        output_size=model_config.get('output_size', 1),
+        output_size=output_size,
         hidden_size=model_config.get('hidden_size', 128),
         num_layers=model_config.get('num_layers', 2),
         dropout=model_config.get('dropout', 0.2),
@@ -368,8 +434,14 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'cpu'):
         embedding_dims=model_config.get('embedding_dims', {}),
         vocab_sizes=model_config.get('vocab_sizes', {}),
         device=device,
-        decoder_extra_features_size=model_config.get('decoder_extra_features_size', 0),
+        decoder_extra_features_size=decoder_extra_features_size,
         use_mlp_decoder_head=use_mlp_decoder_head,
+        decoder_head_hidden=decoder_head_hidden_inferred,
+        decoder_head_layers=decoder_head_layers,
+        decoder_head_dropout=decoder_head_dropout_inferred,
+        decoder_skip_type=decoder_skip_type_inferred,
+        encoder_pool=encoder_pool_inferred,
+        encoder_pool_k=encoder_pool_k_inferred,
     )
     
     model.load_state_dict(state_dict)

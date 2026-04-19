@@ -116,6 +116,30 @@ def _apply_cli_overrides(config: Config, args: argparse.Namespace):
         except Exception:
             setattr(config.model, 'decoder_type', args.decoder_type)
 
+    # Decoder head overrides (B1)
+    if getattr(args, 'no_mlp_decoder_head', False):
+        config.model.use_mlp_decoder_head = False
+    if getattr(args, 'decoder_head_hidden', None) is not None:
+        if args.decoder_head_hidden < 1:
+            raise ValueError("--decoder-head-hidden must be >= 1")
+        config.model.decoder_head_hidden = args.decoder_head_hidden
+    if getattr(args, 'decoder_head_layers', None) is not None:
+        if args.decoder_head_layers < 1:
+            raise ValueError("--decoder-head-layers must be >= 1")
+        config.model.decoder_head_layers = args.decoder_head_layers
+    if getattr(args, 'decoder_head_dropout', None) is not None:
+        if not (0.0 <= args.decoder_head_dropout < 1.0):
+            raise ValueError("--decoder-head-dropout must be in [0.0, 1.0)")
+        config.model.decoder_head_dropout = args.decoder_head_dropout
+    if getattr(args, 'decoder_skip_type', None):
+        config.model.decoder_skip_type = args.decoder_skip_type
+    if getattr(args, 'encoder_pool', False):
+        config.model.encoder_pool = True
+    if getattr(args, 'encoder_pool_k', None) is not None:
+        if args.encoder_pool_k < 1:
+            raise ValueError("--encoder-pool-k must be >= 1")
+        config.model.encoder_pool_k = args.encoder_pool_k
+
     if args.batch_size:
         config.training.batch_size = args.batch_size
     if args.epochs:
@@ -398,6 +422,18 @@ def create_model(config: Config, device: str = 'cpu', use_autoregressive: bool =
     """
     logger.info("Creating model...")
     
+    # Ensure decoder_extra_features_size matches the training mode.  Phase-1
+    # (stint) uses 0; phase-2 / autoregressive uses 11 (post-Part C).  If the
+    # config was created from a phase-1 preset but the user passed
+    # --autoregressive, bump the value so the model is built correctly and so
+    # the resolved config persisted to config.json reflects the actual model
+    # architecture. Legacy 7-extra checkpoints still roll out via
+    # rollout_evaluator's slice-to-model-size guard.
+    if use_autoregressive and config.model.decoder_extra_features_size == 0:
+        config.model.decoder_extra_features_size = 11
+    elif not use_autoregressive:
+        config.model.decoder_extra_features_size = 0
+
     model_config = {
         'input_size': config.model.input_size,
         'output_size': config.model.output_size,
@@ -408,16 +444,23 @@ def create_model(config: Config, device: str = 'cpu', use_autoregressive: bool =
         'vocab_sizes': config.model.vocab_sizes,
         'decoder_type': getattr(config.model, 'decoder_type', 'gru'),
         'encoder_type': getattr(config.model, 'encoder', 'gru'),
+        'decoder_extra_features_size': config.model.decoder_extra_features_size,
+        'use_mlp_decoder_head': getattr(config.model, 'use_mlp_decoder_head', True),
+        'decoder_head_hidden': getattr(config.model, 'decoder_head_hidden', 64),
+        'decoder_head_layers': getattr(config.model, 'decoder_head_layers', 2),
+        'decoder_head_dropout': getattr(config.model, 'decoder_head_dropout', 0.0),
+        'decoder_skip_type': getattr(config.model, 'decoder_skip_type', 'none'),
+        'encoder_pool': getattr(config.model, 'encoder_pool', False),
+        'encoder_pool_k': getattr(config.model, 'encoder_pool_k', 5),
         'device': device,
     }
-    
+
     # If autoregressive dataloader is used, pass compound_classes to model
     try:
         compound_classes = len(get_compound_columns())
     except Exception:
         compound_classes = getattr(config.model, 'compound_classes', 4)
     model_config['compound_classes'] = compound_classes
-    model_config['decoder_extra_features_size'] = 7 if use_autoregressive else 0
 
     if config.model.name in ("seq2seq", "seq2seq_gru"):
         model = Seq2Seq(**model_config)
@@ -720,6 +763,14 @@ def main():
     parser.add_argument('--output', type=Path, help='Output directory for results')
     parser.add_argument('--autoregressive', action='store_true', help='Use autoregressive lap-by-lap dataloader')
     parser.add_argument('--decoder-type', choices=['gru', 'lstm'], help='Decoder type to use (overrides config)')
+    # Decoder output head (B1)
+    parser.add_argument('--no-mlp-decoder-head', action='store_true', help='Use single Linear decoder head instead of MLP (legacy)')
+    parser.add_argument('--decoder-head-hidden', type=int, help='MLP decoder head hidden width (default: 64)')
+    parser.add_argument('--decoder-head-layers', type=int, help='MLP decoder head number of Linear layers (1 = single Linear, default: 2)')
+    parser.add_argument('--decoder-head-dropout', type=float, help='Dropout between MLP decoder head layers (default: 0.0)')
+    parser.add_argument('--decoder-skip-type', choices=['none', 'additive', 'film'], help='Skip connection from decoder input to head (B2). none|additive|film (default: none)')
+    parser.add_argument('--encoder-pool', action='store_true', help='B3: init decoder hidden from concat(last_output, mean_pool_last_k) instead of only last_output')
+    parser.add_argument('--encoder-pool-k', type=int, help='B3: pool window size k (default: 5); clamped to encoder seq len at runtime')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning-rate', type=float, help='Learning rate')

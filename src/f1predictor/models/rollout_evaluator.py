@@ -38,6 +38,7 @@ def evaluate_autoregressive_rollout(
     device: str = 'cpu',
     max_horizon: int = 50,
     return_sequences: bool = False,
+    freeze_decoder_extras: bool = False,
 ) -> Dict:
     """
     Evaluate model via full autoregressive rollout over driver-race sequences.
@@ -81,6 +82,13 @@ def evaluate_autoregressive_rollout(
                                if 'cumulative_stint_time' in numeric_columns else None)
     stint_lap_feat_idx = (numeric_columns.index('stint_lap')
                           if 'stint_lap' in numeric_columns else None)
+
+    # Only feed the decoder its strategy-known extras if the model was
+    # actually trained with them.  Older / phase-1 checkpoints have
+    # ``decoder_extra_features_size == 0`` (decoder GRU input = 1) and would
+    # crash on the 8-dim decoder input otherwise.
+    model_extra_size = int(getattr(model, 'decoder_extra_features_size', 0))
+    use_decoder_extras = bool(_DECODER_EXTRA_FEAT_IDX) and model_extra_size > 0
 
     # Work with normal laps only (matching training/pair-generation filter)
     data = test_dataset.data.copy()
@@ -148,9 +156,14 @@ def evaluate_autoregressive_rollout(
                 # Decoder input: previous lap time + strategy-known extra features
                 # Extra features (tyre life, fuel proxy, stint lap, compound)
                 # come from the TARGET lap since they are known from race strategy.
+                # With ``freeze_decoder_extras=True`` they are instead pinned to
+                # the last context lap — diagnostic ablation to measure how much
+                # the decoder actually relies on the evolving strategy signal.
                 last_laptime = float(context[-1, lap_time_feat_idx])
-                if _DECODER_EXTRA_FEAT_IDX:
-                    target_extra = all_features[target_idx][_DECODER_EXTRA_FEAT_IDX].astype(np.float32)
+                if use_decoder_extras:
+                    extra_src_idx = context_window - 1 if freeze_decoder_extras else target_idx
+                    feat_idx = _DECODER_EXTRA_FEAT_IDX[:model_extra_size]
+                    target_extra = all_features[extra_src_idx][feat_idx].astype(np.float32)
                     decoder_data = np.concatenate([[last_laptime], target_extra])[np.newaxis, np.newaxis, :]
                 else:
                     decoder_data = np.array([[[last_laptime]]], dtype=np.float32)

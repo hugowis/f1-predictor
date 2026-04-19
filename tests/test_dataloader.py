@@ -31,7 +31,18 @@ class TestFeatureColumns:
     """Verify column lists are consistent and sum to expected input_size."""
 
     def test_numeric_column_count(self):
-        assert len(get_numeric_columns()) == 15
+        # 15 legacy + 16 Part-C (C1: 4, C2: 1, C3: 3, C4: 1, C5: 6, C6: 1) = 31
+        assert len(get_numeric_columns()) == 31
+
+    def test_numeric_column_legacy_prefix_order(self):
+        """First 15 numeric columns must stay in legacy order for backward compat."""
+        legacy = [
+            "LapTime", "TyreLife", "Position", "TrackLength", "RaceLaps",
+            "AirTemp", "TrackTemp", "Humidity", "Pressure", "WindSpeed",
+            "WindDirection", "delta_to_car_ahead", "fuel_proxy",
+            "stint_lap", "cumulative_stint_time",
+        ]
+        assert get_numeric_columns()[:15] == legacy
 
     def test_categorical_column_count(self):
         assert len(get_categorical_columns()) == 4
@@ -43,14 +54,14 @@ class TestFeatureColumns:
         assert len(get_compound_columns()) == 4
 
     def test_total_raw_feature_count(self):
-        """Total columns should equal model input_size (35)."""
+        """Total columns should equal model input_size (51 post-Part-C)."""
         total = (
             len(get_numeric_columns())
             + len(get_categorical_columns())
             + len(get_boolean_columns())
             + len(get_compound_columns())
         )
-        assert total == 35
+        assert total == 51
 
     def test_no_duplicate_columns(self):
         """No column appears in more than one category."""
@@ -213,3 +224,130 @@ class TestNormalizeYearInput:
     def test_invalid_type_raises(self):
         with pytest.raises(TypeError):
             normalize_year_input("2020")
+
+
+# ── Part-C engineered features ──────────────────────────────────────────
+
+class TestPartCFeatures:
+    """Verify C1–C6 pipeline steps produce deterministic, finite outputs."""
+
+    @pytest.fixture
+    def prep(self, tmp_path, monkeypatch):
+        """Build a DataPreparation instance without touching raw data on disk."""
+        from data.data_preparation import DataPreparation
+        # Patch _load_schedules so __init__ does not scan the filesystem
+        monkeypatch.setattr(
+            DataPreparation, "_load_schedules", lambda self: ({}, [])
+        )
+        monkeypatch.setattr(
+            DataPreparation,
+            "_load_or_build_stint_norms",
+            lambda self: {"TestCircuit|SOFT": 20.0, "TestCircuit|HARD": 30.0},
+        )
+        return DataPreparation(tmp_path, vocab_years=[2023])
+
+    @pytest.fixture
+    def mini_df(self):
+        """Two-driver, one-stint-each synthetic race frame."""
+        rows = []
+        for drv in ("A", "B"):
+            for lap in range(1, 11):
+                rows.append({
+                    "Driver": drv,
+                    "LapNumber": lap,
+                    "LapTime": 90_000.0 + lap * 50.0 + (0 if drv == "A" else 20.0),
+                    "is_normal_lap": 1,
+                    "is_outlap": 0,
+                    "is_inlap": 0,
+                    "is_pitlap": 0,
+                    "stint_id": 1,
+                    "stint_lap": lap,
+                    "Compound": "SOFT",
+                    "AirTemp": 20.0 + lap * 0.1,
+                    "TrackTemp": 30.0 + lap * 0.2,
+                    "Humidity": 50.0 - lap * 0.1,
+                    "delta_to_car_ahead": 1.0 + lap * 0.05,
+                    "Sector1Time": 25_000.0 + lap * 5.0,
+                    "Sector2Time": 30_000.0 + lap * 10.0,
+                    "Sector3Time": 35_000.0 + lap * 15.0,
+                })
+        return pd.DataFrame(rows)
+
+    def test_traffic_rate(self, prep, mini_df):
+        out = prep._add_traffic_rate(mini_df.copy())
+        assert "d_delta_to_car_ahead" in out.columns
+        a = out[out["Driver"] == "A"].sort_values("LapNumber")
+        # First lap per driver: diff NaN → filled with 0
+        assert a["d_delta_to_car_ahead"].iloc[0] == 0.0
+        # Subsequent laps: constant 0.05 step
+        assert np.allclose(a["d_delta_to_car_ahead"].iloc[1:].values, 0.05)
+
+    def test_weather_deltas(self, prep, mini_df):
+        out = prep._add_weather_deltas(mini_df.copy())
+        for col in ("d_airtemp_vs_start", "d_tracktemp_vs_start", "d_humidity_vs_start"):
+            assert col in out.columns
+            assert out[col].notna().all()
+        # First row (reference) → 0
+        assert out["d_airtemp_vs_start"].iloc[0] == 0.0
+
+    def test_sector_times(self, prep, mini_df):
+        out = prep._process_sector_times(mini_df.copy())
+        for i in (1, 2, 3):
+            assert f"Sector{i}Time_ms" in out.columns
+            assert f"sector{i}_delta" in out.columns
+            assert out[f"Sector{i}Time_ms"].notna().all()
+            # First lap in each stint → delta 0
+            a = out[out["Driver"] == "A"].sort_values("LapNumber")
+            assert a[f"sector{i}_delta"].iloc[0] == 0.0
+
+    def test_rolling_laptime_trend(self, prep, mini_df):
+        out = prep._add_rolling_laptime_trend(mini_df.copy())
+        for col in ("laptime_ema_3", "laptime_ema_5", "laptime_delta_1", "laptime_delta_3"):
+            assert col in out.columns
+            assert out[col].notna().all()
+            assert np.isfinite(out[col]).all()
+        a = out[out["Driver"] == "A"].sort_values("LapNumber")
+        # Per-lap delta should equal the constant 50 ms step (laps 2+ in-stint)
+        assert np.allclose(a["laptime_delta_1"].iloc[1:].values, 50.0)
+        # First lap in stint → shift-based deltas are 0
+        assert a["laptime_delta_1"].iloc[0] == 0.0
+
+    def test_stint_deg_slope(self, prep, mini_df):
+        out = prep._add_stint_deg_slope(mini_df.copy())
+        assert "stint_deg_slope_3" in out.columns
+        assert np.isfinite(out["stint_deg_slope_3"]).all()
+        a = out[out["Driver"] == "A"].sort_values("LapNumber")
+        # Laps 3+ should show positive slope ~50 (LapTime grows 50/lap)
+        late_slopes = a["stint_deg_slope_3"].iloc[2:].values
+        assert np.allclose(late_slopes, 50.0, atol=1e-6)
+
+    def test_stint_progress_pct(self, prep, mini_df):
+        # Need stint_lap already present (fixture provides it)
+        out = prep._add_stint_progress_pct(mini_df.copy(), circuit="TestCircuit")
+        assert "stint_progress_pct" in out.columns
+        assert np.isfinite(out["stint_progress_pct"]).all()
+        # SOFT expected=20 → lap 10 → 0.5
+        a = out[out["Driver"] == "A"].sort_values("LapNumber")
+        assert np.isclose(a["stint_progress_pct"].iloc[9], 0.5)
+
+    def test_decoder_extra_feature_indices_legacy_prefix_frozen(self):
+        """First 7 decoder-extra indices must remain in legacy order."""
+        from dataloaders.utils import get_decoder_extra_feature_indices
+        idx = get_decoder_extra_feature_indices()
+        assert len(idx) == 11
+        # Legacy-first invariant: old 7-extra checkpoints slice idx[:7]
+        numeric = get_numeric_columns()
+        compound = get_compound_columns()
+        cat_count = len(get_categorical_columns())
+        bool_count = len(get_boolean_columns())
+        comp_offset = len(numeric) + cat_count + bool_count
+        expected_legacy = [
+            numeric.index("TyreLife"),
+            numeric.index("fuel_proxy"),
+            numeric.index("stint_lap"),
+            comp_offset + compound.index("compound_soft"),
+            comp_offset + compound.index("compound_medium"),
+            comp_offset + compound.index("compound_hard"),
+            comp_offset + compound.index("compound_unknown"),
+        ]
+        assert idx[:7] == expected_legacy

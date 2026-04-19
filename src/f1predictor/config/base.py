@@ -23,6 +23,33 @@ class ModelConfig:
     num_layers: int = 2
     dropout: float = 0.2
     encoder: str = 'gru'
+    decoder_type: str = 'gru'
+    # Size of the strategy-known extra features fed to the decoder at each step
+    # (TyreLife, fuel_proxy, stint_lap, 4x compound one-hot). 0 for phase-1
+    # stint-based training (decoder sees only prev_laptime); 7 for phase-2
+    # autoregressive. Set here so the value round-trips through config.json.
+    decoder_extra_features_size: int = 0
+    # Decoder output head: MLP (Linear->GELU->Linear) when True, single Linear
+    # otherwise. True for new models; False reproduces legacy checkpoints.
+    use_mlp_decoder_head: bool = True
+    # MLP head shape when use_mlp_decoder_head is True. Defaults preserve the
+    # legacy head (Linear(hidden, 64) -> GELU -> Linear(64, output), no dropout)
+    # so existing checkpoints reload bit-for-bit. E13 sweeps these via CLI.
+    decoder_head_hidden: int = 64
+    decoder_head_layers: int = 2
+    decoder_head_dropout: float = 0.0
+    # Skip/residual from decoder input (prev_laptime + strategy extras) to the
+    # head input. 'none' = recurrent path only (legacy); 'additive' adds a small
+    # MLP residual; 'film' modulates the decoder output with per-step
+    # gamma/beta. Both variants are zero-initialised so untrained runs match
+    # 'none' bit-for-bit. Designed to widen the freeze-extras MAE gap (E14).
+    decoder_skip_type: str = 'none'
+    # Decoder hidden-state init (B3). When False: legacy projection of the last
+    # encoder output. When True: concat(last_output, mean_pool_last_k) -> Linear.
+    # encoder_pool_k is clamped to the actual encoder sequence length at runtime.
+    # Default False so existing checkpoints reload bit-for-bit.
+    encoder_pool: bool = False
+    encoder_pool_k: int = 5
     embedding_dims: Optional[Dict[str, int]] = None
     vocab_sizes: Optional[Dict[str, int]] = None
     
@@ -317,6 +344,7 @@ def get_phase2_config() -> Config:
         hidden_size=256,
         num_layers=3,
         dropout=0.3,
+        decoder_extra_features_size=11,
     )
     
     training_config = TrainingConfig(

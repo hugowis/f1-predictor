@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import json
@@ -60,6 +61,9 @@ class DataPreparation:
 
     ]
 
+    STINT_NORMS_FALLBACK = 25.0  # laps; used when (circuit, compound) unseen
+    STINT_NORMS_MIN_GROUP_SIZE = 3  # drop tiny groups to avoid noisy medians
+
     def __init__(self, data_path: Path, vocab_years: List[int] = None):
         """
         Parameters
@@ -73,15 +77,21 @@ class DataPreparation:
             used (legacy behaviour — not recommended, causes data leakage).
         """
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.data_path = data_path
         self.vocabs_path = data_path / "vocabs"
         self.raw_data_path = data_path / "raw_data"
         self.save_dir = data_path / "clean_data"
+        self.stint_norms_path = data_path / "stint_norms.json"
         self.schedules, self.years = self._load_schedules()
         self.vocab_years = set(vocab_years) if vocab_years is not None else None
 
         self.categories = {
             col: {"<UNK>": 0} for col in self.CATEGORICAL_COLUMNS
         }
+
+        # (circuit, compound_UPPER) -> expected stint length; built lazily
+        # from raw training-year laps. C6 uses this for stint_progress_pct.
+        self.stint_norms: Dict[str, float] = self._load_or_build_stint_norms()
 
         self.pipeline = [
             self._add_metadata,
@@ -92,12 +102,18 @@ class DataPreparation:
             self._add_lap_type_flags,
             self._add_trackstatus_flag,
             self._compute_delta_to_car_ahead,
+            self._add_traffic_rate,              # C4
             self._convert_bool,
             self._encode_compound,
             self._add_fuel_proxy,
+            self._add_weather_deltas,            # C3
             self._to_categorical,
             self._add_stint_length,
             self._add_cumulative_stint_time,
+            self._process_sector_times,          # C5
+            self._add_rolling_laptime_trend,     # C1
+            self._add_stint_deg_slope,           # C2
+            self._add_stint_progress_pct,        # C6
             self._drop_useless_columns,
         ]
 
@@ -300,6 +316,222 @@ class DataPreparation:
         )
         df["cumulative_stint_time"] = df["cumulative_stint_time"].fillna(0.0)
         return df
+
+    # ---------------------------------------------------------------------
+    # Part C — engineered trend / deg / weather / sector features
+    # ---------------------------------------------------------------------
+
+    def _add_traffic_rate(self, df, **_):
+        """C4: first difference of delta_to_car_ahead per driver."""
+        df = df.sort_values(["Driver", "LapNumber"])
+        df["d_delta_to_car_ahead"] = (
+            df.groupby("Driver")["delta_to_car_ahead"].diff().fillna(0.0)
+        )
+        return df
+
+    def _add_weather_deltas(self, df, **_):
+        """C3: weather deltas vs race start (per-race first-lap reference)."""
+        df = df.sort_values(["Driver", "LapNumber"])
+        for src, dst in [
+            ("AirTemp", "d_airtemp_vs_start"),
+            ("TrackTemp", "d_tracktemp_vs_start"),
+            ("Humidity", "d_humidity_vs_start"),
+        ]:
+            if src in df.columns:
+                ref = df[src].dropna()
+                ref_val = float(ref.iloc[0]) if len(ref) else 0.0
+                df[dst] = (df[src] - ref_val).fillna(0.0)
+            else:
+                df[dst] = 0.0
+        return df
+
+    def _process_sector_times(self, df, **_):
+        """C5: rename sector times to *_ms, ffill, compute per-stint deltas.
+
+        Originals (Sector{1,2,3}Time) are still dropped at the end by
+        DROP_COLS; the renamed ms versions survive.
+        """
+        df = df.sort_values(["Driver", "LapNumber"])
+        for i in (1, 2, 3):
+            src = f"Sector{i}Time"
+            dst = f"Sector{i}Time_ms"
+            if src in df.columns:
+                df[dst] = df[src]
+            else:
+                df[dst] = np.nan
+
+            # Per-stint ffill + fallback to the stint's median
+            df[dst] = (
+                df.groupby(["Driver", "stint_id"])[dst]
+                .transform(lambda s: s.ffill().fillna(s.median()))
+            )
+            # If the whole stint was NaN, fall back to the race-level median
+            med = df[dst].median()
+            df[dst] = df[dst].fillna(med if pd.notna(med) else 0.0)
+
+            # Per-stint delta vs stint's first valid lap (shape signal)
+            first_vals = (
+                df.groupby(["Driver", "stint_id"])[dst].transform("first")
+            )
+            df[f"sector{i}_delta"] = (df[dst] - first_vals).fillna(0.0)
+        return df
+
+    def _add_rolling_laptime_trend(self, df, **_):
+        """C1: EMA + deltas of LapTime within each driver-stint.
+
+        Non-normal laps (in/out/pitlap) are masked and forward-filled so
+        pit noise doesn't poison the trend.
+        """
+        df = df.sort_values(["Driver", "LapNumber"])
+        masked = df["LapTime"].where(df["is_normal_lap"] == 1)
+        masked = masked.groupby([df["Driver"], df["stint_id"]]).ffill()
+        # If a stint starts with a non-normal lap, bfill so early rows are
+        # not NaN; else fall back to raw LapTime.
+        masked = masked.groupby([df["Driver"], df["stint_id"]]).bfill()
+        masked = masked.fillna(df["LapTime"])
+
+        grp = masked.groupby([df["Driver"], df["stint_id"]])
+        df["laptime_ema_3"] = (
+            grp.transform(lambda s: s.ewm(span=3, adjust=False).mean())
+        ).fillna(0.0)
+        df["laptime_ema_5"] = (
+            grp.transform(lambda s: s.ewm(span=5, adjust=False).mean())
+        ).fillna(0.0)
+        df["laptime_delta_1"] = grp.transform(lambda s: s - s.shift(1)).fillna(0.0)
+        df["laptime_delta_3"] = grp.transform(lambda s: s - s.shift(3)).fillna(0.0)
+        return df
+
+    def _add_stint_deg_slope(self, df, **_):
+        """C2: rolling slope of LapTime on stint_lap over last 3 in-stint laps."""
+        df = df.sort_values(["Driver", "LapNumber"])
+
+        def _slope(window: pd.Series) -> float:
+            if len(window) < 2:
+                return 0.0
+            y = window.values.astype(np.float64)
+            x = np.arange(len(y), dtype=np.float64)
+            if np.isnan(y).any():
+                mask = ~np.isnan(y)
+                if mask.sum() < 2:
+                    return 0.0
+                x, y = x[mask], y[mask]
+            x_mean = x.mean()
+            y_mean = y.mean()
+            denom = ((x - x_mean) ** 2).sum()
+            if denom == 0.0:
+                return 0.0
+            return float(((x - x_mean) * (y - y_mean)).sum() / denom)
+
+        masked = df["LapTime"].where(df["is_normal_lap"] == 1)
+        slopes = (
+            masked.groupby([df["Driver"], df["stint_id"]])
+            .transform(lambda s: s.rolling(window=3, min_periods=2).apply(_slope, raw=False))
+        )
+        df["stint_deg_slope_3"] = slopes.fillna(0.0)
+        return df
+
+    def _add_stint_progress_pct(self, df, *, circuit=None, **_):
+        """C6: stint_lap / expected_stint_len for (circuit, compound).
+
+        Uses self.stint_norms (built from training years) with a constant
+        fallback so held-out circuits still produce finite values.
+        """
+        compound = df.get("Compound")
+        if compound is None:
+            df["stint_progress_pct"] = 0.0
+            return df
+
+        expected = compound.astype("string").str.upper().map(
+            lambda c: self.stint_norms.get(
+                f"{circuit}|{c}", self.STINT_NORMS_FALLBACK
+            )
+        ).astype(float)
+        expected = expected.where(expected > 0, self.STINT_NORMS_FALLBACK)
+
+        stint_lap = df["stint_lap"].astype(float)
+        # -1 sentinel (non-normal laps) → 0.0 progress
+        pct = np.where(stint_lap < 0, 0.0, stint_lap / expected)
+        df["stint_progress_pct"] = pct.astype(np.float32)
+        return df
+
+    # ---------------------------------------------------------------------
+    # Stint norms (C6 support)
+    # ---------------------------------------------------------------------
+
+    def _load_or_build_stint_norms(self) -> Dict[str, float]:
+        """Return (circuit, compound) -> expected stint length.
+
+        Scans raw training-year laps. Stint length = per-(Driver, Stint)
+        max(LapNumber) - min(LapNumber) + 1. Aggregated as median per
+        (circuit_name, Compound_UPPER). Cached to data/stint_norms.json.
+        Held-out circuits/compounds use STINT_NORMS_FALLBACK at lookup.
+        """
+        if self.stint_norms_path.exists():
+            try:
+                with open(self.stint_norms_path) as f:
+                    norms = json.load(f)
+                self.logger.info(
+                    f"Loaded stint_norms ({len(norms)} keys) from cache"
+                )
+                return {k: float(v) for k, v in norms.items()}
+            except (json.JSONDecodeError, OSError) as e:
+                self.logger.warning(f"Failed to load stint_norms cache: {e}")
+
+        self.logger.info("Building stint_norms from raw training-year laps...")
+        train_years = (
+            sorted(self.vocab_years) if self.vocab_years else self.years
+        )
+
+        records = []
+        for year in train_years:
+            if year not in self.schedules:
+                continue
+            for _, race in self.schedules[year].iterrows():
+                event = race["EventName"]
+                circuit = race["Location"]
+                laps_dir = self.raw_data_path / "laps" / str(year) / event
+                race_csv = laps_dir / "Race.csv"
+                if not race_csv.exists():
+                    continue
+                try:
+                    df = pd.read_csv(
+                        race_csv,
+                        usecols=["Driver", "LapNumber", "Stint", "Compound"],
+                        low_memory=False,
+                    )
+                except (ValueError, OSError):
+                    continue
+                df = df.dropna(subset=["Driver", "LapNumber", "Stint", "Compound"])
+                if df.empty:
+                    continue
+                df["Compound"] = df["Compound"].astype(str).str.upper()
+                grp = df.groupby(["Driver", "Stint", "Compound"])
+                stint_lens = (grp["LapNumber"].max() - grp["LapNumber"].min() + 1)
+                for (drv, stint, comp), length in stint_lens.items():
+                    records.append((circuit, comp, float(length)))
+
+        norms: Dict[str, float] = {}
+        if records:
+            rec_df = pd.DataFrame(records, columns=["circuit", "compound", "length"])
+            agg = rec_df.groupby(["circuit", "compound"])
+            counts = agg.size()
+            medians = agg["length"].median()
+            for (circuit, compound), med in medians.items():
+                if counts[(circuit, compound)] < self.STINT_NORMS_MIN_GROUP_SIZE:
+                    continue
+                norms[f"{circuit}|{compound}"] = float(med)
+
+        try:
+            self.stint_norms_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.stint_norms_path, "w") as f:
+                json.dump(norms, f, indent=2, sort_keys=True)
+            self.logger.info(
+                f"Built stint_norms ({len(norms)} keys) → {self.stint_norms_path}"
+            )
+        except OSError as e:
+            self.logger.warning(f"Failed to cache stint_norms: {e}")
+
+        return norms
 
     # ---------------------------------------------------------------------
     # Orchestration

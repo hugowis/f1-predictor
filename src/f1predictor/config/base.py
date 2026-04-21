@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ModelConfig:
     """Model architecture configuration."""
     name: str = "seq2seq"
-    input_size: int = 35  # From dataloaders (13 numeric + 2 tire deg + 4 cat + 12 bool + 4 compound)
+    input_size: int = 51  # Post-Part-C: 31 numeric + 4 cat + 12 bool + 4 compound. Auto-derived at train time — see train.py.
     output_size: int = 1  # Predict single lap time
     hidden_size: int = 128
     num_layers: int = 2

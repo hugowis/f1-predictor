@@ -344,6 +344,22 @@ class LapTimeNormalizer:
                 f"Pass the correct years or re-fit the scaler on training data only."
             )
 
+        # Reject scalers whose column set no longer matches the current
+        # numeric-feature registry.  A mismatch means the scaler was fit
+        # before a feature-schema change (e.g. Part C added 16 columns):
+        # loading it would leave the new columns un-normalised and the
+        # model would see raw millisecond values, producing NaN on the
+        # first forward pass.  Force a refit instead of silently breaking.
+        saved_columns = data.get('columns', [])
+        expected_columns = get_numeric_columns()
+        if list(saved_columns) != list(expected_columns):
+            raise FileNotFoundError(
+                f"Scaler at {filepath} was fit on columns "
+                f"{saved_columns} but the current feature registry is "
+                f"{expected_columns}. Delete the stale scaler and re-fit "
+                f"on training data."
+            )
+
         self.scaler = data['scaler']
         self.columns = data['columns']
         self.years = data['years']

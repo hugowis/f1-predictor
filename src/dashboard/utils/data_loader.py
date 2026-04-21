@@ -67,7 +67,7 @@ def _parse_leaderboard_experiment(exp_dir: Path) -> Optional[dict]:
         return None
 
     # Aggregate across seeds
-    mae_vals = [r["mae_ms"] for r in rows if "mae_ms" in r]
+    mae_vals = [r["mae_ms"] for r in rows if r.get("mae_ms") is not None]
     stint_vals = [r.get("stint_mae_ms") for r in rows if r.get("stint_mae_ms") is not None]
     stab_vals = [r.get("stability_ratio") for r in rows if r.get("stability_ratio") is not None]
 

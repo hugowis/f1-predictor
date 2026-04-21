@@ -16,6 +16,11 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+
+# Switch multiprocessing to file_system sharing so DataLoader workers don't
+# exhaust the forkserver's unix-socket fd budget when multiple training
+# processes run in parallel against the big precomputed AR cache.
+torch.multiprocessing.set_sharing_strategy('file_system')
 from analyze_results import analyze_results as run_analysis
 
 # Add f1predictor library to path for imports
@@ -433,6 +438,26 @@ def create_model(config: Config, device: str = 'cpu', use_autoregressive: bool =
         config.model.decoder_extra_features_size = 11
     elif not use_autoregressive:
         config.model.decoder_extra_features_size = 0
+
+    # Auto-derive encoder input_size from the feature registry so schema
+    # changes (e.g. Part C) don't silently break training.  Warn loudly if
+    # the config value disagrees with the registry — that's the classic
+    # "Expected 103, got 119" mismatch at the encoder GRU.
+    from dataloaders.utils import (
+        get_numeric_columns, get_categorical_columns,
+        get_boolean_columns, get_compound_columns,
+    )
+    derived_input_size = (
+        len(get_numeric_columns()) + len(get_categorical_columns())
+        + len(get_boolean_columns()) + len(get_compound_columns())
+    )
+    if config.model.input_size != derived_input_size:
+        logger.warning(
+            f"ModelConfig.input_size={config.model.input_size} disagrees with "
+            f"feature-registry count {derived_input_size}; overriding to "
+            f"{derived_input_size} to match the AR cache."
+        )
+        config.model.input_size = derived_input_size
 
     model_config = {
         'input_size': config.model.input_size,
